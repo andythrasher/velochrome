@@ -61,10 +61,14 @@ The largest day folder (1,478 photos, OM-5 II with camera JPEGs):
   runs past the bytes read (stop: it's real) from one whose segments don't chain together (not a
   JPEG: keep looking). Previews also fall back to the next candidate if one won't decode.
 - **A thumbnail that can't be made is reported**, so its grid cell doesn't wait forever.
-- **Memory:** browsing that folder used about 2.5 GB, mostly the decode caches, which are sized
-  from installed memory (10% for raws, 5% for previews). Full-size previews are the biggest
-  item, about 96 MB each for a 24 MP JPEG; keeping them only for the photo in view would cut
-  this a lot.
+- **Memory:** the decode caches were sized from installed memory (10% for raws, 5% for
+  previews), which on a 32 GB PC let browsing an S1 folder reach 5.2 GB. Culling moves through
+  photos once, so the caches only need the photos around the one in view. They're now capped:
+  raws at 768 MB (16 at 24 MP; about 680 MB on a 16 GB laptop), fitted previews at 256–512 MB,
+  thumbnails at 128 MB, and full-size previews (96 MB each at 24 MP) at just two, the photo in
+  view and the one before; neighbours' full-size previews are no longer decoded ahead. The same
+  browsing run (40 photos stepped through, five 100% checks, twelve pages of grid) now peaks at
+  1.7 GB, and `bench cull` is unchanged: next photo in 5–7 ms, 100% checks under 1 ms.
 
 ## Not in 1b
 

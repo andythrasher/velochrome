@@ -35,6 +35,9 @@ pub const THUMB_EDGE: u32 = 256;
 
 const PREVIEW_KINDS: [Kind; 3] = [Kind::Fast, Kind::Loupe, Kind::Full];
 
+/// How many full-size previews stay cached: the photo in view and the one before it.
+const FULL_PREVIEWS_KEPT: usize = 2;
+
 /// Where the user is, which decides what's wanted.
 #[derive(Debug, Clone, Copy)]
 pub struct Focus {
@@ -115,8 +118,9 @@ impl Jobs {
                 visible: Vec::new(),
                 thumbs: HashMap::new(),
                 thumb_bytes: 0,
-                // 175 KB each at 256 pixels: about 1,500 thumbnails.
-                thumb_budget: 256 << 20,
+                // 175 KB each at 256 pixels: about 750 thumbnails. Remaking one takes about 1.5 ms
+                // of a core, so scrolling back to evicted ones costs little.
+                thumb_budget: 128 << 20,
                 wanted: Vec::new(),
                 wanted_set: HashSet::new(),
                 in_flight: HashSet::new(),
@@ -126,9 +130,11 @@ impl Jobs {
                 raws: HashMap::new(),
                 preview_bytes: 0,
                 raw_bytes: 0,
-                // About 10% of memory for raws (48 MB each at 24 MP), 5% for previews.
-                raw_budget: (memory / 10).max(512 << 20),
-                preview_budget: (memory / 20).max(256 << 20),
+                // Enough for the photos around the one in view, not a whole folder: culling moves
+                // through photos once. Raws are 48 MB at 24 MP, so 768 MB is 16 of them; on a
+                // 16 GB laptop, whose GPU shares that memory, it's about 14.
+                raw_budget: (memory / 24).clamp(384 << 20, 768 << 20),
+                preview_budget: (memory / 40).clamp(256 << 20, 512 << 20),
                 clock: 0,
                 shutdown: false,
             }),
@@ -475,11 +481,9 @@ impl State {
             }
             add(-1, Kind::Fast, 3);
             add(-1, Kind::Loupe, 3);
-            add(1, Kind::Full, 4);
             add(1, Kind::Raw, 4);
             add(2, Kind::Raw, 5);
             add(-1, Kind::Raw, 5);
-            add(-1, Kind::Full, 5);
             for d in 3..=4 {
                 add(d, Kind::Raw, 6);
             }
@@ -551,6 +555,19 @@ impl State {
         self.preview_bytes += bytes;
         // Several kinds can share one preview; counting it each time overstates the total,
         // which only makes eviction a little early.
+        // Full-size previews are big (96 MB at 24 MP) and only wanted for checking focus on the
+        // photo in view, so just the last two are kept, whatever the budget.
+        if kind == Kind::Full {
+            let focus = self.focus.index;
+            loop {
+                let fulls: Vec<_> = self.previews.keys().filter(|k| k.1 == Kind::Full).copied().collect();
+                if fulls.len() <= FULL_PREVIEWS_KEPT {
+                    break;
+                }
+                let Some(key) = oldest(&self.previews, |k| k.1 == Kind::Full && k.0 != focus) else { break };
+                self.preview_bytes -= self.previews.remove(&key).unwrap().bytes;
+            }
+        }
         while self.preview_bytes > self.preview_budget {
             let Some(key) = oldest(&self.previews, |k| !self.wanted_set.contains(k)) else { break };
             self.preview_bytes -= self.previews.remove(&key).unwrap().bytes;
