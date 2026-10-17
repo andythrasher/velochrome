@@ -10,7 +10,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Device;
 use windows::core::Interface;
@@ -160,9 +161,11 @@ struct Viewer {
     zoom: Zoom,
     edit: Edit,
     edit_mode: bool,
-    /// The preview on the GPU, and which photo and decode it came from.
-    preview: Option<PreviewTexture>,
-    preview_of: Option<(usize, *const Preview)>,
+    /// Previews on the GPU, one per tier (quick, loupe, full size). Separate, so moving between
+    /// tiers (sharpening up, zooming in and out) never swaps one texture between two sizes,
+    /// which would reallocate it each time (50–170 ms on some laptops). Each is reused for the
+    /// next photo, as a camera's previews are all the same size.
+    previews: [PreviewSlot; 3],
     /// The developed raw on the GPU, and which photo it is.
     image: Option<(usize, Image)>,
     dirty: bool,
@@ -185,8 +188,7 @@ impl Viewer {
             zoom: Zoom::Fit,
             edit: Edit::default(),
             edit_mode: false,
-            preview: None,
-            preview_of: None,
+            previews: Default::default(),
             image: None,
             dirty: false,
             shutdown: false,
@@ -196,8 +198,24 @@ impl Viewer {
     fn run(mut self, rx: Receiver<Command>) {
         while !self.shutdown {
             // Sleep until there's something to do, then take everything queued, so a burst of
-            // slider moves or key repeats becomes one frame.
-            let Ok(first) = rx.recv() else { break };
+            // slider moves or key repeats becomes one frame. If the photo's full-size preview
+            // could be uploaded ahead, do it once things have been quiet for a moment: never
+            // while the user is moving through photos.
+            let first = if self.full_preview_to_upload().is_some() {
+                match rx.recv_timeout(Duration::from_millis(150)) {
+                    Ok(command) => command,
+                    Err(RecvTimeoutError::Timeout) => {
+                        if let Err(e) = self.upload_full_preview() {
+                            eprintln!("windedit: uploading a preview failed: {e}");
+                        }
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                let Ok(command) = rx.recv() else { break };
+                command
+            };
             self.handle(first);
             while let Ok(next) = rx.try_recv() {
                 self.handle(next);
@@ -267,7 +285,9 @@ impl Viewer {
             Command::Folder => {
                 self.focus = None;
                 self.image = None;
-                self.preview_of = None;
+                for slot in &mut self.previews {
+                    slot.of = None;
+                }
             }
             Command::Snapshot(reply) => {
                 let target = self.offscreen.as_ref().or(self.presenter.as_ref().map(|p| &p.target));
@@ -348,7 +368,7 @@ impl Viewer {
         for &kind in self.preferences(index) {
             if kind == Kind::Raw {
                 if matches!(&self.image, Some((i, _)) if *i == index) {
-                    chosen = Some(Kind::Raw);
+                    chosen = Some((Kind::Raw, None));
                     break;
                 }
                 if let Some(frame) = self.jobs.raw(index) {
@@ -356,25 +376,20 @@ impl Viewer {
                     let (image, t) = Image::open(&mut self.gpu, &mut self.memory, &frame)?;
                     open_ms = t.total_ms;
                     self.image = Some((index, image));
-                    chosen = Some(Kind::Raw);
+                    chosen = Some((Kind::Raw, None));
                     break;
                 }
             } else if let Some(p) = self.jobs.preview(index, kind) {
-                let key = (index, Arc::as_ptr(&p));
-                if self.preview_of != Some(key) {
-                    let reuse = self.preview.take();
-                    self.preview = Some(PreviewTexture::upload(&mut self.gpu, reuse, &p.pixels, p.orientation)?);
-                    self.preview_of = Some(key);
-                }
-                chosen = Some(kind);
+                let slot = self.put_preview(index, &p, slot_for(kind))?;
+                chosen = Some((kind, Some(slot)));
                 break;
             }
         }
-        let Some(kind) = chosen else { return Ok(()) };
+        let Some((kind, slot)) = chosen else { return Ok(()) };
 
-        let layer = match kind {
-            Kind::Raw => Layer::Raw(&self.image.as_ref().unwrap().1),
-            _ => Layer::Preview(self.preview.as_ref().unwrap()),
+        let layer = match slot {
+            None => Layer::Raw(&self.image.as_ref().unwrap().1),
+            Some(s) => Layer::Preview(self.previews[s].texture.as_ref().unwrap()),
         };
         let (width, height) = photo_size;
         let (raw_width, raw_height) = self.jobs.raw(index).map_or((0, 0), |r| (r.width, r.height));
@@ -405,6 +420,59 @@ impl Viewer {
             cpu_ms: timings.cpu_ms,
             open_ms,
         });
+        Ok(())
+    }
+}
+
+const FULL: usize = 2;
+
+fn slot_for(kind: Kind) -> usize {
+    match kind {
+        Kind::Fast => 0,
+        Kind::Loupe => 1,
+        _ => FULL,
+    }
+}
+
+/// A preview texture on the GPU, and which photo and decode it holds.
+#[derive(Default)]
+struct PreviewSlot {
+    texture: Option<PreviewTexture>,
+    of: Option<(usize, *const Preview)>,
+}
+
+impl Viewer {
+    /// Makes sure this preview is on the GPU and returns the slot holding it: whichever slot
+    /// already has it (a 3200-pixel JPEG can be the quick, loupe and full-size preview at once),
+    /// else `slot`, whose texture is reused when the size matches.
+    fn put_preview(&mut self, index: usize, preview: &Arc<Preview>, slot: usize) -> windows::core::Result<usize> {
+        let key = (index, Arc::as_ptr(preview));
+        if let Some(s) = self.previews.iter().position(|s| s.of == Some(key)) {
+            return Ok(s);
+        }
+        let reuse = self.previews[slot].texture.take();
+        self.previews[slot].of = None;
+        self.previews[slot].texture = Some(PreviewTexture::upload(&mut self.gpu, reuse, &preview.pixels, preview.orientation)?);
+        self.previews[slot].of = Some(key);
+        Ok(slot)
+    }
+
+    /// The full-size preview of the photo in view, if it's decoded, not on the GPU yet, and the
+    /// photo is shown fitted in Cull mode (so a zoom to 100% would want it next).
+    fn full_preview_to_upload(&self) -> Option<(usize, Arc<Preview>)> {
+        let index = self.focus?;
+        if self.edit_mode || !matches!(self.zoom, Zoom::Fit) {
+            return None;
+        }
+        let full = self.jobs.preview(index, Kind::Full)?;
+        let key = (index, Arc::as_ptr(&full));
+        (!self.previews.iter().any(|s| s.of == Some(key))).then_some((index, full))
+    }
+
+    fn upload_full_preview(&mut self) -> windows::core::Result<()> {
+        if let Some((index, full)) = self.full_preview_to_upload() {
+            self.put_preview(index, &full, FULL)?;
+        }
         Ok(())
     }
 }

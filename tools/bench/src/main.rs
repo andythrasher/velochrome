@@ -486,7 +486,11 @@ fn snapshot(files: &[PathBuf]) {
             engine.show(index);
         }
         engine.jobs().wait_idle(Duration::from_secs(10));
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(400));
+        if std::env::var_os("ZOOM").is_some() {
+            engine.set_zoom(windedit_core::pipeline::Zoom::Actual { x: 0.5, y: 0.35 });
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let (w, h, px) = engine.snapshot().unwrap();
         let path = out_dir.join(format!("{}.snapshot.png", f.file_stem().unwrap().to_string_lossy()));
         image::save_buffer(&path, &px, w, h, image::ExtendedColorType::Rgba8).unwrap();
