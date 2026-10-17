@@ -1,5 +1,5 @@
-//! The basic adjustments and the CPU side of the math behind them: white balance as a color
-//! temperature and tint, and the tone curve the sliders shape. The per-pixel work is in
+//! The basic adjustments and the CPU side of the white balance math: a color temperature and tint
+//! in, camera multipliers out. The tone sliders are in `tone.rs`; the per-pixel work is in
 //! `shaders/develop.hlsl`.
 
 use crate::color::{self, Mat3};
@@ -129,57 +129,6 @@ pub fn white_balance_change(edit: &Edit, xyz_to_cam: &Mat3, as_shot: [f32; 3]) -
     [0, 1, 2].map(|i| wanted[i] / as_shot[i])
 }
 
-// ---- Tone ----
-
-/// The tone curve's table: CURVE_SIZE entries over log2 of scene-referred linear light from
-/// CURVE_MIN_EV to CURVE_MAX_EV (1.0 = diffuse white, 0.18 = middle grey), giving display light
-/// (0–1, linear). Below the range the shader continues it linearly; above, it holds the last
-/// value.
-pub const CURVE_SIZE: usize = 1024;
-pub const CURVE_MIN_EV: f32 = -16.0;
-pub const CURVE_MAX_EV: f32 = 6.0;
-
-const MIDDLE_GREY_EV: f32 = -2.473_931_2; // log2(0.18)
-
-fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// The base look: Narkowicz's fit of the ACES filmic curve, a gentle toe and a highlight
-/// shoulder that rolls off instead of clipping.
-fn filmic(x: f32) -> f32 {
-    ((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)).clamp(0.0, 1.0)
-}
-
-/// Shapes the curve from the tone sliders, working in stops (log2) so each slider acts on a
-/// range of brightness:
-/// - Contrast steepens or flattens around middle grey.
-/// - Highlights and Shadows shift the upper and lower parts of the range (up to 2 stops), more
-///   the further from middle grey, so −Highlights compresses bright areas and +Shadows opens
-///   up dark ones, starting just either side of middle grey.
-/// - Whites and Blacks do the same for the extremes (up to a stop), moving the clipping points.
-pub fn tone_curve(edit: &Edit) -> Vec<f32> {
-    let mid = MIDDLE_GREY_EV;
-    let contrast = 1.0 + edit.contrast / 100.0 * 0.5;
-    let mut curve: Vec<f32> = (0..CURVE_SIZE)
-        .map(|i| {
-            let ev = CURVE_MIN_EV + (CURVE_MAX_EV - CURVE_MIN_EV) * i as f32 / (CURVE_SIZE - 1) as f32;
-            let mut l = mid + (ev - mid) * contrast;
-            l += edit.highlights / 100.0 * 2.0 * smoothstep(mid - 0.5, mid + 4.0, l);
-            l += edit.shadows / 100.0 * 2.0 * (1.0 - smoothstep(mid - 4.0, mid + 0.5, l));
-            l += edit.whites / 100.0 * smoothstep(mid + 1.5, mid + 5.0, l);
-            l += edit.blacks / 100.0 * (1.0 - smoothstep(mid - 7.0, mid - 3.0, l));
-            filmic(l.exp2())
-        })
-        .collect();
-    // Strong settings can fold the curve over; keep it rising so tones never swap places.
-    for i in 1..curve.len() {
-        curve[i] = curve[i].max(curve[i - 1]);
-    }
-    curve
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,28 +167,5 @@ mod tests {
         // Warmer means less blue gain and more red, as on a camera.
         let warm = temperature_to_multipliers(&OM5_XYZ_TO_CAM, k + 1500.0, t);
         assert!(warm[2] < wb[2] && warm[0] > wb[0], "{warm:?}");
-    }
-
-    #[test]
-    fn neutral_curve_is_the_base_look() {
-        let curve = tone_curve(&Edit::default());
-        let at = |ev: f32| curve[((ev - CURVE_MIN_EV) / (CURVE_MAX_EV - CURVE_MIN_EV) * (CURVE_SIZE - 1) as f32).round() as usize];
-        assert!((at(MIDDLE_GREY_EV) - filmic(0.18)).abs() < 0.01);
-        assert!(curve.windows(2).all(|w| w[1] >= w[0]));
-    }
-
-    #[test]
-    fn sliders_move_the_right_tones() {
-        let at = |c: &[f32], ev: f32| c[((ev - CURVE_MIN_EV) / (CURVE_MAX_EV - CURVE_MIN_EV) * (CURVE_SIZE - 1) as f32).round() as usize];
-        let base = tone_curve(&Edit::default());
-        let shadows = tone_curve(&Edit { shadows: 100.0, ..Default::default() });
-        let highlights = tone_curve(&Edit { highlights: -100.0, ..Default::default() });
-        let contrast = tone_curve(&Edit { contrast: 100.0, ..Default::default() });
-        let mid = MIDDLE_GREY_EV;
-        assert!(at(&shadows, mid - 4.0) > at(&base, mid - 4.0) * 1.3, "shadows lift the darks");
-        assert!((at(&shadows, mid + 2.0) - at(&base, mid + 2.0)).abs() < 0.01, "but not the brights");
-        assert!(at(&highlights, mid + 3.0) < at(&base, mid + 3.0) - 0.02, "highlights pull down the brights");
-        assert!((at(&highlights, mid - 3.0) - at(&base, mid - 3.0)).abs() < 0.01, "but not the darks");
-        assert!(at(&contrast, mid - 2.0) < at(&base, mid - 2.0) && at(&contrast, mid + 2.0) > at(&base, mid + 2.0));
     }
 }

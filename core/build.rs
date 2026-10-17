@@ -4,13 +4,14 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SHADERS: &[&str] = &["demosaic", "downsample", "develop"];
+const SHADERS: &[&str] = &["demosaic", "downsample", "develop", "tonesmall", "toneguide", "tonestats"];
 
 fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let dxc = find_dxc().expect("dxc.exe not found: install the Windows SDK or set DXC");
     println!("cargo:rerun-if-env-changed=DXC");
     println!("cargo:rerun-if-changed=shaders/common.hlsli");
+    println!("cargo:rerun-if-changed=shaders/tone.hlsli");
     for name in SHADERS {
         let src = format!("shaders/{name}.hlsl");
         println!("cargo:rerun-if-changed={src}");

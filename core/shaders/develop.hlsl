@@ -2,22 +2,27 @@
 // shows one of the camera's JPEGs (mode 1) through the same zoom and rotation.
 //
 // It samples the cached pyramid at the level matching the zoom, so its cost depends on the
-// window size, not the sensor size. White balance, exposure and both color conversions are
-// folded into one matrix on the CPU, and the tone sliders into one curve table, so this stays
-// a few dozen instructions per pixel.
+// window size, not the sensor size. White balance, exposure, the camera's offset and the color
+// conversion to Rec.2020 are folded into one matrix on the CPU. The tone model (tone.hlsli) then
+// moves each pixel's brightness using the guided-filter coefficients and statistics the
+// pre-pass worked out for the whole image.
 
-// Like the other kernels', but with two inputs: the image, then the tone curve.
+#include "tone.hlsli"
+
+// Like the other kernels', but with four inputs: the image, the tone parameters, the guided
+// filter's coefficients and the statistics.
 #define DEVELOP_ROOT_SIGNATURE \
     "RootConstants(num32BitConstants=32, b0)," \
-    "DescriptorTable(SRV(t0, numDescriptors=2), UAV(u0))," \
+    "DescriptorTable(SRV(t0, numDescriptors=4), UAV(u0))," \
     "StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR," \
     " addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)"
 
 cbuffer Constants : register(b0)
 {
-    float4 row0;    // camera RGB → linear sRGB; white balance and exposure included
+    float4 row0;    // camera RGB → linear Rec.2020; white balance, exposure and camera offset included
     float4 row1;
     float4 row2;
+    float4 lum;     // camera RGB → brightness (the sRGB luminance of the same pixel)
     float2 origin;  // image coordinates (0..1) at output pixel (0, 0)
     float2 stepX;   // change in image coordinates per output pixel to the right
     float2 stepY;   // ... and per output pixel down
@@ -27,30 +32,20 @@ cbuffer Constants : register(b0)
     uint outHeight;
     float saturation; // -1..1
     float vibrance;   // -1..1
+    float2 baseScale; // image coordinates → pixels of the guided filter's small copy
+    float2 baseSize;  // the small copy's size in pixels (the texture is bigger)
 };
 
-// Must match develop.rs.
-static const uint CURVE_SIZE = 1024;
-static const float CURVE_MIN_EV = -16.0;
-static const float CURVE_MAX_EV = 6.0;
-
 Texture2D<float4> image : register(t0);
-Buffer<float> curve : register(t1);
+Texture2D<float2> baseCoefficients : register(t2);
+Buffer<float> stats : register(t3); // the 99.5th and 25th percentiles of the tones
 SamplerState linearClamp : register(s0);
 RWTexture2D<unorm float4> output : register(u0);
 
-// The tone curve for one channel: looked up by stops, linear below the table's range.
-float tone(float x)
-{
-    if (x <= 0.0)
-        return 0.0;
-    float ev = log2(x);
-    if (ev <= CURVE_MIN_EV)
-        return curve[0] * x / exp2(CURVE_MIN_EV);
-    float t = saturate((ev - CURVE_MIN_EV) / (CURVE_MAX_EV - CURVE_MIN_EV)) * (CURVE_SIZE - 1);
-    uint i = min((uint)t, CURVE_SIZE - 2);
-    return lerp(curve[i], curve[i + 1], t - i);
-}
+static const float3x3 REC2020_TO_SRGB = float3x3(
+    1.660491, -0.5876411, -0.0728499,
+    -0.1245505, 1.1328999, -0.0083494,
+    -0.0181508, -0.1005789, 1.1187297);
 
 // OkLab (Björn Ottosson): a perceptual color space where scaling a and b changes how colorful
 // something is without shifting its hue or lightness. Works on linear sRGB.
@@ -117,8 +112,17 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     }
     float3 cam = texel.rgb;
-    float3 rgb = float3(dot(row0.xyz, cam), dot(row1.xyz, cam), dot(row2.xyz, cam));
-    rgb = float3(tone(rgb.r), tone(rgb.g), tone(rgb.b));
+    float3 wide = float3(dot(row0.xyz, cam), dot(row1.xyz, cam), dot(row2.xyz, cam));
+    // Brightness in stops, moved by the sliders: the pixel's own for Contrast, Blacks and
+    // Whites, and its surroundings' (the base) for Highlights and Shadows.
+    float x = log2(max(dot(lum.xyz, cam), 1e-9));
+    float xg = toneGlobal(x);
+    float2 dims;
+    baseCoefficients.GetDimensions(dims.x, dims.y);
+    float2 ab = baseCoefficients.SampleLevel(linearClamp, clamp(uv * baseScale, 0.5, baseSize - 0.5) / dims, 0);
+    float base = ab.x * xg + ab.y;
+    float shifted = xg + toneLocal(xg, base, float2(stats[0], stats[1]));
+    float3 rgb = mul(REC2020_TO_SRGB, toneRgb(wide * exp2(shifted - x)));
     rgb = saturate(presence(rgb));
     output[id.xy] = float4(srgbEncode(rgb), 1.0);
 }

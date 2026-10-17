@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::{Interface, Result};
 
-use crate::develop::CURVE_SIZE;
+use crate::tone::BASE_EDGE;
 
 /// A compute kernel: its root signature (compiled into the shader) and pipeline state.
 pub struct Kernel {
@@ -24,6 +24,9 @@ pub struct Kernels {
     pub demosaic: Kernel,
     pub downsample: Kernel,
     pub develop: Kernel,
+    pub tone_small: Kernel,
+    pub tone_guide: Kernel,
+    pub tone_stats: Kernel,
 }
 
 /// How many timestamps one submission can record.
@@ -52,10 +55,45 @@ pub struct Gpu {
     /// GPU timestamp ticks per second.
     pub timestamp_freq: u64,
     pub kernels: Kernels,
-    /// The tone curve table the develop pass reads: in upload memory, mapped for good, and
-    /// rewritten for each frame (safe, as every submission waits for the GPU).
-    curve: ID3D12Resource,
-    curve_ptr: *mut f32,
+    /// The tone parameters the shaders read: in upload memory, mapped for good, and rewritten
+    /// for each frame (safe, as every submission waits for the GPU).
+    params: ID3D12Resource,
+    params_ptr: *mut u8,
+    /// What the tone pre-pass works in. Small and fixed in size whatever the photo, so they are
+    /// made once here.
+    pub tone: ToneResources,
+}
+
+/// Room for the tone parameters.
+const PARAMS_BYTES: u64 = 256;
+
+/// Textures and a buffer for the tone pre-pass, which reduces the photo to a copy about
+/// `BASE_EDGE` pixels across. All stay in the unordered access state, except while the develop
+/// pass reads `coefficients` and `stats`.
+pub struct ToneResources {
+    /// The photo's tones, one pixel per block.
+    pub small: ID3D12Resource,
+    /// Two quantities side by side per pixel, for the guided filter's intermediate steps.
+    pub scratch_a: ID3D12Resource,
+    pub scratch_b: ID3D12Resource,
+    /// The guided filter's a and b.
+    pub coefficients: ID3D12Resource,
+    /// The 99.5th and 25th percentiles of the tones.
+    pub stats: ID3D12Resource,
+}
+
+impl ToneResources {
+    fn new(device: &ID3D12Device) -> Result<ToneResources> {
+        let edge = BASE_EDGE as u32;
+        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        Ok(ToneResources {
+            small: new_texture(device, edge, edge, 1, DXGI_FORMAT_R32_FLOAT, uav)?,
+            scratch_a: new_texture(device, edge * 2, edge, 1, DXGI_FORMAT_R32_FLOAT, uav)?,
+            scratch_b: new_texture(device, edge * 2, edge, 1, DXGI_FORMAT_R32_FLOAT, uav)?,
+            coefficients: new_texture(device, edge, edge, 1, DXGI_FORMAT_R32G32_FLOAT, uav)?,
+            stats: new_uav_buffer(device, 16)?,
+        })
+    }
 }
 
 impl Gpu {
@@ -121,18 +159,17 @@ impl Gpu {
                 demosaic: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/demosaic.dxil")))?,
                 downsample: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/downsample.dxil")))?,
                 develop: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/develop.dxil")))?,
+                tone_small: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/tonesmall.dxil")))?,
+                tone_guide: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/toneguide.dxil")))?,
+                tone_stats: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/tonestats.dxil")))?,
             };
 
             let query_readback =
                 new_buffer(&device, MAX_TIMESTAMPS as u64 * 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST)?;
-            let curve = new_buffer(
-                &device,
-                (CURVE_SIZE * 4) as u64,
-                D3D12_HEAP_TYPE_UPLOAD,
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-            )?;
-            let mut curve_ptr = std::ptr::null_mut();
-            curve.Map(0, Some(&D3D12_RANGE::default()), Some(&mut curve_ptr))?;
+            let params = new_buffer(&device, PARAMS_BYTES, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+            let mut params_ptr = std::ptr::null_mut();
+            params.Map(0, Some(&D3D12_RANGE::default()), Some(&mut params_ptr))?;
+            let tone = ToneResources::new(&device)?;
             Ok(Gpu {
                 factory,
                 adapter_name,
@@ -151,8 +188,9 @@ impl Gpu {
                 timestamps_used: 0,
                 timestamp_freq,
                 kernels,
-                curve,
-                curve_ptr: curve_ptr as *mut f32,
+                params,
+                params_ptr: params_ptr as *mut u8,
+                tone,
             })
         }
     }
@@ -230,6 +268,11 @@ impl Gpu {
     /// Records a kernel run. `table` is the descriptor slot of its input; its output is the
     /// next slot. `threads` is the grid size, in threads (groups are 16×16).
     pub fn dispatch<C: Copy>(&self, kernel: &Kernel, constants: &C, table: u32, threads: (u32, u32)) {
+        self.dispatch_groups(kernel, constants, table, (threads.0.div_ceil(16), threads.1.div_ceil(16)));
+    }
+
+    /// Like `dispatch`, but for a grid given in thread groups.
+    pub fn dispatch_groups<C: Copy>(&self, kernel: &Kernel, constants: &C, table: u32, groups: (u32, u32)) {
         let words = size_of::<C>() / 4;
         assert!(size_of::<C>().is_multiple_of(4) && words <= 32);
         unsafe {
@@ -238,7 +281,7 @@ impl Gpu {
             self.list
                 .SetComputeRoot32BitConstants(0, words as u32, constants as *const C as *const _, 0);
             self.list.SetComputeRootDescriptorTable(1, self.gpu_handle(table));
-            self.list.Dispatch(threads.0.div_ceil(16), threads.1.div_ceil(16), 1);
+            self.list.Dispatch(groups.0, groups.1, 1);
         }
     }
 
@@ -269,14 +312,28 @@ impl Gpu {
         unsafe { self.device.CreateShaderResourceView(resource, Some(&desc), self.cpu_handle(slot)) };
     }
 
-    /// Writes the tone curve table for the next develop pass.
-    pub fn set_curve(&self, values: &[f32]) {
-        let n = values.len().min(CURVE_SIZE);
-        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), self.curve_ptr, n) };
+    /// Writes the tone parameters for the next passes.
+    pub fn set_params<T: Copy>(&self, value: &T) {
+        assert!(size_of::<T>() as u64 <= PARAMS_BYTES);
+        unsafe { std::ptr::copy_nonoverlapping(value as *const T as *const u8, self.params_ptr, size_of::<T>()) };
     }
 
-    pub fn srv_curve(&self, slot: u32) {
-        self.srv_buffer(&self.curve, DXGI_FORMAT_R32_FLOAT, CURVE_SIZE as u32, slot);
+    /// A view of the parameters, which `set_params` wrote as a `T`.
+    pub fn srv_params<T>(&self, slot: u32) {
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 0,
+                    NumElements: 1,
+                    StructureByteStride: size_of::<T>() as u32,
+                    Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                },
+            },
+        };
+        unsafe { self.device.CreateShaderResourceView(&self.params, Some(&desc), self.cpu_handle(slot)) };
     }
 
     pub fn srv_buffer(&self, resource: &ID3D12Resource, format: DXGI_FORMAT, elements: u32, slot: u32) {
@@ -298,6 +355,29 @@ impl Gpu {
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_UAV { MipSlice: mip, PlaneSlice: 0 } },
         };
         unsafe { self.device.CreateUnorderedAccessView(resource, None, Some(&desc), self.cpu_handle(slot)) };
+    }
+
+    pub fn uav_buffer(&self, resource: &ID3D12Resource, format: DXGI_FORMAT, elements: u32, slot: u32) {
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV { FirstElement: 0, NumElements: elements, ..Default::default() },
+            },
+        };
+        unsafe { self.device.CreateUnorderedAccessView(resource, None, Some(&desc), self.cpu_handle(slot)) };
+    }
+
+    /// Makes the writes of the last dispatches visible to the next ones.
+    pub fn uav_barrier(&self) {
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: ManuallyDrop::new(None) }),
+            },
+        };
+        unsafe { self.list.ResourceBarrier(&[barrier]) };
     }
 
     pub fn transition(&self, resource: &ID3D12Resource, sub: u32, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
@@ -382,6 +462,22 @@ pub fn new_buffer(
         ..Default::default()
     };
     committed(device, heap, &desc, state)
+}
+
+/// A small buffer a kernel writes and later passes read.
+pub fn new_uav_buffer(device: &ID3D12Device, size: u64) -> Result<ID3D12Resource> {
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: size,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    committed(device, D3D12_HEAP_TYPE_DEFAULT, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
 }
 
 fn committed(
