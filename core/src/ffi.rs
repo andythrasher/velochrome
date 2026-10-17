@@ -14,16 +14,18 @@ use windows::core::Interface;
 
 use crate::decode;
 use crate::gpu::Gpu;
-use crate::pipeline::{Edit, Image, Zoom};
+use crate::pipeline::{Edit, Image, ImageMemory, Zoom, warm_up};
 use crate::present::{FrameTimings, Presenter};
 
 pub struct Engine {
     gpu: Gpu,
+    memory: ImageMemory,
     image: Option<Image>,
     presenter: Option<Presenter>,
     edit: Edit,
     zoom: Zoom,
     last_error: String,
+    warm_up_ms: f64,
 }
 
 #[repr(C)]
@@ -32,6 +34,7 @@ pub struct OpenInfo {
     pub width: u32,
     pub height: u32,
     pub decode_ms: f64,
+    pub alloc_ms: f64,
     pub upload_ms: f64,
     pub copy_ms: f64,
     pub demosaic_ms: f64,
@@ -82,14 +85,22 @@ fn write_wide(text: &str, buf: *mut u16, len: u32) -> u32 {
 /// Creates the engine on the fastest GPU. Returns null if there is no usable Direct3D 12 GPU.
 #[unsafe(no_mangle)]
 pub extern "C" fn we_engine_create() -> *mut Engine {
-    match catch_unwind(Gpu::new) {
-        Ok(Ok(gpu)) => Box::into_raw(Box::new(Engine {
+    // Warming up here, before the app shows anything, keeps that cost off the first photo.
+    let created = catch_unwind(|| -> windows::core::Result<(Gpu, f64)> {
+        let mut gpu = Gpu::new()?;
+        let warm_up_ms = warm_up(&mut gpu)?;
+        Ok((gpu, warm_up_ms))
+    });
+    match created {
+        Ok(Ok((gpu, warm_up_ms))) => Box::into_raw(Box::new(Engine {
             gpu,
+            memory: ImageMemory::new(),
             image: None,
             presenter: None,
             edit: Edit::default(),
             zoom: Zoom::Fit,
             last_error: String::new(),
+            warm_up_ms,
         })),
         _ => std::ptr::null_mut(),
     }
@@ -126,14 +137,15 @@ pub extern "C" fn we_adapter_name(engine: *const Engine, buf: *mut u16, len: u32
 pub extern "C" fn we_open(engine: *mut Engine, path: *const u16, info: *mut OpenInfo) -> i32 {
     guard(engine, |e| {
         let frame = decode::decode_file(&wide_to_path(path)).map_err(|err| err.to_string())?;
-        e.image = None; // free the previous photo's GPU memory first
-        let (image, t) = Image::open(&mut e.gpu, &frame).map_err(|err| err.to_string())?;
+        e.image = None; // its memory is about to be reused
+        let (image, t) = Image::open(&mut e.gpu, &mut e.memory, &frame).map_err(|err| err.to_string())?;
         let (width, height) = image.oriented_size();
         if let Some(info) = unsafe { info.as_mut() } {
             *info = OpenInfo {
                 width,
                 height,
                 decode_ms: frame.decode_time.as_secs_f64() * 1000.0,
+                alloc_ms: t.alloc_ms,
                 upload_ms: t.upload_ms,
                 copy_ms: t.copy_ms,
                 demosaic_ms: t.demosaic_ms,
@@ -199,4 +211,10 @@ pub extern "C" fn we_render(engine: *mut Engine, timings: *mut FrameTimings) -> 
         }
         Ok(())
     })
+}
+
+/// How long preparing the GPU kernels took when the engine was created, in milliseconds.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_warm_up_ms(engine: *const Engine) -> f64 {
+    unsafe { engine.as_ref() }.map_or(0.0, |e| e.warm_up_ms)
 }

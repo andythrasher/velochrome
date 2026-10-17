@@ -15,7 +15,7 @@ sealed unsafe partial class Engine : IDisposable
     public struct OpenInfo
     {
         public uint Width, Height;
-        public double DecodeMs, UploadMs, CopyMs, DemosaicMs, PyramidMs, TotalMs;
+        public double DecodeMs, AllocMs, UploadMs, CopyMs, DemosaicMs, PyramidMs, TotalMs;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -33,6 +33,7 @@ sealed unsafe partial class Engine : IDisposable
     [LibraryImport(Dll)] private static partial int we_set_exposure(IntPtr engine, float stops);
     [LibraryImport(Dll)] private static partial int we_set_zoom(IntPtr engine, int actual, float x, float y);
     [LibraryImport(Dll)] private static partial int we_render(IntPtr engine, out FrameTimings timings);
+    [LibraryImport(Dll)] private static partial double we_warm_up_ms(IntPtr engine);
 
     IntPtr handle;
 
@@ -42,9 +43,13 @@ sealed unsafe partial class Engine : IDisposable
         if (handle == IntPtr.Zero)
             throw new InvalidOperationException("This PC has no graphics card that supports Direct3D 12.");
         AdapterName = ReadString(&we_adapter_name);
+        WarmUpMs = we_warm_up_ms(handle);
     }
 
     public string AdapterName { get; }
+
+    /// <summary>How long preparing the GPU kernels took at startup.</summary>
+    public double WarmUpMs { get; }
 
     public OpenInfo Open(string path)
     {

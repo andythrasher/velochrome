@@ -35,7 +35,7 @@ public sealed partial class MainWindow : Window
         Closed += (_, _) => engine.Dispose();
         Content.KeyDown += Content_KeyDown;
         CompositionTarget.Rendering += OnRendering;
-        Status.Text = $"{engine.AdapterName} · Ctrl+O opens a raw file";
+        Status.Text = $"{engine.AdapterName} · GPU warm-up {engine.WarmUpMs:F0} ms · Ctrl+O opens a raw file";
         if (startPath != null)
             _ = OpenAsync(startPath);
     }
@@ -71,7 +71,7 @@ public sealed partial class MainWindow : Window
             Render();
             var o = opened;
             openSummary = $"{engine.AdapterName} · {Path.GetFileName(path)} {o.Width}×{o.Height} · " +
-                $"open {o.TotalMs:F0} ms (decode {o.DecodeMs:F0}, upload {o.UploadMs:F1}, copy {o.CopyMs:F1}, " +
+                $"open {o.TotalMs:F0} ms (decode {o.DecodeMs:F0}, {(o.AllocMs > 0 ? $"new GPU memory {o.AllocMs:F0}" : "GPU memory reused")}, upload {o.UploadMs:F1}, copy {o.CopyMs:F1}, " +
                 $"demosaic {o.DemosaicMs:F1}, pyramid {o.PyramidMs:F1}) · on screen after {clock.Elapsed.TotalMilliseconds:F0} ms";
             Status.Text = openSummary;
             Title = $"{Path.GetFileName(path)} – Windedit";

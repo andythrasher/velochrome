@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 use windedit_core::decode;
 use windedit_core::gpu::Gpu;
-use windedit_core::pipeline::{Edit, Image, Target, Zoom, read_target, render};
+use windedit_core::pipeline::{Edit, Image, ImageMemory, OpenTimings, Target, Zoom, read_target, render, warm_up};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -147,6 +147,7 @@ struct ViewCase {
 fn bench_gpu(files: &[PathBuf]) {
     let mut gpu = Gpu::new().expect("no Direct3D 12 GPU");
     println!("GPU: {} ({})", gpu.adapter_name, if gpu.uma { "shared memory" } else { "own memory" });
+    println!("warm-up (prepares the GPU kernels): {:.1} ms", warm_up(&mut gpu).unwrap());
     let cases = [
         ViewCase { name: "fit 1920x1080", width: 1920, height: 1080, zoom: |_| Zoom::Fit },
         ViewCase { name: "fit 2560x1440", width: 2560, height: 1440, zoom: |_| Zoom::Fit },
@@ -173,22 +174,21 @@ fn bench_gpu(files: &[PathBuf]) {
                 continue;
             }
         };
-        // The first open also warms up the driver; time the second.
-        let _ = Image::open(&mut gpu, &frame).unwrap();
-        let (image, t) = Image::open(&mut gpu, &frame).unwrap();
         println!(
-            "{name} ({} {}, {}x{}): decode {:.1} ms; open {:.1} ms = upload {:.1} + copy {:.2} + demosaic {:.2} + pyramid {:.2} (GPU)",
+            "{name} ({} {}, {}x{}): decode {:.1} ms",
             frame.make,
             frame.model,
             frame.width,
             frame.height,
-            ms(frame.decode_time),
-            t.total_ms,
-            t.upload_ms,
-            t.copy_ms,
-            t.demosaic_ms,
-            t.pyramid_ms
+            ms(frame.decode_time)
         );
+        // New memory for each file, so the first open shows what a session's first photo
+        // (or first photo of a new size) costs; the second reuses it, like every photo after.
+        let mut memory = ImageMemory::new();
+        let (_, first) = Image::open(&mut gpu, &mut memory, &frame).unwrap();
+        print_open("first open (new memory)", &first);
+        let (image, t) = Image::open(&mut gpu, &mut memory, &frame).unwrap();
+        print_open("next open (reused)     ", &t);
 
         for case in &cases {
             let target = Target::new(&gpu, case.width, case.height).unwrap();
@@ -236,4 +236,11 @@ fn render_png(gpu: &mut Gpu, image: &Image, target: &Target, zoom: Zoom, path: &
     gpu.submit().unwrap();
     let pixels = read_target(gpu, target).unwrap();
     image::save_buffer(path, &pixels, target.width, target.height, image::ExtendedColorType::Rgba8).unwrap();
+}
+
+fn print_open(label: &str, t: &OpenTimings) {
+    println!(
+        "  {label} {:.1} ms = alloc {:.1} + upload {:.1} + copy {:.2} + demosaic {:.2} + pyramid {:.2} (GPU)",
+        t.total_ms, t.alloc_ms, t.upload_ms, t.copy_ms, t.demosaic_ms, t.pyramid_ms
+    );
 }

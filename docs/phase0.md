@@ -4,9 +4,10 @@ The question: can a raw editor built on a Rust engine plus DirectX 12 compute fe
 the photos from my cameras? Phase 0 built just enough to find out: decoding, a GPU develop
 pipeline with one adjustment (Exposure), and a WinUI window to drag it in.
 
-**Answer: yes, with lots of headroom.** The develop pass costs fractions of a millisecond even
-at 4K. The time that matters now is CPU decoding when a photo is opened, and the fixes for that
-are known (see *What it found*).
+**Answer: yes, with lots of headroom,** on the desktop and on a Lunar Lake laptop. The develop
+pass costs fractions of a millisecond at 1440p on both. The time that matters now is opening a
+photo (CPU decoding, plus GPU memory setup on the laptop), and the fixes for that are known
+(see *What it found* and *Results on the laptop*).
 
 ## What was built
 
@@ -63,6 +64,52 @@ Against the targets set at the start (slider < 16 ms here, < 33 ms on the laptop
 right at the line for ORF and well under it for both Lumix bodies. Next-photo needs the preview
 and prefetch work below.
 
+## Results on the laptop
+
+Core Ultra 7 256V (Lunar Lake: 4 performance + 4 efficient cores), Arc 140V integrated GPU,
+16 GB shared memory. One S1 file and one OM-5 II file; the benchmark times the *second* open of
+each photo.
+
+| | Lumix S1 | OM-5 Mark II | (desktop, for comparison) |
+|---|---|---|---|
+| Decode, one file | 77 ms | 185 ms | 80 / 231 ms |
+| Upload (CPU copy) | 5.1 ms | 4.1 ms | 4.7 / 3.8 ms |
+| Copy to video memory | none (shared memory) | none | 3.8 / 3.9 ms |
+| Demosaic | 8.5 ms | 14.3 ms | 2.0 / 1.4 ms |
+| Pyramid | 1.7 ms | 1.5 ms | 1.8 / 1.1 ms |
+| Whole GPU open | 66 ms | 109 ms | 20 / 16 ms |
+| Develop, fit 1920×1080 | 0.42 ms | 0.46 ms | 0.02 ms |
+| Develop, fit 2560×1440 | 0.49 ms | 0.49 ms | 0.15 / 0.10 ms |
+| Develop, fit 3840×2160 | 1.47 ms | 1.33 ms | 0.16 / 0.14 ms |
+| Develop, 100% 2560×1440 | 0.33 ms | 0.25 ms | 0.08 / 0.06 ms |
+| Develop, full size | 3.3 ms | 2.3 ms | 0.51 / 0.37 ms |
+
+In the app (S1, first photo opened): Exposure dragged with 0.34 ms of develop time and a
+1.85 ms render call, and reached the screen in 9.6 ms on average, under one display refresh.
+Opening took 363 ms: decode 144, upload 9.3, **demosaic 141.8**, pyramid 2.1.
+
+What the laptop adds:
+
+- **Slider speed is a non-issue on the low end too.** 0.5 ms at 1440p is under 2% of the 33 ms
+  budget. The Arc 140V is roughly 3–10× slower than the RTX 5060 Ti here, which still leaves
+  plenty of room for heavier processing.
+- **Single-file decoding is faster than on the desktop** (Lunar Lake's performance cores beat
+  the 14700F at this sequential work). The many-files rate wasn't measured: only two files.
+- **The first photo opened is slow on the GPU.** Demosaic took 142 ms in the app but 8.5 ms when
+  the benchmark opened the same file a second time. The likely cause is that the GPU is first to
+  touch about 256 MB of newly allocated memory, which Windows must zero and map in; the desktop
+  doesn't show this. On top of that, every open spends about 50 ms (laptop) or 6 ms (desktop)
+  outside the timed GPU steps, which is mostly allocating that memory.
+
+**Follow-up (done, awaiting a laptop re-run):** the engine now keeps each photo size's GPU
+memory and reuses it (`ImageMemory` in `core/src/pipeline.rs`; two sizes, so a folder mixing
+cameras doesn't thrash), and runs every kernel once on a tiny photo when it starts
+(`warm_up`). On the desktop, opening the next photo went from 18–20 ms to 7–9 ms of GPU-side
+work, and warm-up takes 1.8 ms. `bench gpu` now prints the warm-up time and both a first open
+(new memory) and a next open (reused), and the app says whether the memory was new or reused.
+On the laptop, a slow *first* open that persists after warm-up points at fresh memory rather
+than shader preparation; the *next* open should drop to around 15–25 ms.
+
 ## What it found
 
 1. **The per-edit cost is negligible, so the budget can go to quality.** At 0.1 ms per frame
@@ -97,12 +144,10 @@ and prefetch work below.
   overlap on the table.
 - No lens corrections, no edits saved anywhere.
 
-## Not yet measured: the laptop
+## Measuring on another PC
 
-The Core Ultra 7 256V (Arc 140V, shared memory) is the other half of the target. The engine
-detects shared memory and skips the copy to video memory there. To measure, copy
-`artifacts\windedit-phase0` (made by the publish command in the README) to the laptop, along
-with a few raw files, and run:
+Copy `artifacts\windedit-phase0` (made by the publish command in the README) to it, along with
+a few raw files, and from a terminal in that folder run:
 
 ```
 bench.exe decode <folder of raws>

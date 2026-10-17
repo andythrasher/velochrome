@@ -25,6 +25,77 @@ const fn slot_downsample(level: u32) -> u32 {
 }
 const SLOT_DEVELOP: u32 = 100; // the whole pyramid, then the output
 
+/// The GPU memory photos are opened into, kept between photos. Allocating it is slow (about
+/// 50 ms on a Lunar Lake laptop, and the GPU's first pass over fresh memory is slower still),
+/// so each photo size gets its memory once and every later photo of that size reuses it.
+///
+/// Opening a photo overwrites the memory of the last photo of the same size, so only the most
+/// recent `Image` of each size stays valid.
+pub struct ImageMemory {
+    /// Most recently used first.
+    slots: Vec<Slot>,
+}
+
+/// How many photo sizes keep their memory: enough for two cameras mixed in one folder. Each
+/// costs about 350 MB for a 24-megapixel photo.
+const SLOTS: usize = 2;
+
+struct Slot {
+    width: u32,
+    height: u32,
+    levels: u32,
+    /// Sensor data, in memory the CPU writes and the GPU can read. Mapped for its whole life.
+    upload: ID3D12Resource,
+    upload_ptr: *mut u16,
+    /// A copy in video memory, for GPUs that have their own (discrete cards).
+    raw: Option<ID3D12Resource>,
+    linear: ID3D12Resource,
+    /// A photo has been opened into it, so its resources are in their after-open states.
+    used: bool,
+}
+
+impl Default for ImageMemory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ImageMemory {
+    pub fn new() -> ImageMemory {
+        ImageMemory { slots: Vec::new() }
+    }
+
+    /// The slot for this size, moved to the front; allocated if there's none yet. Returns
+    /// whether it was just allocated.
+    fn take(&mut self, gpu: &Gpu, width: u32, height: u32) -> Result<bool> {
+        if let Some(i) = self.slots.iter().position(|s| s.width == width && s.height == height) {
+            let slot = self.slots.remove(i);
+            self.slots.insert(0, slot);
+            return Ok(false);
+        }
+        // Free the least recently used size before allocating, so the peak stays down.
+        if self.slots.len() >= SLOTS {
+            self.slots.pop();
+        }
+        let bytes = width as u64 * height as u64 * 2;
+        let upload = gpu.buffer(bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+        let mut ptr = std::ptr::null_mut();
+        unsafe { upload.Map(0, Some(&D3D12_RANGE::default()), Some(&mut ptr))? };
+        let raw = if gpu.uma {
+            None
+        } else {
+            Some(gpu.buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON)?)
+        };
+        let levels = 32 - width.max(height).leading_zeros();
+        let linear = gpu.texture(width, height, levels as u16, LINEAR_FORMAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
+        self.slots.insert(
+            0,
+            Slot { width, height, levels, upload, upload_ptr: ptr as *mut u16, raw, linear, used: false },
+        );
+        Ok(true)
+    }
+}
+
 /// A photo ready to develop: demosaiced and on the GPU.
 pub struct Image {
     pub width: u32,
@@ -37,6 +108,8 @@ pub struct Image {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpenTimings {
+    /// CPU: allocating GPU memory, when this photo size had none yet (otherwise 0).
+    pub alloc_ms: f64,
     /// CPU: copying the sensor data into memory the GPU can read.
     pub upload_ms: f64,
     /// GPU: copying it into video memory (none on integrated graphics).
@@ -81,40 +154,45 @@ struct DevelopConstants {
 }
 
 impl Image {
-    pub fn open(gpu: &mut Gpu, frame: &RawFrame) -> Result<(Image, OpenTimings)> {
+    pub fn open(gpu: &mut Gpu, memory: &mut ImageMemory, frame: &RawFrame) -> Result<(Image, OpenTimings)> {
         let start = Instant::now();
         let (width, height) = (frame.width, frame.height);
         let bytes = width as u64 * height as u64 * 2;
 
-        // Sensor data goes into an upload buffer, which lives in system memory. Integrated
-        // GPUs read it right there; discrete ones get a copy in their own memory.
-        let upload = gpu.buffer(bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)?;
-        unsafe {
-            let mut ptr = std::ptr::null_mut();
-            upload.Map(0, Some(&D3D12_RANGE::default()), Some(&mut ptr))?;
-            std::ptr::copy_nonoverlapping(frame.data.as_ptr(), ptr as *mut u16, frame.data.len());
-            upload.Unmap(0, None);
-        }
-        let upload_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let fresh = memory.take(gpu, width, height)?;
+        let alloc_ms = if fresh { start.elapsed().as_secs_f64() * 1000.0 } else { 0.0 };
+        let slot = &mut memory.slots[0];
+        let (levels, linear) = (slot.levels, slot.linear.clone());
 
-        let levels = 32 - width.max(height).leading_zeros();
-        let linear = gpu.texture(width, height, levels as u16, LINEAR_FORMAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
+        // Sensor data goes into the upload buffer, which lives in system memory. Integrated
+        // GPUs read it right there; discrete ones get a copy in their own memory.
+        let upload_start = Instant::now();
+        unsafe { std::ptr::copy_nonoverlapping(frame.data.as_ptr(), slot.upload_ptr, frame.data.len()) };
+        let upload_ms = upload_start.elapsed().as_secs_f64() * 1000.0;
 
         gpu.begin()?;
-        let t_start = gpu.timestamp();
-        let raw = if gpu.uma {
-            upload.clone()
-        } else {
-            let raw = gpu.buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON)?;
-            unsafe { gpu.list.CopyBufferRegion(&raw, 0, &upload, 0, bytes) };
+        if slot.used {
+            // Back from where the last photo left them.
             gpu.transition(
-                &raw,
-                0,
-                D3D12_RESOURCE_STATE_COPY_DEST,
+                &linear,
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             );
-            raw
+        }
+        let t_start = gpu.timestamp();
+        let raw = match &slot.raw {
+            None => slot.upload.clone(),
+            Some(raw) => {
+                if slot.used {
+                    gpu.transition(raw, 0, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                }
+                unsafe { gpu.list.CopyBufferRegion(raw, 0, &slot.upload, 0, bytes) };
+                gpu.transition(raw, 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                raw.clone()
+            }
         };
+        slot.used = true;
         let t_copied = gpu.timestamp();
 
         gpu.srv_buffer(&raw, DXGI_FORMAT_R16_UINT, width * height, SLOT_DEMOSAIC);
@@ -165,6 +243,7 @@ impl Image {
         drop(raw);
 
         let timings = OpenTimings {
+            alloc_ms,
             upload_ms,
             copy_ms: ts[t_copied as usize] - ts[t_start as usize],
             demosaic_ms: ts[t_demosaiced as usize] - ts[t_copied as usize],
@@ -186,6 +265,34 @@ impl Image {
     pub fn oriented_size(&self) -> (u32, u32) {
         if self.orientation.swaps_axes() { (self.height, self.width) } else { (self.width, self.height) }
     }
+}
+
+/// Runs every kernel once on a tiny made-up photo, so the driver has finished preparing them
+/// (some drivers compile shaders on first use) before a real photo is opened. Returns how long
+/// it took, in milliseconds.
+pub fn warm_up(gpu: &mut Gpu) -> Result<f64> {
+    let start = Instant::now();
+    const SIZE: u32 = 64;
+    let frame = RawFrame {
+        make: String::new(),
+        model: String::new(),
+        data: vec![1000; (SIZE * SIZE) as usize],
+        width: SIZE,
+        height: SIZE,
+        cfa: [[0, 1], [1, 2]],
+        black: [[0.0; 2]; 2],
+        white: 4095.0,
+        wb: [2.0, 1.0, 1.5],
+        cam_to_working: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        orientation: Orientation::Normal,
+        decode_time: Default::default(),
+    };
+    let (image, _) = Image::open(gpu, &mut ImageMemory::new(), &frame)?;
+    let target = Target::new(gpu, SIZE, SIZE)?;
+    gpu.begin()?;
+    render(gpu, &image, &Edit::default(), Zoom::Fit, &target);
+    gpu.submit()?;
+    Ok(start.elapsed().as_secs_f64() * 1000.0)
 }
 
 /// The edits. Phase 0 has just one.
