@@ -14,6 +14,7 @@ use windows::core::Result;
 use crate::color::{self, Mat3};
 use crate::decode::{Orientation, RawFrame};
 use crate::develop;
+use crate::lens::{LensCorrection, LensModel};
 use crate::gpu::{Gpu, new_buffer, new_texture};
 use crate::tone;
 
@@ -139,6 +140,8 @@ pub struct Image {
     /// The white balance the camera recorded, which the demosaic applied.
     pub as_shot: [f32; 3],
     pub orientation: Orientation,
+    /// Distortion and chromatic aberration correction, if the camera recorded any.
+    pub lens: Option<LensCorrection>,
     /// How many stops this camera's raws are rendered brighter or darker (`tone::camera_offset`).
     pub camera_offset: f32,
 }
@@ -193,6 +196,7 @@ struct DevelopConstants {
     vibrance: f32,
     base_scale: [f32; 2],
     base_size: [f32; 2],
+    lens: [[f32; 4]; 4],
 }
 
 /// What the tone shaders read, field for field as in tone.hlsli: the model's numbers, the
@@ -336,6 +340,7 @@ impl Image {
             xyz_to_cam: frame.xyz_to_cam,
             as_shot: frame.wb,
             orientation: frame.orientation,
+            lens: frame.lens,
             camera_offset: tone::camera_offset(&frame.make),
         };
         Ok((image, timings))
@@ -366,6 +371,7 @@ pub fn warm_up(gpu: &mut Gpu) -> Result<f64> {
         cam_to_working: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         xyz_to_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         orientation: Orientation::Normal,
+        lens: None,
         decode_time: Default::default(),
     };
     let (image, _) = Image::open(gpu, &mut ImageMemory::new(), &frame)?;
@@ -477,6 +483,7 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
         vibrance: edit.vibrance / 100.0,
         base_scale: base.0,
         base_size: base.1,
+        lens: lens_constants(layer),
     };
     match layer {
         Layer::Raw(image) => gpu.srv_texture(&image.linear, LINEAR_FORMAT, 0, image.levels, SLOT_DEVELOP),
@@ -798,4 +805,21 @@ fn read_floats(gpu: &mut Gpu, texture: &ID3D12Resource, channels: usize, w: usiz
         readback.Unmap(0, Some(&D3D12_RANGE::default()));
         Ok(out)
     }
+}
+
+/// The lens correction as the develop shader reads it: model (0 none, 1 Olympus, 2 Panasonic),
+/// scale, zoom and a chromatic aberration flag; then the distortion terms and red's and blue's
+/// chromatic aberration terms. A camera JPEG is already corrected, so it gets none.
+fn lens_constants(layer: Layer) -> [[f32; 4]; 4] {
+    let Layer::Raw(Image { lens: Some(l), .. }) = layer else { return [[0.0; 4]; 4] };
+    let model = match l.model {
+        LensModel::Olympus => 1.0,
+        LensModel::Panasonic => 2.0,
+    };
+    [
+        [model, l.scale, l.zoom, l.has_ca() as u32 as f32],
+        [l.k[0], l.k[1], l.k[2], 0.0],
+        [l.ca_red[0], l.ca_red[1], l.ca_red[2], 0.0],
+        [l.ca_blue[0], l.ca_blue[1], l.ca_blue[2], 0.0],
+    ]
 }

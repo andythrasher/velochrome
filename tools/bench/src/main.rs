@@ -7,6 +7,8 @@
 //!     bench gpu <file or folder>...      open and develop times on the GPU; writes a PNG of
 //!                                        each photo's fitted view next to the benchmark
 
+mod lens;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -33,6 +35,8 @@ fn main() {
         "xmpcheck" => xmp_check(&files_any(rest)),
         "thumbs" => bench_thumbs(&rest.iter().map(PathBuf::from).collect::<Vec<_>>()),
         "look" => bench_look(&files),
+        "lens" => lens::bench_lens(&files),
+        "lensscan" => lens::lens_scan(rest),
         "cull" => bench_cull(&rest.iter().map(PathBuf::from).collect::<Vec<_>>()),
         _ => {
             eprintln!("unknown command {cmd}");
@@ -491,6 +495,11 @@ fn snapshot(files: &[PathBuf]) {
         }
         engine.jobs().wait_idle(Duration::from_secs(10));
         std::thread::sleep(Duration::from_millis(400));
+        if std::env::var_os("EDITMODE").is_some() {
+            engine.set_edit_mode(true); // as the D key does
+            engine.jobs().wait_idle(Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(600));
+        }
         if std::env::var_os("ZOOM").is_some() {
             engine.set_zoom(windedit_core::pipeline::Zoom::Actual { x: 0.5, y: 0.35 });
             std::thread::sleep(Duration::from_millis(100));

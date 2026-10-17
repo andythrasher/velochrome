@@ -12,7 +12,7 @@
 // Like the other kernels', but with four inputs: the image, the tone parameters, the guided
 // filter's coefficients and the statistics.
 #define DEVELOP_ROOT_SIGNATURE \
-    "RootConstants(num32BitConstants=32, b0)," \
+    "RootConstants(num32BitConstants=48, b0)," \
     "DescriptorTable(SRV(t0, numDescriptors=4), UAV(u0))," \
     "StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR," \
     " addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)"
@@ -34,6 +34,10 @@ cbuffer Constants : register(b0)
     float vibrance;   // -1..1
     float2 baseScale; // image coordinates → pixels of the guided filter's small copy
     float2 baseSize;  // the small copy's size in pixels (the texture is bigger)
+    float4 lensA;     // lens correction: model (0 none, 1 Olympus, 2 Panasonic), scale, zoom, has chromatic aberration
+    float4 lensK;     // distortion terms
+    float4 lensR;     // red chromatic aberration terms
+    float4 lensB;     // blue chromatic aberration terms
 };
 
 Texture2D<float4> image : register(t0);
@@ -93,6 +97,43 @@ float3 srgbEncode(float3 c)
     return select(c <= 0.0031308, 12.92 * c, 1.055 * pow(c, 1.0 / 2.4) - 0.055);
 }
 
+// Lens correction (see docs/lens.md, and core/src/lens.rs which does the same on the CPU): where
+// a position in the corrected image sits in the sensor image. The ratio of source radius to
+// corrected radius for green, at corrected radius r (in half-diagonals).
+float lensGreenRatio(float r)
+{
+    float scale = lensA.y;
+    if (lensA.x == 1.0)
+    {
+        float rs2 = r * scale * r * scale;
+        return scale * (1.0 + rs2 * (lensK.x + rs2 * (lensK.y + rs2 * lensK.z)));
+    }
+    // Panasonic: two rounds of rd = r / f(rd) invert the polynomial closely enough.
+    float rd = r;
+    [unroll] for (int i = 0; i < 2; i++)
+    {
+        float rd2 = rd * rd;
+        float f = 1.0 + scale * rd2 * (lensK.x + rd2 * (lensK.y + rd2 * lensK.z));
+        rd = f > 1e-6 ? r / f : r;
+    }
+    return r > 0.0 ? rd / r : 1.0;
+}
+
+// The sensor-image position for a corrected-image position; ca is the colour's chromatic
+// aberration terms (zero for green).
+float2 lensWarp(float2 uv, float2 dims, float3 ca, bool useCa)
+{
+    float2 q = (uv - 0.5) * dims * lensA.z;
+    float r = length(q) / (0.5 * length(dims));
+    float g = lensGreenRatio(r);
+    if (useCa)
+    {
+        float rd2 = g * r * g * r;
+        g *= 1.0 + ca.x + rd2 * (ca.y + rd2 * ca.z);
+    }
+    return 0.5 + q * g / dims;
+}
+
 [RootSignature(DEVELOP_ROOT_SIGNATURE)]
 [numthreads(16, 16, 1)]
 void main(uint3 id : SV_DispatchThreadID)
@@ -100,16 +141,33 @@ void main(uint3 id : SV_DispatchThreadID)
     if (id.x >= outWidth || id.y >= outHeight)
         return;
     float2 uv = origin + (id.x + 0.5) * stepX + (id.y + 0.5) * stepY;
+    float2 uv_in = uv;
     if (any(uv < 0.0) || any(uv > 1.0))
     {
         output[id.xy] = float4(0.11, 0.11, 0.11, 1.0); // the empty canvas around the photo
         return;
     }
-    float4 texel = image.SampleLevel(linearClamp, uv, lod);
     if (mode == 1)
     {
-        output[id.xy] = float4(texel.bgr, 1.0);
+        output[id.xy] = float4(image.SampleLevel(linearClamp, uv, lod).bgr, 1.0);
         return;
+    }
+    float4 texel;
+    if (lensA.x != 0.0)
+    {
+        float2 dims;
+        image.GetDimensions(dims.x, dims.y);
+        uv = lensWarp(uv, dims, 0.0, false); // the tone base layer follows the sensor image too
+        texel = image.SampleLevel(linearClamp, uv, lod);
+        if (lensA.w != 0.0)
+        {
+            texel.r = image.SampleLevel(linearClamp, lensWarp(uv_in, dims, lensR.xyz, true), lod).r;
+            texel.b = image.SampleLevel(linearClamp, lensWarp(uv_in, dims, lensB.xyz, true), lod).b;
+        }
+    }
+    else
+    {
+        texel = image.SampleLevel(linearClamp, uv, lod);
     }
     float3 cam = texel.rgb;
     float3 wide = float3(dot(row0.xyz, cam), dot(row1.xyz, cam), dot(row2.xyz, cam));

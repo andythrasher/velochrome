@@ -18,3 +18,4 @@ pub mod xmp;
 pub mod ratings;
 pub mod develop;
 pub mod tone;
+pub mod lens;

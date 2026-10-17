@@ -12,6 +12,7 @@ use rawler::rawimage::RawPhotometricInterpretation;
 use rawler::rawsource::RawSource;
 
 use crate::color::{self, Mat3};
+use crate::lens::LensCorrection;
 
 /// Clockwise rotation (and mirroring) to apply when displaying, from the file's metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -51,6 +52,8 @@ pub struct RawFrame {
     /// The camera's XYZ → camera RGB matrix (D65), for white balance in temperature and tint.
     pub xyz_to_cam: Mat3,
     pub orientation: Orientation,
+    /// The distortion (and chromatic aberration) correction the camera recorded, if any.
+    pub lens: Option<LensCorrection>,
     pub decode_time: Duration,
 }
 
@@ -137,6 +140,12 @@ pub fn decode_file(path: &Path) -> Result<RawFrame, DecodeError> {
 
     // rawler leaves orientation unset for ORF and RW2; both keep the standard tag in IFD0.
     let orientation = to_orientation(tiff_orientation(source.buf()).unwrap_or(raw.orientation));
+    // WINDEDIT_NO_LENS=1 shows the uncorrected image, for comparing.
+    let lens = if std::env::var_os("WINDEDIT_NO_LENS").is_some() {
+        None
+    } else {
+        LensCorrection::from_raw(source.buf(), w as u32, h as u32)
+    };
 
     Ok(RawFrame {
         make: raw.clean_make.clone(),
@@ -151,6 +160,7 @@ pub fn decode_file(path: &Path) -> Result<RawFrame, DecodeError> {
         cam_to_working: color::camera_to_working(xyz_to_cam),
         xyz_to_cam,
         orientation,
+        lens,
         decode_time: start.elapsed(),
     })
 }
