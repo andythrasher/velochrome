@@ -50,6 +50,8 @@ pub enum Command {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FrameEvent {
+    /// `EVENT_FRAME` or `EVENT_THUMBNAIL`.
+    pub kind: u32,
     pub photo: i32,
     /// What was drawn: 1 quick preview, 2 loupe preview, 3 full-size preview, 4 the raw.
     pub layer: u32,
@@ -75,8 +77,14 @@ pub fn layer_code(kind: Kind) -> u32 {
         Kind::Loupe => 2,
         Kind::Full => 3,
         Kind::Raw => 4,
+        Kind::Thumb => 0,
     }
 }
+
+/// `FrameEvent::kind`: a frame was drawn.
+pub const EVENT_FRAME: u32 = 1;
+/// `FrameEvent::kind`: the photo's thumbnail is ready (only `photo` is set).
+pub const EVENT_THUMBNAIL: u32 = 2;
 
 pub type EventSink = Box<dyn Fn(&FrameEvent) + Send>;
 
@@ -267,6 +275,9 @@ impl Viewer {
                 self.offscreen = Target::new(&self.gpu, width, height).ok();
                 self.dirty = true;
             }
+            Command::Ready(index, Kind::Thumb) => {
+                (self.events)(&FrameEvent { kind: EVENT_THUMBNAIL, photo: index as i32, ..Default::default() });
+            }
             Command::Ready(index, kind) => {
                 if kind == Kind::Raw
                     && let Some(frame) = self.jobs.raw(index)
@@ -409,6 +420,7 @@ impl Viewer {
             }
         };
         (self.events)(&FrameEvent {
+            kind: EVENT_FRAME,
             photo: index as i32,
             layer: layer_code(kind),
             width,

@@ -4,10 +4,11 @@ A raw photo editor for Windows, built for speed: a Rust engine that develops pho
 with a native WinUI app on top. Mac and Linux versions are planned, each with its own native app
 on the same engine.
 
-It's at **Phase 1, milestone 1a**: the engine for culling. Previews show at once, raws are
-decoded ahead in the background, and the test window moves through a folder. See
-[docs/phase0.md](docs/phase0.md) for the engine test, [docs/phase1-plan.md](docs/phase1-plan.md)
-for the plan and [docs/phase1a.md](docs/phase1a.md) for what 1a measured.
+It's at **Phase 1, milestone 1b**: culling. Open a folder, move through it in a loupe or a grid,
+and rate, flag and label photos with Lightroom's keys; it all goes into Lightroom-compatible XMP
+sidecars. See [docs/phase1-plan.md](docs/phase1-plan.md) for the plan, and
+[docs/phase0.md](docs/phase0.md), [docs/phase1a.md](docs/phase1a.md) and
+[docs/phase1b.md](docs/phase1b.md) for what each step built and measured.
 
 Cameras tested: OM System OM-5 Mark II, Panasonic Lumix S1 and S9. The decoder (rawler)
 knows many more, but they're untested.
@@ -19,12 +20,14 @@ shader compiler; Visual Studio Build Tools include it).
 
 ```
 dotnet build app/Windedit
-app/Windedit/bin/Debug/net10.0-windows10.0.26100.0/win-x64/Windedit.exe [a photo]
+app/Windedit/bin/Debug/net10.0-windows10.0.26100.0/win-x64/Windedit.exe [a folder or photo]
 ```
 
-In the window: Ctrl+O opens a photo and its folder, ←/→/Home/End move through it, a click
-zooms to 100% there (and back), E switches between Cull mode (the camera's JPEGs) and Edit mode
-(the developed raw), and F12 saves the last frame the engine drew to `%TEMP%\windedit-snapshot.png`.
+In the window: Ctrl+O opens a folder. The keys follow Lightroom: ← → to move, 0–5 for stars,
+P / X / U to pick, reject or clear, 6–9 for color labels (Shift or Caps Lock moves on after
+rating), Z or a click for 100%, G for the grid, E for the loupe, D for Edit mode (the developed
+raw rather than the camera's JPEGs). Ratings, flags and labels are saved to each photo's `.xmp`
+sidecar. F12 saves the last frame the engine drew to `%TEMP%\windedit-snapshot.png`.
 
 Building the app builds the engine first (`cargo build --release -p windedit-core`).
 
@@ -37,8 +40,9 @@ target/release/bench.exe cull <a folder>
 ```
 
 `gpu` also writes a PNG of each photo's fitted view to `target/release/renders`. `cull` runs
-the whole engine the way culling uses it (see [docs/phase1a.md](docs/phase1a.md)). `jpegs`,
-`previewpng` and `snapshot` are diagnostics.
+the whole engine the way culling uses it (see [docs/phase1a.md](docs/phase1a.md)); `thumbs <a
+folder>` times thumbnails for a grid; `xmpcheck <folder of .xmp>` checks that sidecars would
+update cleanly, writing nothing. `jpegs`, `previewpng` and `snapshot` are diagnostics.
 
 To run it on another PC (no .NET or Rust needed there):
 
@@ -57,6 +61,7 @@ then copy `target/release/bench.exe` into that folder too.
 - `docs/`: plans and findings.
 
 Set `WINDEDIT_D3D_DEBUG=1` to turn on the Direct3D debug layer (needs Windows' Graphics Tools).
+`WINDEDIT_NO_ECO=1` runs background decoding at normal priority instead of EcoQoS, for comparing.
 
 ## License
 

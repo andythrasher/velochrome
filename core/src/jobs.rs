@@ -26,7 +26,12 @@ pub enum Kind {
     Full,
     /// The raw sensor data.
     Raw,
+    /// A small preview for the filmstrip and grid.
+    Thumb,
 }
+
+/// Thumbnails' longer side, in pixels: sharp in a grid cell of about 170 DIPs at 150% scaling.
+pub const THUMB_EDGE: u32 = 256;
 
 const PREVIEW_KINDS: [Kind; 3] = [Kind::Fast, Kind::Loupe, Kind::Full];
 
@@ -58,6 +63,16 @@ struct State {
     /// Bumped when the folder changes, so results for the old one are dropped.
     generation: u64,
     focus: Focus,
+    /// The order the user moves through the photos in (sorted and filtered by the app), which
+    /// decides which photos are "next". Photos left out of it aren't prefetched.
+    order: Vec<usize>,
+    /// Each photo's place in `order`.
+    position: Vec<Option<usize>>,
+    /// Photos whose thumbnails are on screen (filmstrip or grid), most important first.
+    visible: Vec<usize>,
+    thumbs: HashMap<usize, Entry<Thumbnail>>,
+    thumb_bytes: usize,
+    thumb_budget: usize,
     /// Wanted jobs, most wanted first, with their priority (0 is highest).
     wanted: Vec<(usize, Kind, u8)>,
     wanted_set: HashSet<(usize, Kind)>,
@@ -95,6 +110,13 @@ impl Jobs {
                 photos: Arc::new(Vec::new()),
                 generation: 0,
                 focus: Focus { index: 0, direction: 1, loupe_edge: 2560, need_raw: false },
+                order: Vec::new(),
+                position: Vec::new(),
+                visible: Vec::new(),
+                thumbs: HashMap::new(),
+                thumb_bytes: 0,
+                // 175 KB each at 256 pixels: about 1,500 thumbnails.
+                thumb_budget: 256 << 20,
                 wanted: Vec::new(),
                 wanted_set: HashSet::new(),
                 in_flight: HashSet::new(),
@@ -135,13 +157,18 @@ impl Jobs {
     /// Switches to another set of photos (a folder), dropping everything cached.
     pub fn set_photos(&self, photos: Arc<Vec<Photo>>) {
         let mut s = self.state.lock().unwrap();
+        let n = photos.len();
         s.photos = photos;
         s.generation += 1;
         s.previews.clear();
         s.raws.clear();
+        s.thumbs.clear();
         s.failed.clear();
         s.preview_bytes = 0;
         s.raw_bytes = 0;
+        s.thumb_bytes = 0;
+        s.visible.clear();
+        s.set_order((0..n).collect());
         s.focus.index = 0;
         s.plan();
         drop(s);
@@ -150,6 +177,36 @@ impl Jobs {
 
     pub fn photos(&self) -> Arc<Vec<Photo>> {
         self.state.lock().unwrap().photos.clone()
+    }
+
+    /// The order the user moves through the photos (e.g. sorted and filtered), for deciding
+    /// which photos are next. Photos left out aren't prefetched.
+    pub fn set_order(&self, order: Vec<usize>) {
+        let mut s = self.state.lock().unwrap();
+        s.set_order(order);
+        s.plan();
+        drop(s);
+        self.wake.notify_all();
+    }
+
+    /// Photos whose thumbnails are on screen, most important first.
+    pub fn set_visible(&self, visible: Vec<usize>) {
+        let mut s = self.state.lock().unwrap();
+        let n = s.photos.len();
+        s.visible = visible.into_iter().filter(|&i| i < n).collect();
+        s.plan();
+        drop(s);
+        self.wake.notify_all();
+    }
+
+    pub fn thumbnail(&self, index: usize) -> Option<Arc<Thumbnail>> {
+        let mut s = self.state.lock().unwrap();
+        s.clock += 1;
+        let now = s.clock;
+        s.thumbs.get_mut(&index).map(|e| {
+            e.last_used = now;
+            e.value.clone()
+        })
     }
 
     pub fn set_focus(&self, focus: Focus) {
@@ -228,6 +285,8 @@ impl Jobs {
                     Some(path) => decode::decode_file(path).map(|f| Done::Raw(Arc::new(f))),
                     None => Err(decode::DecodeError("no raw file".into())),
                 },
+                Kind::Thumb => preview::load(&photo, Want::Cover(THUMB_EDGE))
+                    .map(|p| Done::Thumb(Arc::new(Thumbnail::from_preview(&p, THUMB_EDGE)))),
                 _ => {
                     let want = match kind {
                         Kind::Fast => Want::Fast,
@@ -251,6 +310,10 @@ impl Jobs {
                             s.insert_raw(index, frame);
                             satisfied.push(Kind::Raw);
                         }
+                        Ok(Done::Thumb(t)) => {
+                            s.insert_thumb(index, t);
+                            satisfied.push(Kind::Thumb);
+                        }
                         Ok(Done::Preview(p)) => {
                             // A preview can stand in for other kinds too: a 3200-pixel embedded
                             // JPEG is both the quickest and one that covers a 2560 view.
@@ -266,6 +329,10 @@ impl Jobs {
                         }
                         Err(_) => {
                             s.failed.insert((index, kind));
+                            // A grid cell waits for its thumbnail, so say it won't come.
+                            if kind == Kind::Thumb {
+                                satisfied.push(Kind::Thumb);
+                            }
                         }
                     }
                 }
@@ -292,6 +359,71 @@ pub fn shutdown(jobs: &Arc<Jobs>) {
 enum Done {
     Preview(Arc<Preview>),
     Raw(Arc<RawFrame>),
+    Thumb(Arc<Thumbnail>),
+}
+
+/// A small, upright preview for the filmstrip and grid: 8-bit BGRA with opaque alpha (what
+/// WinUI's WriteableBitmap takes), rows packed.
+pub struct Thumbnail {
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
+}
+
+impl Thumbnail {
+    /// Shrinks a preview to fit `edge` (averaging blocks of pixels) and turns it upright, so
+    /// an app can show it as it is.
+    pub fn from_preview(p: &Preview, edge: u32) -> Thumbnail {
+        let (sw, sh) = (p.pixels.width as usize, p.pixels.height as usize);
+        let scale = (edge as f32 / sw.max(sh) as f32).min(1.0);
+        let (w, h) = (((sw as f32 * scale).round() as usize).max(1), ((sh as f32 * scale).round() as usize).max(1));
+        let mut small = vec![0u8; w * h * 4];
+        for y in 0..h {
+            let (y0, y1) = (y * sh / h, ((y + 1) * sh / h).max(y * sh / h + 1));
+            for x in 0..w {
+                let (x0, x1) = (x * sw / w, ((x + 1) * sw / w).max(x * sw / w + 1));
+                let mut sum = [0u32; 3];
+                for sy in y0..y1 {
+                    for sx in x0..x1 {
+                        let i = (sy * sw + sx) * 4;
+                        for (s, &v) in sum.iter_mut().zip(&p.pixels.bgra[i..i + 3]) {
+                            *s += v as u32;
+                        }
+                    }
+                }
+                let n = ((y1 - y0) * (x1 - x0)) as u32;
+                let o = (y * w + x) * 4;
+                for (d, s) in small[o..o + 3].iter_mut().zip(sum) {
+                    *d = (s / n) as u8;
+                }
+                small[o + 3] = 255;
+            }
+        }
+        rotate(small, w, h, p.orientation)
+    }
+}
+
+fn rotate(px: Vec<u8>, w: usize, h: usize, orientation: crate::decode::Orientation) -> Thumbnail {
+    use crate::decode::Orientation::*;
+    if orientation == Normal {
+        return Thumbnail { width: w as u32, height: h as u32, bgra: px };
+    }
+    let (ow, oh) = if orientation.swaps_axes() { (h, w) } else { (w, h) };
+    let mut out = vec![0u8; px.len()];
+    for y in 0..h {
+        for x in 0..w {
+            // Where source pixel (x, y) lands once rotated clockwise by the orientation.
+            let (nx, ny) = match orientation {
+                Rotate90 => (h - 1 - y, x),
+                Rotate180 => (w - 1 - x, h - 1 - y),
+                Rotate270 => (y, w - 1 - x),
+                Normal => (x, y),
+            };
+            let (s, d) = ((y * w + x) * 4, (ny * ow + nx) * 4);
+            out[d..d + 4].copy_from_slice(&px[s..s + 4]);
+        }
+    }
+    Thumbnail { width: ow as u32, height: oh as u32, bgra: out }
 }
 
 fn satisfies(p: &Preview, kind: Kind, loupe_edge: u32) -> bool {
@@ -301,7 +433,7 @@ fn satisfies(p: &Preview, kind: Kind, loupe_edge: u32) -> bool {
         Kind::Fast => true,
         Kind::Loupe => decoded >= loupe_edge || (p.is_largest && full_size),
         Kind::Full => p.is_largest && full_size,
-        Kind::Raw => false,
+        Kind::Raw | Kind::Thumb => false,
     }
 }
 
@@ -312,9 +444,18 @@ impl State {
         let mut wanted: Vec<(usize, Kind, u8)> = Vec::new();
         let f = self.focus;
         if n > 0 {
+            // Neighbours in the order the user moves through (filters and sorting included). A
+            // photo outside that order (just filtered out) still gets its own previews.
+            let here = self.position.get(f.index).copied().flatten();
+            let order = &self.order;
             let at = |offset: i32| -> Option<usize> {
-                let i = f.index as i64 + (offset * f.direction) as i64;
-                (0..n as i64).contains(&i).then_some(i as usize)
+                match here {
+                    Some(pos) => {
+                        let p = pos as i64 + (offset * f.direction) as i64;
+                        (0..order.len() as i64).contains(&p).then(|| order[p as usize])
+                    }
+                    None => (offset == 0 && f.index < n).then_some(f.index),
+                }
             };
             let raw_priority = if f.need_raw { 1 } else { 4 };
             let mut add = |offset: i32, kind: Kind, priority: u8| {
@@ -345,11 +486,39 @@ impl State {
             for d in 5..=12 {
                 add(d, Kind::Fast, 7);
             }
+            // Thumbnails on screen come right after the photo in view: they're cheap, and an
+            // empty grid is the first thing anyone would notice.
+            for (rank, &i) in self.visible.iter().enumerate() {
+                wanted.push((i, Kind::Thumb, if rank < 64 { 1 } else { 3 }));
+            }
         }
         wanted.retain(|&(i, kind, _)| kind != Kind::Raw || self.photos[i].raw.is_some());
         wanted.sort_by_key(|&(_, _, priority)| priority); // stable: keeps the order above within a priority
         self.wanted_set = wanted.iter().map(|&(i, k, _)| (i, k)).collect();
         self.wanted = wanted;
+    }
+
+    fn set_order(&mut self, order: Vec<usize>) {
+        let n = self.photos.len();
+        self.position = vec![None; n];
+        let order: Vec<usize> = order.into_iter().filter(|&i| i < n).collect();
+        for (pos, &i) in order.iter().enumerate() {
+            self.position[i] = Some(pos);
+        }
+        self.order = order;
+    }
+
+    fn insert_thumb(&mut self, index: usize, value: Arc<Thumbnail>) {
+        self.clock += 1;
+        let bytes = value.bgra.len();
+        if let Some(old) = self.thumbs.insert(index, Entry { value, bytes, last_used: self.clock }) {
+            self.thumb_bytes -= old.bytes;
+        }
+        self.thumb_bytes += bytes;
+        while self.thumb_bytes > self.thumb_budget {
+            let Some(key) = oldest(&self.thumbs, |&i| !self.wanted_set.contains(&(i, Kind::Thumb))) else { break };
+            self.thumb_bytes -= self.thumbs.remove(&key).unwrap().bytes;
+        }
     }
 
     /// The most wanted job that isn't done, running or failed, marked as running. Raws leave
@@ -361,6 +530,7 @@ impl State {
                 && !self.failed.contains(&(i, kind))
                 && match kind {
                     Kind::Raw => !self.raws.contains_key(&i) && self.raws_in_flight < raw_limit,
+                    Kind::Thumb => !self.thumbs.contains_key(&i),
                     _ => !self.previews.contains_key(&(i, kind)),
                 }
         })?;

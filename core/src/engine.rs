@@ -9,6 +9,7 @@ use std::thread::JoinHandle;
 
 use crate::jobs::{self, Focus, Jobs};
 use crate::library::{self, Photo};
+use crate::ratings::Ratings;
 use crate::pipeline::Zoom;
 use crate::viewer::{self, Command, EventSink, GpuInfo};
 
@@ -18,6 +19,7 @@ pub struct Engine {
     gpu_thread: Option<JoinHandle<()>>,
     pub info: GpuInfo,
     view: Mutex<ViewState>,
+    ratings: Ratings,
 }
 
 /// What decides which decodes are wanted.
@@ -50,6 +52,7 @@ impl Engine {
             viewer: tx,
             gpu_thread: Some(gpu_thread),
             info,
+            ratings: Ratings::new(),
             view: Mutex::new(ViewState {
                 index: None,
                 direction: 1,
@@ -64,6 +67,7 @@ impl Engine {
     pub fn open_folder(&self, dir: &Path) -> std::io::Result<usize> {
         let photos = library::scan_folder(dir)?;
         let count = photos.len();
+        self.ratings.load(dir, &photos);
         self.view.lock().unwrap().index = None;
         let _ = self.viewer.send(Command::Folder);
         self.jobs.set_photos(Arc::new(photos));
@@ -146,6 +150,22 @@ impl Engine {
         result.recv().ok().flatten()
     }
 
+    /// Every photo's stars, label and pick flag, in folder order.
+    pub fn ratings(&self) -> &Ratings {
+        &self.ratings
+    }
+
+    /// The order the user moves through the photos (sorted and filtered), so the right
+    /// neighbours are decoded ahead.
+    pub fn set_order(&self, order: Vec<usize>) {
+        self.jobs.set_order(order);
+    }
+
+    /// Photos whose thumbnails are on screen, most important first.
+    pub fn set_visible(&self, visible: Vec<usize>) {
+        self.jobs.set_visible(visible);
+    }
+
     pub fn jobs(&self) -> &Arc<Jobs> {
         &self.jobs
     }
@@ -168,5 +188,6 @@ impl Drop for Engine {
             let _ = thread.join();
         }
         jobs::shutdown(&self.jobs);
+        self.ratings.finish();
     }
 }

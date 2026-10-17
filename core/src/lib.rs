@@ -14,3 +14,5 @@ pub mod jobs;
 pub mod sys;
 pub mod engine;
 pub mod viewer;
+pub mod xmp;
+pub mod ratings;

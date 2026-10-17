@@ -9,7 +9,7 @@ namespace Windedit;
 /// engine's threads, and each frame drawn raises <see cref="FrameDrawn"/> on the engine's GPU
 /// thread (not the UI thread). Failed calls throw with the engine's message.
 /// </summary>
-sealed unsafe partial class Engine : IDisposable
+public sealed unsafe partial class Engine : IDisposable
 {
     const string Dll = "windedit_core";
 
@@ -17,6 +17,8 @@ sealed unsafe partial class Engine : IDisposable
     [StructLayout(LayoutKind.Sequential)]
     public struct Frame
     {
+        /// <summary>1: a frame was drawn. 2: the photo's thumbnail is ready (only Photo is set).</summary>
+        public uint Kind;
         public int Photo;
         /// <summary>1 quick preview, 2 loupe preview, 3 full-size preview, 4 the raw.</summary>
         public uint Layer;
@@ -42,11 +44,33 @@ sealed unsafe partial class Engine : IDisposable
     [LibraryImport(Dll)] private static partial int we_view_resize(IntPtr engine, uint width, uint height, float scale, out IntPtr chain);
     [LibraryImport(Dll)] private static partial int we_prepare(IntPtr engine, uint width, uint height);
     [LibraryImport(Dll, StringMarshalling = StringMarshalling.Utf16)] private static partial int we_save_snapshot(IntPtr engine, string path);
+    [LibraryImport(Dll)] private static partial int we_get_metadata(IntPtr engine, Metadata* output, int count);
+    [LibraryImport(Dll)] private static partial int we_set_rating(IntPtr engine, int index, int rating);
+    [LibraryImport(Dll)] private static partial int we_set_pick(IntPtr engine, int index, int pick);
+    [LibraryImport(Dll)] private static partial int we_set_label(IntPtr engine, int index, int label);
+    [LibraryImport(Dll)] private static partial int we_set_order(IntPtr engine, int* order, int count);
+    [LibraryImport(Dll)] private static partial int we_set_visible(IntPtr engine, int* visible, int count);
+    [LibraryImport(Dll)] private static partial int we_thumbnail(IntPtr engine, int index, byte* buf, int capacity, out int width, out int height);
+
+    public const uint FrameEvent = 1, ThumbnailEvent = 2;
+
+    /// <summary>
+    /// A photo's stars (0–5), pick flag (1 picked, -1 rejected, 0 neither) and color label
+    /// (1–5: Red, Yellow, Green, Blue, Purple; 6 another name; 0 none). Saved in its XMP sidecar.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Metadata
+    {
+        public int Rating, Pick, Label;
+    }
 
     IntPtr handle;
     GCHandle self;
 
-    /// <summary>Raised on the engine's GPU thread after every frame drawn.</summary>
+    /// <summary>
+    /// Raised on the engine's GPU thread after every frame drawn, and when a thumbnail is ready
+    /// (see <see cref="Frame.Kind"/>).
+    /// </summary>
     public event Action<Frame>? FrameDrawn;
 
     public Engine()
@@ -100,6 +124,48 @@ sealed unsafe partial class Engine : IDisposable
 
     /// <summary>Allocates GPU memory for photos with this sensor size, ahead of the first one.</summary>
     public void Prepare(uint width, uint height) => Check(we_prepare(handle, width, height));
+
+    /// <summary>Every photo's metadata, in folder order.</summary>
+    public Metadata[] GetMetadata(int count)
+    {
+        var all = new Metadata[count];
+        fixed (Metadata* p = all)
+            Check(we_get_metadata(handle, p, count));
+        return all;
+    }
+
+    public void SetRating(int index, int rating) => Check(we_set_rating(handle, index, rating));
+
+    public void SetPick(int index, int pick) => Check(we_set_pick(handle, index, pick));
+
+    public void SetLabel(int index, int label) => Check(we_set_label(handle, index, label));
+
+    /// <summary>The order the user moves through the photos, so the right ones are decoded ahead.</summary>
+    public void SetOrder(ReadOnlySpan<int> order)
+    {
+        fixed (int* p = order)
+            Check(we_set_order(handle, p, order.Length));
+    }
+
+    /// <summary>Photos whose thumbnails are on screen, most important first.</summary>
+    public void SetVisible(ReadOnlySpan<int> visible)
+    {
+        fixed (int* p = visible)
+            Check(we_set_visible(handle, p, visible.Length));
+    }
+
+    /// <summary>Thumbnail capacity: 256×256 BGRA.</summary>
+    public const int ThumbnailBytes = 256 * 256 * 4;
+
+    /// <summary>
+    /// Copies a photo's thumbnail (BGRA, upright) into <paramref name="buffer"/>: 1 if copied,
+    /// 0 if not ready yet, 2 if there won't be one.
+    /// </summary>
+    public int GetThumbnail(int index, Span<byte> buffer, out int width, out int height)
+    {
+        fixed (byte* p = buffer)
+            return Check(we_thumbnail(handle, index, p, buffer.Length, out width, out height));
+    }
 
     /// <summary>Saves the last frame drawn as a PNG (a diagnostic).</summary>
     public void SaveSnapshot(string path) => Check(we_save_snapshot(handle, path));

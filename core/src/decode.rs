@@ -182,9 +182,13 @@ pub fn embedded_jpegs(bytes: &[u8]) -> Vec<EmbeddedJpeg> {
             continue;
         };
         found.push(EmbeddedJpeg { offset: soi, width, height });
-        match jpeg_end(&bytes[soi..], 0) {
-            Some(len) => i = soi + len,
-            None => break,
+        match jpeg_extent(&bytes[soi..], 0) {
+            Extent::Complete(len) => i = soi + len,
+            Extent::Truncated => break,
+            Extent::Invalid => {
+                found.pop();
+                i = soi + 3;
+            }
         }
     }
     found
@@ -251,22 +255,50 @@ pub fn orientation_of(head: &[u8]) -> Orientation {
 /// after the scan header is searched, so a thumbnail's end marker inside the EXIF block isn't
 /// mistaken for it; `from` skips data already searched by an earlier call.
 pub fn jpeg_end(jpeg: &[u8], from: usize) -> Option<usize> {
+    match jpeg_extent(jpeg, from) {
+        Extent::Complete(len) => Some(len),
+        Extent::Truncated | Extent::Invalid => None,
+    }
+}
+
+/// How much of `jpeg` a JPEG starting at its first byte takes up.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Extent {
+    /// All there: this many bytes, through the end marker.
+    Complete(usize),
+    /// Well-formed as far as it goes, but it runs past the end of `jpeg`.
+    Truncated,
+    /// Not a JPEG after all: its marker segments don't chain together (a chance FF D8 FF in
+    /// other data, as found in some OM-5 II files).
+    Invalid,
+}
+
+pub fn jpeg_extent(jpeg: &[u8], from: usize) -> Extent {
     let mut j = 2;
     let data_start = loop {
-        if j + 4 > jpeg.len() || jpeg[j] != 0xFF {
-            return None;
+        if j + 4 > jpeg.len() {
+            return Extent::Truncated;
         }
+        let marker = jpeg[j + 1];
+        // Every segment before the scan starts with FF and a marker byte, then a length of at
+        // least 2. Anything else means these bytes were never a JPEG.
         let len = u16::from_be_bytes([jpeg[j + 2], jpeg[j + 3]]) as usize;
-        if jpeg[j + 1] == 0xDA {
+        if jpeg[j] != 0xFF || marker == 0x00 || marker == 0xFF || len < 2 {
+            return Extent::Invalid;
+        }
+        if marker == 0xDA {
             break j + 2 + len;
         }
         j += 2 + len;
     };
     let start = from.max(data_start);
     if start >= jpeg.len() {
-        return None;
+        return Extent::Truncated;
     }
-    memchr::memmem::find(&jpeg[start..], &[0xFF, 0xD9]).map(|p| start + p + 2)
+    match memchr::memmem::find(&jpeg[start..], &[0xFF, 0xD9]) {
+        Some(p) => Extent::Complete(start + p + 2),
+        None => Extent::Truncated,
+    }
 }
 
 #[cfg(test)]
@@ -311,6 +343,19 @@ mod tests {
         let found = embedded_jpegs(&file);
         let sizes: Vec<_> = found.iter().map(|j| (j.offset, j.width, j.height)).collect();
         assert_eq!(sizes, vec![(100, 1920, 1280), (full_at, 6000, 4000)]);
+    }
+
+    #[test]
+    fn skips_a_false_jpeg_start() {
+        // FF D8 FF and a frame header by chance, but the segments don't chain (as in some
+        // OM-5 II raws), then the real preview.
+        let mut file = vec![0u8; 20];
+        file.extend([0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x0A, 0xFF, 0x06, 0x00, 0x03, 0x01, 0x00, 0x00, 0x7F, 0x13]);
+        file.extend([0x42u8; 40]);
+        let real_at = file.len();
+        file.extend(jpeg(3200, 2400, &[9; 32]));
+        let found: Vec<_> = embedded_jpegs(&file).iter().map(|j| (j.offset, j.width)).collect();
+        assert_eq!(found, vec![(real_at, 3200)]);
     }
 
     #[test]

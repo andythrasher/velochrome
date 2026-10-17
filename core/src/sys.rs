@@ -21,6 +21,9 @@ pub fn physical_memory_bytes() -> usize {
 /// on a hybrid CPU that keeps the performance cores free for what the user is waiting on, and
 /// saves battery.
 pub fn set_background(background: bool) {
+    if std::env::var_os("WINDEDIT_NO_ECO").is_some() {
+        return; // for measuring what EcoQoS costs
+    }
     unsafe {
         let thread = GetCurrentThread();
         let state = THREAD_POWER_THROTTLING_STATE {

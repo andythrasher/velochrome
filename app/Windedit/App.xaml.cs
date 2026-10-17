@@ -10,8 +10,8 @@ public partial class App : Application
 
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
-        // A raw file named on the command line opens straight away.
-        var path = Environment.GetCommandLineArgs().Skip(1).FirstOrDefault(File.Exists);
+        // A photo or folder named on the command line opens straight away.
+        var path = Environment.GetCommandLineArgs().Skip(1).FirstOrDefault(p => File.Exists(p) || Directory.Exists(p));
         window = new MainWindow(path);
         window.Activate();
     }

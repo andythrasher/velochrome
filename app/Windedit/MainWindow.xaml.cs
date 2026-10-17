@@ -1,103 +1,404 @@
+using System.Runtime.InteropServices.WindowsRuntime;
+using Microsoft.UI.Input;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
-using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
+using Microsoft.UI.Xaml.Media.Imaging;
 using Windows.Storage.Pickers;
 using Windows.System;
+using Windows.UI.Core;
 
 namespace Windedit;
 
 /// <summary>
-/// Phase 1a test window: open a photo, move through its folder, and see what the engine drew
-/// and how soon. The engine does the work on its own threads; this window only sends requests
-/// and shows the frame reports it gets back.
+/// Culling: a folder's photos in a loupe with a filmstrip, or a grid; stars, pick flags and color
+/// labels with Lightroom's keys, saved to XMP sidecars by the engine; filters. The engine decodes
+/// and draws on its own threads; this window sends requests and shows what comes back.
 /// </summary>
 public sealed partial class MainWindow : Window
 {
-    static readonly string[] Extensions = [".orf", ".rw2", ".dng", ".jpg", ".jpeg"];
     static readonly string[] LayerNames = ["", "quick preview", "loupe preview", "full-size preview", "raw"];
+    static readonly string[] LabelNames = ["", "Red", "Yellow", "Green", "Blue", "Purple", "label"];
+    static readonly string AppData = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Windedit");
     // Sensor sizes seen, so the next launch can allocate GPU memory for them before it's needed.
-    static readonly string SizesFile = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Windedit", "sizes.txt");
+    static readonly string SizesFile = Path.Combine(AppData, "sizes.txt");
+    static readonly string RecentFile = Path.Combine(AppData, "recent.txt");
 
     readonly Engine engine;
     readonly Microsoft.UI.Dispatching.DispatcherQueue ui;
-    int count, index = -1;
-    bool actualSize;
-    Engine.Frame last;
     readonly List<(uint, uint)> sizes = [];
+    readonly byte[] thumbnailBuffer = new byte[Engine.ThumbnailBytes];
+
+    string? folder;
+    /// <summary>Every photo in the folder, by its engine index.</summary>
+    PhotoItem[] all = [];
+    /// <summary>The photos the filters let through, in order.</summary>
+    List<PhotoItem> shown = [];
+    /// <summary>Position of the current photo in <see cref="shown"/>, or -1.</summary>
+    int position = -1;
+    PhotoItem? CurrentPhoto => position >= 0 && position < shown.Count ? shown[position] : null;
+
+    bool gridMode, actualSize, editMode;
+    Engine.Frame last;
+    /// <summary>How many repeaters each photo is shown in (filmstrip, grid): its thumbnail is
+    /// kept while it's on screen somewhere.</summary>
+    readonly Dictionary<int, int> realized = [];
+    bool visibleUpdatePending;
 
     public MainWindow(string? startPath)
     {
         InitializeComponent();
-        AppWindow.Resize(new Windows.Graphics.SizeInt32(1600, 1000));
+        AppWindow.Resize(new Windows.Graphics.SizeInt32(1700, 1100));
         ui = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
         engine = new Engine();
-        engine.FrameDrawn += frame => ui.TryEnqueue(() => OnFrame(frame));
+        engine.FrameDrawn += e => ui.TryEnqueue(() => OnEngineEvent(e));
         Closed += (_, _) => engine.Dispose();
-        Content.KeyDown += Content_KeyDown;
+        // Every key goes through here, even ones a control already used, so the culling keys work
+        // wherever focus is (except while choosing from a list).
+        Root.AddHandler(UIElement.KeyDownEvent, new KeyEventHandler(Root_KeyDown), true);
+        FlagFilter.SelectedIndex = RatingFilter.SelectedIndex = LabelFilter.SelectedIndex = 0;
+        LoupeToggle.IsChecked = true;
         PrepareRememberedSizes();
-        Status.Text = $"{engine.AdapterName} · GPU warm-up {engine.WarmUpMs:F1} ms · Ctrl+O opens a photo";
+        RefreshRecentMenu();
+        EmptyText.Text = $"Open a folder of photos (Ctrl+O).\n\n{engine.AdapterName}";
+        TimingText.Text = $"GPU warm-up {engine.WarmUpMs:F1} ms";
+
         if (startPath != null)
-            OpenPhoto(startPath);
+        {
+            if (Directory.Exists(startPath))
+                OpenFolder(startPath, null);
+            else if (File.Exists(startPath))
+                OpenFolder(Path.GetDirectoryName(startPath)!, startPath);
+        }
     }
 
-    async void Open_Click(object sender, RoutedEventArgs e)
+    // ---- Opening ----
+
+    void OpenFolder_Click(SplitButton sender, SplitButtonClickEventArgs args) => PickFolder();
+
+    async void PickFolder()
     {
-        var picker = new FileOpenPicker { SuggestedStartLocation = PickerLocationId.PicturesLibrary };
-        foreach (var ext in Extensions)
-            picker.FileTypeFilter.Add(ext);
+        var picker = new FolderPicker { SuggestedStartLocation = PickerLocationId.PicturesLibrary };
+        picker.FileTypeFilter.Add("*");
         WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(this));
-        var file = await picker.PickSingleFileAsync();
-        if (file != null)
-            OpenPhoto(file.Path);
+        var picked = await picker.PickSingleFolderAsync();
+        if (picked != null)
+            OpenFolder(picked.Path, null);
     }
 
-    /// <summary>Opens the photo's folder and shows it.</summary>
-    void OpenPhoto(string path)
+    /// <summary>Opens a folder and shows <paramref name="photoPath"/> in it, or its first photo.</summary>
+    void OpenFolder(string path, string? photoPath)
     {
+        int count;
         try
         {
-            count = engine.OpenFolder(Path.GetDirectoryName(path)!);
-            Show(Math.Max(0, engine.FindPhoto(path)));
+            count = engine.OpenFolder(path);
         }
         catch (Exception ex)
         {
-            Status.Text = $"Couldn't open {Path.GetFileName(path)}: {ex.Message}";
+            EmptyText.Text = $"Couldn't open {path}: {ex.Message}";
+            return;
         }
+        folder = path;
+        realized.Clear();
+        var metadata = engine.GetMetadata(count);
+        all = new PhotoItem[count];
+        for (var i = 0; i < count; i++)
+            all[i] = new PhotoItem(i, engine.PhotoName(i)) { Metadata = metadata[i] };
+        RememberRecent(path);
+        Title = $"{Path.GetFileName(path)} – Windedit";
+        position = -1;
+        ApplyFilters(photoPath != null ? engine.FindPhoto(photoPath) : -1);
     }
 
-    void Show(int newIndex)
+    // ---- Filters ----
+
+    void Filter_Changed(object sender, SelectionChangedEventArgs e)
     {
-        if (newIndex < 0 || newIndex >= count)
+        if (all.Length > 0)
+            ApplyFilters(CurrentPhoto?.Index ?? -1);
+        FocusKeys();
+    }
+
+    bool Passes(Engine.Metadata m)
+    {
+        var flag = FlagFilter.SelectedIndex switch
+        {
+            1 => m.Pick != -1,
+            2 => m.Pick == 1,
+            3 => m.Pick == -1,
+            _ => true,
+        };
+        var label = LabelFilter.SelectedIndex <= 0 || m.Label == LabelFilter.SelectedIndex;
+        return flag && m.Rating >= Math.Max(0, RatingFilter.SelectedIndex) && label;
+    }
+
+    /// <summary>
+    /// Rebuilds the shown list and tells the engine the new order (so it prefetches the photos
+    /// that are next in it). Keeps <paramref name="keep"/> current if it still passes, else the
+    /// next photo that does.
+    /// </summary>
+    void ApplyFilters(int keep)
+    {
+        shown = all.Where(p => Passes(p.Metadata)).ToList();
+        engine.SetOrder(shown.Select(p => p.Index).ToArray());
+        realized.Clear();
+        Filmstrip.ItemsSource = shown;
+        GridRepeater.ItemsSource = shown;
+
+        foreach (var p in all)
+            p.IsCurrent = false;
+        position = -1;
+        if (shown.Count > 0)
+        {
+            var at = shown.FindIndex(p => p.Index >= Math.Max(0, keep));
+            ShowAt(at >= 0 ? at : shown.Count - 1);
+        }
+        UpdateEmptyText();
+        UpdateCounts();
+    }
+
+    void UpdateEmptyText()
+    {
+        EmptyText.Visibility = shown.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        if (all.Length > 0 && shown.Count == 0)
+            EmptyText.Text = "No photos match these filters.";
+        else if (all.Length == 0 && folder != null)
+            EmptyText.Text = "There are no photos in this folder.";
+    }
+
+    void UpdateCounts()
+    {
+        var picks = all.Count(p => p.Metadata.Pick == 1);
+        var rejects = all.Count(p => p.Metadata.Pick == -1);
+        CountText.Text = shown.Count == all.Length
+            ? $"{all.Length} photos · {picks} picks · {rejects} rejects"
+            : $"{shown.Count} of {all.Length} shown · {picks} picks · {rejects} rejects";
+    }
+
+    // ---- Moving ----
+
+    void ShowAt(int newPosition)
+    {
+        if (newPosition < 0 || newPosition >= shown.Count)
             return;
-        index = newIndex;
-        engine.Show(index);
-        Title = $"{engine.PhotoName(index)} ({index + 1} of {count}) – Windedit";
+        if (CurrentPhoto is { } old)
+            old.IsCurrent = false;
+        position = newPosition;
+        var item = shown[position];
+        item.IsCurrent = true;
+        if (actualSize)
+        {
+            actualSize = false;
+            engine.ZoomToFit();
+        }
+        engine.Show(item.Index);
+        BringIntoView(Filmstrip, horizontal: true);
+        if (gridMode)
+            BringIntoView(GridRepeater, horizontal: false);
+        UpdatePhotoText();
     }
 
-    void OnFrame(Engine.Frame f)
+    void BringIntoView(ItemsRepeater repeater, bool horizontal)
     {
-        last = f;
-        RememberSize(f.RawWidth, f.RawHeight);
-        if (f.Photo != index)
+        if (position < 0 || repeater.ItemsSourceView == null || position >= repeater.ItemsSourceView.Count)
             return;
-        var open = f.OpenMs > 0 ? $", raw opened on the GPU in {f.OpenMs:F1} ms" : "";
-        Status.Text = $"{engine.AdapterName} · {engine.PhotoName(index)} ({index + 1} of {count}) " +
-            $"{f.Width}×{f.Height} · {(actualSize ? "100%" : "fit")}{(EditToggle.IsChecked == true ? " · Edit" : "")}\n" +
-            $"Showing the {LayerNames[f.Layer]}, {f.SinceShowMs:F1} ms after it was asked for{open} · " +
-            $"frame: GPU {f.GpuMs:F2} ms, total {f.CpuMs:F2} ms";
+        var element = repeater.GetOrCreateElement(position);
+        element.UpdateLayout();
+        element.StartBringIntoView(new BringIntoViewOptions
+        {
+            AnimationDesired = false,
+            HorizontalAlignmentRatio = horizontal ? 0.5 : double.NaN,
+            VerticalAlignmentRatio = horizontal ? double.NaN : 0.5,
+        });
     }
 
-    void Edit_Click(object sender, RoutedEventArgs e) => engine.SetEditMode(EditToggle.IsChecked == true);
-
-    void Exposure_ValueChanged(object sender, RangeBaseValueChangedEventArgs e)
+    void UpdatePhotoText()
     {
-        ExposureText.Text = e.NewValue.ToString("+0.00;-0.00;0.00");
-        engine.SetExposure((float)e.NewValue);
+        if (CurrentPhoto is not { } p)
+        {
+            PhotoText.Text = "";
+            return;
+        }
+        var m = p.Metadata;
+        var parts = new List<string>
+        {
+            $"{p.Name}  ({position + 1} of {shown.Count})",
+            new string('★', m.Rating) + new string('☆', 5 - m.Rating),
+        };
+        if (m.Pick != 0)
+            parts.Add(m.Pick == 1 ? "Picked" : "Rejected");
+        if (m.Label != 0)
+            parts.Add(LabelNames[m.Label]);
+        if (actualSize)
+            parts.Add("100%");
+        PhotoText.Text = string.Join("   ", parts);
     }
 
-    void Exposure_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e) => ExposureSlider.Value = 0;
+    // ---- Rating ----
+
+    void Rate(Action<int> apply, bool advance)
+    {
+        if (CurrentPhoto is not { } p)
+            return;
+        apply(p.Index);
+        p.Metadata = engine.GetMetadata(all.Length)[p.Index];
+        UpdatePhotoText();
+        UpdateCounts();
+        if (advance)
+            ShowAt(position + 1);
+    }
+
+    /// <summary>Lightroom's auto-advance: with Caps Lock on, or Shift held, rating moves on.</summary>
+    static bool AutoAdvance()
+    {
+        var caps = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.CapitalLock);
+        var shift = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift);
+        return caps.HasFlag(CoreVirtualKeyStates.Locked) || shift.HasFlag(CoreVirtualKeyStates.Down);
+    }
+
+    // ---- Keys ----
+
+    void Root_KeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        // Leave keys alone while a filter list has focus.
+        if (FocusManager.GetFocusedElement(Content.XamlRoot) is ComboBox)
+            return;
+        var ctrl = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control).HasFlag(CoreVirtualKeyStates.Down);
+        if (ctrl && e.Key == VirtualKey.O)
+        {
+            PickFolder();
+            e.Handled = true;
+            return;
+        }
+        if (ctrl || all.Length == 0)
+            return;
+
+        var advance = AutoAdvance();
+        var key = (int)e.Key;
+        switch (e.Key)
+        {
+            case VirtualKey.Right: ShowAt(position + 1); break;
+            case VirtualKey.Left: ShowAt(position - 1); break;
+            case VirtualKey.Down when gridMode: ShowAt(Math.Min(position + GridColumns(), shown.Count - 1)); break;
+            case VirtualKey.Up when gridMode: ShowAt(Math.Max(position - GridColumns(), 0)); break;
+            case VirtualKey.Home: ShowAt(0); break;
+            case VirtualKey.End: ShowAt(shown.Count - 1); break;
+            case VirtualKey.PageDown when gridMode: ShowAt(Math.Min(position + GridColumns() * GridRows(), shown.Count - 1)); break;
+            case VirtualKey.PageUp when gridMode: ShowAt(Math.Max(position - GridColumns() * GridRows(), 0)); break;
+
+            case >= VirtualKey.Number0 and <= VirtualKey.Number5:
+                Rate(i => engine.SetRating(i, key - (int)VirtualKey.Number0), advance);
+                break;
+            case >= VirtualKey.NumberPad0 and <= VirtualKey.NumberPad5:
+                Rate(i => engine.SetRating(i, key - (int)VirtualKey.NumberPad0), advance);
+                break;
+            case >= VirtualKey.Number6 and <= VirtualKey.Number9:
+                // The same label again clears it, as in Lightroom.
+                var label = key - (int)VirtualKey.Number6 + 1;
+                Rate(i => engine.SetLabel(i, all[i].Metadata.Label == label ? 0 : label), advance);
+                break;
+            case VirtualKey.P: Rate(i => engine.SetPick(i, 1), advance); break;
+            case VirtualKey.X: Rate(i => engine.SetPick(i, -1), advance); break;
+            case VirtualKey.U: Rate(i => engine.SetPick(i, 0), advance); break;
+
+            case VirtualKey.G: SetGridMode(true); break;
+            case VirtualKey.E: SetGridMode(false); break;
+            case VirtualKey.Enter when gridMode: SetGridMode(false); break;
+            case VirtualKey.Escape when actualSize: ToggleZoom(0.5, 0.5); break;
+            case VirtualKey.Escape when !gridMode: SetGridMode(true); break;
+            case VirtualKey.D: SetEditMode(!editMode); break;
+            case VirtualKey.Z:
+            case VirtualKey.Space when !gridMode:
+                ToggleZoom(0.5, 0.5);
+                break;
+            case VirtualKey.F12:
+                // Diagnostic: what the engine drew, to compare with the screen.
+                engine.SaveSnapshot(Path.Combine(Path.GetTempPath(), "windedit-snapshot.png"));
+                break;
+            default:
+                return;
+        }
+        e.Handled = true;
+    }
+
+    int GridColumns()
+    {
+        var width = GridScroller.ViewportWidth - 20;
+        return Math.Max(1, (int)((width + 6) / (190 + 6)));
+    }
+
+    int GridRows() => Math.Max(1, (int)(GridScroller.ViewportHeight / (150 + 6)));
+
+    /// <summary>Keeps keyboard focus off the filter lists, so arrow keys move through photos.</summary>
+    void FocusKeys() => OpenButton.Focus(FocusState.Programmatic);
+
+    // ---- Views ----
+
+    void Loupe_Click(object sender, RoutedEventArgs e) => SetGridMode(false);
+
+    void Grid_Click(object sender, RoutedEventArgs e) => SetGridMode(true);
+
+    void SetGridMode(bool on)
+    {
+        gridMode = on;
+        LoupeToggle.IsChecked = !on;
+        GridToggle.IsChecked = on;
+        GridScroller.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+        Panel.Visibility = on ? Visibility.Collapsed : Visibility.Visible;
+        FilmstripScroller.Visibility = on ? Visibility.Collapsed : Visibility.Visible;
+        ui.TryEnqueue(() => BringIntoView(on ? GridRepeater : Filmstrip, horizontal: !on));
+        FocusKeys();
+    }
+
+    void Edit_Click(object sender, RoutedEventArgs e) => SetEditMode(EditToggle.IsChecked == true);
+
+    void SetEditMode(bool on)
+    {
+        editMode = on;
+        EditToggle.IsChecked = on;
+        engine.SetEditMode(on);
+    }
+
+    void Thumbnail_Tapped(object sender, TappedRoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is PhotoItem item)
+            ShowAt(shown.IndexOf(item));
+        FocusKeys();
+    }
+
+    void Thumbnail_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e)
+    {
+        if (gridMode)
+            SetGridMode(false);
+    }
+
+    // ---- Zoom ----
+
+    void Panel_PointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (CurrentPhoto == null || last.Width == 0)
+            return;
+        // Where the click landed on the fitted photo, as fractions of its size.
+        var p = e.GetCurrentPoint(Panel).Position;
+        double w = Panel.ActualWidth, h = Panel.ActualHeight;
+        var fit = Math.Min(w / last.Width, h / last.Height);
+        ToggleZoom((p.X - (w - last.Width * fit) / 2) / (last.Width * fit), (p.Y - (h - last.Height * fit) / 2) / (last.Height * fit));
+        FocusKeys();
+    }
+
+    void ToggleZoom(double x, double y)
+    {
+        if (CurrentPhoto == null || gridMode)
+            return;
+        actualSize = !actualSize;
+        if (actualSize)
+            engine.ZoomToActual((float)Math.Clamp(x, 0, 1), (float)Math.Clamp(y, 0, 1));
+        else
+            engine.ZoomToFit();
+        UpdatePhotoText();
+    }
 
     void Panel_SizeChanged(object sender, SizeChangedEventArgs e) => ResizeView();
 
@@ -111,66 +412,98 @@ public sealed partial class MainWindow : Window
         engine.ResizeView(Panel, (uint)Math.Round(Panel.ActualWidth * scale), (uint)Math.Round(Panel.ActualHeight * scale), scale);
     }
 
-    void Panel_PointerPressed(object sender, PointerRoutedEventArgs e)
+    // ---- Thumbnails ----
+
+    void Repeater_ElementPrepared(ItemsRepeater sender, ItemsRepeaterElementPreparedEventArgs args)
     {
-        if (index < 0 || last.Width == 0)
+        if (args.Index >= shown.Count)
             return;
-        if (actualSize)
+        var item = shown[args.Index];
+        realized[item.Index] = realized.GetValueOrDefault(item.Index) + 1;
+        if (item.Thumbnail == null)
+            LoadThumbnail(item);
+        ScheduleVisibleUpdate();
+    }
+
+    void Repeater_ElementClearing(ItemsRepeater sender, ItemsRepeaterElementClearingEventArgs args)
+    {
+        if ((args.Element as FrameworkElement)?.DataContext is not PhotoItem item)
+            return;
+        var count = realized.GetValueOrDefault(item.Index) - 1;
+        if (count <= 0)
         {
-            engine.ZoomToFit();
+            realized.Remove(item.Index);
+            item.Thumbnail = null; // the engine keeps the pixels; this frees the bitmap
         }
         else
         {
-            // Where the click landed on the fitted photo, as fractions of its size.
-            var p = e.GetCurrentPoint(Panel).Position;
-            double w = Panel.ActualWidth, h = Panel.ActualHeight;
-            var fit = Math.Min(w / last.Width, h / last.Height);
-            var x = (p.X - (w - last.Width * fit) / 2) / (last.Width * fit);
-            var y = (p.Y - (h - last.Height * fit) / 2) / (last.Height * fit);
-            engine.ZoomToActual((float)x, (float)y);
+            realized[item.Index] = count;
         }
-        actualSize = !actualSize;
+        ScheduleVisibleUpdate();
     }
 
-    void Content_KeyDown(object sender, KeyRoutedEventArgs e)
+    void Scroller_ViewChanged(object? sender, ScrollViewerViewChangedEventArgs e) => ScheduleVisibleUpdate();
+
+    /// <summary>Tells the engine which thumbnails are on screen, once per batch of changes.</summary>
+    void ScheduleVisibleUpdate()
     {
-        if (index < 0)
+        if (visibleUpdatePending)
             return;
-        switch (e.Key)
+        visibleUpdatePending = true;
+        ui.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, () =>
         {
-            case VirtualKey.Right: Show(index + 1); break;
-            case VirtualKey.Left: Show(index - 1); break;
-            case VirtualKey.Home: Show(0); break;
-            case VirtualKey.End: Show(count - 1); break;
-            case VirtualKey.F12:
-                // Diagnostic: what the engine drew, to compare with the screen.
-                engine.SaveSnapshot(Path.Combine(Path.GetTempPath(), "windedit-snapshot.png"));
-                break;
-            case VirtualKey.E:
-                EditToggle.IsChecked = EditToggle.IsChecked != true;
-                engine.SetEditMode(EditToggle.IsChecked == true);
-                break;
-            default: return;
-        }
-        e.Handled = true;
+            visibleUpdatePending = false;
+            var center = CurrentPhoto?.Index ?? 0;
+            var visible = realized.Keys.Where(i => all[i].Thumbnail == null)
+                .OrderBy(i => Math.Abs(i - center)).ToArray();
+            engine.SetVisible(visible);
+        });
     }
+
+    void LoadThumbnail(PhotoItem item)
+    {
+        if (engine.GetThumbnail(item.Index, thumbnailBuffer, out var w, out var h) != 1)
+            return;
+        var bitmap = new WriteableBitmap(w, h);
+        using (var stream = bitmap.PixelBuffer.AsStream())
+            stream.Write(thumbnailBuffer, 0, w * h * 4);
+        bitmap.Invalidate();
+        item.Thumbnail = bitmap;
+    }
+
+    // ---- Engine events ----
+
+    void OnEngineEvent(Engine.Frame e)
+    {
+        if (e.Photo < 0 || e.Photo >= all.Length)
+            return;
+        if (e.Kind == Engine.ThumbnailEvent)
+        {
+            if (realized.ContainsKey(e.Photo))
+                LoadThumbnail(all[e.Photo]);
+            return;
+        }
+        last = e;
+        RememberSize(e.RawWidth, e.RawHeight);
+        if (e.Photo != CurrentPhoto?.Index)
+            return;
+        var open = e.OpenMs > 0 ? $", raw opened in {e.OpenMs:F0} ms" : "";
+        TimingText.Text = $"{LayerNames[e.Layer]} {e.SinceShowMs:F0} ms after asking{open} · GPU {e.GpuMs:F2} ms";
+    }
+
+    // ---- Remembered things ----
 
     void PrepareRememberedSizes()
     {
-        try
+        foreach (var line in ReadLines(SizesFile))
         {
-            foreach (var line in File.ReadAllLines(SizesFile))
+            var parts = line.Split(' ');
+            if (parts.Length == 2 && uint.TryParse(parts[0], out var w) && uint.TryParse(parts[1], out var h))
             {
-                var parts = line.Split(' ');
-                if (parts.Length == 2 && uint.TryParse(parts[0], out var w) && uint.TryParse(parts[1], out var h))
-                {
-                    sizes.Add((w, h));
-                    engine.Prepare(w, h);
-                }
+                sizes.Add((w, h));
+                engine.Prepare(w, h);
             }
         }
-        catch (IOException) { }
-        catch (UnauthorizedAccessException) { }
     }
 
     /// <summary>Keeps the two most recent sensor sizes (the engine keeps memory for two).</summary>
@@ -182,12 +515,49 @@ public sealed partial class MainWindow : Window
         sizes.Insert(0, (width, height));
         if (sizes.Count > 2)
             sizes.RemoveAt(2);
+        WriteLines(SizesFile, sizes.Select(s => $"{s.Item1} {s.Item2}"));
+    }
+
+    void RememberRecent(string path)
+    {
+        var recent = ReadLines(RecentFile).Where(p => !string.Equals(p, path, StringComparison.OrdinalIgnoreCase)).Take(9).ToList();
+        recent.Insert(0, path);
+        WriteLines(RecentFile, recent);
+        RefreshRecentMenu();
+    }
+
+    void RefreshRecentMenu()
+    {
+        RecentMenu.Items.Clear();
+        foreach (var path in ReadLines(RecentFile).Where(Directory.Exists))
+        {
+            var item = new MenuFlyoutItem { Text = path };
+            item.Click += (_, _) => OpenFolder(path, null);
+            RecentMenu.Items.Add(item);
+        }
+        if (RecentMenu.Items.Count == 0)
+            RecentMenu.Items.Add(new MenuFlyoutItem { Text = "No recent folders", IsEnabled = false });
+    }
+
+    static List<string> ReadLines(string path)
+    {
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(SizesFile)!);
-            File.WriteAllLines(SizesFile, sizes.Select(s => $"{s.Item1} {s.Item2}"));
+            return File.ReadAllLines(path).Where(l => l.Length > 0).ToList();
         }
-        catch (IOException) { }
-        catch (UnauthorizedAccessException) { }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return [];
+        }
+    }
+
+    static void WriteLines(string path, IEnumerable<string> lines)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllLines(path, lines);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
     }
 }

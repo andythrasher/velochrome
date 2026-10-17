@@ -87,22 +87,41 @@ pub fn load(photo: &Photo, want: Want) -> Result<Preview, DecodeError> {
     let max_edge = candidates.last().map(|c| c.2.max(c.3)).ok_or_else(|| DecodeError("no preview in this photo".into()))?;
     // Among the biggest, the embedded one (the sort put it first): it's the cheaper read.
     let largest = *candidates.iter().find(|c| c.2.max(c.3) == max_edge).unwrap();
-    let (pick, decode_edge) = match want {
-        Want::Fast => (candidates[0], 0),
-        Want::Cover(edge) => (candidates.iter().copied().find(|c| c.2.max(c.3) >= edge).unwrap_or(largest), edge),
-        Want::Largest => (largest, 0),
+    // The best candidate first, then the rest in the order they'd next best do, so a JPEG that
+    // won't decode (damaged, or not really a JPEG) falls back to another.
+    let mut order: Vec<_> = candidates.clone();
+    let decode_edge = match want {
+        Want::Fast => 0,
+        Want::Cover(edge) => {
+            // Those that cover the view, smallest first; then the smaller ones, biggest first.
+            order.sort_by_key(|c| {
+                let e = c.2.max(c.3);
+                if e >= edge { (0, e as i64) } else { (1, -(e as i64)) }
+            });
+            edge
+        }
+        Want::Largest => {
+            order.sort_by_key(|c| (std::cmp::Reverse(c.2.max(c.3)), c.0 == Source::CameraJpeg));
+            0
+        }
     };
-    let (source, offset, source_width, source_height) = pick;
-    let is_largest = (source_width, source_height) == (largest.2, largest.3);
-
-    let bytes = match source {
-        Source::Embedded => read_jpeg_at(photo.raw.as_ref().unwrap(), offset)?,
-        Source::CameraJpeg => std::fs::read(photo.jpeg.as_ref().unwrap()).map_err(|e| DecodeError(e.to_string()))?,
-    };
-    let pixels = jpeg::decode(&bytes, decode_edge).map_err(|e| DecodeError(e.to_string()))?;
     // The cameras store JPEG pixels unrotated, with the same orientation as the raw.
     let orientation = header.map(|h| h.orientation).unwrap_or_default();
-    Ok(Preview { pixels, orientation, source, source_width, source_height, is_largest, time: start.elapsed() })
+    let mut last_error = DecodeError("no preview in this photo".into());
+    for (source, offset, source_width, source_height) in order {
+        let bytes = match source {
+            Source::Embedded => read_jpeg_at(photo.raw.as_ref().unwrap(), offset),
+            Source::CameraJpeg => std::fs::read(photo.jpeg.as_ref().unwrap()).map_err(|e| DecodeError(e.to_string())),
+        };
+        match bytes.and_then(|b| jpeg::decode(&b, decode_edge).map_err(|e| DecodeError(e.to_string()))) {
+            Ok(pixels) => {
+                let is_largest = (source_width, source_height) == (largest.2, largest.3);
+                return Ok(Preview { pixels, orientation, source, source_width, source_height, is_largest, time: start.elapsed() });
+            }
+            Err(e) => last_error = e,
+        }
+    }
+    Err(last_error)
 }
 
 fn read_head(path: &Path, offset: u64, len: usize) -> Result<Vec<u8>, DecodeError> {

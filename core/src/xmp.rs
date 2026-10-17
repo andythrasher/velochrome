@@ -1,0 +1,509 @@
+//! Ratings, color labels and pick flags in XMP sidecars, the files Lightroom, Bridge and
+//! Photo Mechanic also read and write (`P1020943.xmp` beside `P1020943.RW2`).
+//!
+//! A sidecar that already exists is changed in place: only the text of the values we own is
+//! touched, so everything else (Lightroom's develop settings, keywords, layout) stays exactly
+//! as it was. That's why this has its own small XML scanner: it records where every tag and
+//! attribute sits, which a general XML library's reader/writer round trip doesn't preserve.
+//!
+//! Stars and labels use the standard `xmp:Rating` and `xmp:Label`. There's no standard field
+//! for picks and rejects (Lightroom keeps them only in its catalog), so they go in our own
+//! namespace. Bridge's convention of "rating −1 means rejected" is read, but not written, since
+//! it would lose the star rating.
+
+use std::collections::HashMap;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+
+pub const NS_RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+pub const NS_XMP: &str = "http://ns.adobe.com/xap/1.0/";
+/// Our namespace. A URN, so it claims no web domain; the app's name is still provisional.
+pub const NS_WINDEDIT: &str = "urn:windedit:1.0";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pick {
+    #[default]
+    Unflagged,
+    Picked,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Metadata {
+    /// Stars, 0–5.
+    pub rating: u8,
+    /// Lightroom's label names: Red, Yellow, Green, Blue, Purple.
+    pub label: Option<String>,
+    pub pick: Pick,
+}
+
+/// The sidecar for a photo whose files are named `stem` in `dir`.
+pub fn sidecar_path(dir: &Path, stem: &str) -> PathBuf {
+    dir.join(format!("{stem}.xmp"))
+}
+
+/// Reads a sidecar; no file (or one that can't be understood) means no metadata.
+pub fn read(path: &Path) -> Metadata {
+    std::fs::read_to_string(path).ok().and_then(|text| parse(&text)).unwrap_or_default()
+}
+
+pub fn parse(text: &str) -> Option<Metadata> {
+    let scan = scan(text).ok()?;
+    let mut meta = Metadata::default();
+    let rating: i32 = scan.props[RATING].as_ref().and_then(|p| p.value.trim().parse().ok()).unwrap_or(0);
+    meta.rating = rating.clamp(0, 5) as u8;
+    meta.label = scan.props[LABEL].as_ref().map(|p| p.value.trim().to_string()).filter(|l| !l.is_empty());
+    meta.pick = match scan.props[PICK].as_ref().map(|p| p.value.trim().to_string()).as_deref() {
+        Some("1") => Pick::Picked,
+        Some("-1") => Pick::Rejected,
+        Some(_) => Pick::Unflagged,
+        None if rating < 0 => Pick::Rejected, // Bridge's reject
+        None => Pick::Unflagged,
+    };
+    Some(meta)
+}
+
+/// Writes `meta` to the sidecar: updating it in place if it exists, creating it if not.
+/// Written to a temporary file first and swapped in, so a crash can't leave half a file.
+pub fn write(path: &Path, meta: &Metadata) -> std::io::Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(existing) => update(&existing, meta).map_err(std::io::Error::other)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => new_sidecar(meta),
+        Err(e) => return Err(e),
+    };
+    let temp = path.with_extension("xmp.windedit-tmp");
+    std::fs::write(&temp, text)?;
+    std::fs::rename(&temp, path)
+}
+
+/// A fresh sidecar, laid out the way Lightroom lays out its own.
+pub fn new_sidecar(meta: &Metadata) -> String {
+    let mut attrs = String::new();
+    attrs.push_str(&format!("\n   xmp:Rating=\"{}\"", meta.rating));
+    if let Some(label) = &meta.label {
+        attrs.push_str(&format!("\n   xmp:Label=\"{}\"", escape(label)));
+    }
+    if let Some(pick) = pick_value(meta.pick) {
+        attrs.push_str(&format!("\n   windedit:Pick=\"{pick}\""));
+    }
+    format!(
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Windedit\">\n \
+         <rdf:RDF xmlns:rdf=\"{NS_RDF}\">\n  \
+         <rdf:Description rdf:about=\"\"\n    \
+         xmlns:xmp=\"{NS_XMP}\"\n    \
+         xmlns:windedit=\"{NS_WINDEDIT}\"{attrs}/>\n \
+         </rdf:RDF>\n</x:xmpmeta>\n"
+    )
+}
+
+fn pick_value(pick: Pick) -> Option<&'static str> {
+    match pick {
+        Pick::Unflagged => None,
+        Pick::Picked => Some("1"),
+        Pick::Rejected => Some("-1"),
+    }
+}
+
+/// `text` with our values changed to `meta`'s and nothing else touched.
+pub fn update(text: &str, meta: &Metadata) -> Result<String, String> {
+    let scan = scan(text)?;
+    let first = scan.descriptions.first().ok_or("no rdf:Description to put the rating in")?;
+
+    let wanted: [Option<String>; 3] = [
+        // Leave a zero rating out unless the file already has one (Lightroom writes 0).
+        (meta.rating > 0 || scan.props[RATING].is_some()).then(|| meta.rating.to_string()),
+        meta.label.clone(),
+        pick_value(meta.pick).map(str::to_string),
+    ];
+
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    let mut insert = String::new();
+    let mut declare: Vec<(&str, &str)> = Vec::new();
+    for (i, want) in wanted.iter().enumerate() {
+        match (&scan.props[i], want) {
+            (Some(found), Some(value)) if found.value != *value => edits.push((found.value_range.clone(), escape(value))),
+            (Some(_), Some(_)) => {}
+            (Some(found), None) => edits.push((found.whole.clone(), String::new())),
+            (None, Some(value)) => {
+                let (ns, preferred, local) = PROPS[i];
+                let prefix = match first.prefixes.iter().find(|(_, uri)| uri.as_str() == ns) {
+                    Some((p, _)) => p.clone(),
+                    None => {
+                        declare.push((preferred, ns));
+                        preferred.to_string()
+                    }
+                };
+                insert.push_str(&format!("\n   {prefix}:{local}=\"{}\"", escape(value)));
+            }
+            (None, None) => {}
+        }
+    }
+    if !insert.is_empty() {
+        let declarations: String = declare.iter().map(|(p, ns)| format!("\n    xmlns:{p}=\"{ns}\"")).collect();
+        let at = first.attrs_end;
+        edits.push((at..at, declarations + &insert));
+    }
+
+    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    let mut out = text.to_string();
+    for (range, replacement) in edits {
+        out.replace_range(range, &replacement);
+    }
+    Ok(out)
+}
+
+const RATING: usize = 0;
+const LABEL: usize = 1;
+const PICK: usize = 2;
+/// (namespace, the prefix to declare if the file has none for it, local name)
+const PROPS: [(&str, &str, &str); 3] =
+    [(NS_XMP, "xmp", "Rating"), (NS_XMP, "xmp", "Label"), (NS_WINDEDIT, "windedit", "Pick")];
+
+/// One of our values, found in the file.
+#[derive(Debug)]
+struct Found {
+    value: String,
+    /// The text to replace to change it.
+    value_range: Range<usize>,
+    /// The text to remove to delete it, with the whitespace before it.
+    whole: Range<usize>,
+}
+
+struct Description {
+    /// Namespace prefixes in scope at the tag (prefix → URI).
+    prefixes: HashMap<String, String>,
+    /// Where new attributes go: just before the tag's `>` or `/>`.
+    attrs_end: usize,
+}
+
+struct Scan {
+    /// The top-level rdf:Descriptions (children of rdf:RDF); nested ones, like those inside
+    /// Lightroom's crs:Preset, are left alone.
+    descriptions: Vec<Description>,
+    props: [Option<Found>; 3],
+}
+
+fn scan(text: &str) -> Result<Scan, String> {
+    let tokens = tokenize(text)?;
+    let mut scopes: Vec<HashMap<String, String>> = vec![HashMap::new()];
+    // (namespace, local name, index of the top-level Description it's in, if any)
+    let mut stack: Vec<(String, String, Option<usize>)> = Vec::new();
+    let mut result = Scan { descriptions: Vec::new(), props: [None, None, None] };
+    // An element-form value being read: (prop, start of its whitespace, start of content).
+    let mut open_prop: Option<(usize, usize, usize, usize)> = None;
+
+    for token in &tokens {
+        match token {
+            Token::Start { name, attrs, range, attrs_end, empty } => {
+                let mut scope = scopes.last().unwrap().clone();
+                for a in attrs {
+                    if let Some(prefix) = a.name.strip_prefix("xmlns:") {
+                        scope.insert(prefix.to_string(), a.value.clone());
+                    } else if a.name == "xmlns" {
+                        scope.insert(String::new(), a.value.clone());
+                    }
+                }
+                let (ns, local) = resolve(name, &scope, true);
+                let parent = stack.last();
+                let parent_is_rdf = parent.is_some_and(|(pns, plocal, _)| pns == NS_RDF && plocal == "RDF");
+                let in_description = parent.and_then(|p| p.2);
+                let mut own_description = None;
+
+                if ns == NS_RDF && local == "Description" && parent_is_rdf {
+                    own_description = Some(result.descriptions.len());
+                    result.descriptions.push(Description { prefixes: scope.clone(), attrs_end: *attrs_end });
+                    for a in attrs.iter().filter(|a| !a.name.starts_with("xmlns")) {
+                        let (ans, alocal) = resolve(&a.name, &scope, false);
+                        if let Some(i) = prop_index(&ans, &alocal)
+                            && result.props[i].is_none()
+                        {
+                            result.props[i] =
+                                Some(Found { value: a.value.clone(), value_range: a.value_range.clone(), whole: a.whole.clone() });
+                        }
+                    }
+                } else if parent.is_some_and(|p| p.2.is_some() && is_description(p))
+                    && let Some(i) = prop_index(&ns, &local)
+                    && result.props[i].is_none()
+                {
+                    // Element form, e.g. <xmp:Rating>3</xmp:Rating>, directly in a Description.
+                    let ws_start = text[..range.start].trim_end_matches([' ', '\t', '\r', '\n']).len();
+                    if *empty {
+                        result.props[i] =
+                            Some(Found { value: String::new(), value_range: range.clone(), whole: ws_start..range.end });
+                    } else {
+                        open_prop = Some((i, ws_start, range.end, stack.len()));
+                    }
+                }
+
+                if !empty {
+                    stack.push((ns, local, own_description.or(in_description)));
+                    scopes.push(scope);
+                }
+            }
+            Token::End { range } => {
+                if let Some((i, ws_start, content_start, depth)) = open_prop
+                    && stack.len() == depth + 1
+                {
+                    let content = content_start..range.start;
+                    result.props[i] = Some(Found {
+                        value: unescape(&text[content.clone()]),
+                        value_range: content,
+                        whole: ws_start..range.end,
+                    });
+                    open_prop = None;
+                }
+                stack.pop();
+                scopes.pop();
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn is_description(entry: &(String, String, Option<usize>)) -> bool {
+    entry.0 == NS_RDF && entry.1 == "Description"
+}
+
+fn prop_index(ns: &str, local: &str) -> Option<usize> {
+    PROPS.iter().position(|&(pns, _, plocal)| pns == ns && plocal == local)
+}
+
+/// (namespace URI, local name). Unprefixed attributes have no namespace; unprefixed elements
+/// take the default namespace.
+fn resolve(name: &str, scope: &HashMap<String, String>, element: bool) -> (String, String) {
+    match name.split_once(':') {
+        Some((prefix, local)) => (scope.get(prefix).cloned().unwrap_or_default(), local.to_string()),
+        None if element => (scope.get("").cloned().unwrap_or_default(), name.to_string()),
+        None => (String::new(), name.to_string()),
+    }
+}
+
+struct Attr {
+    name: String,
+    value: String,
+    value_range: Range<usize>,
+    /// From the whitespace before the name to the closing quote.
+    whole: Range<usize>,
+}
+
+enum Token {
+    Start { name: String, attrs: Vec<Attr>, range: Range<usize>, attrs_end: usize, empty: bool },
+    End { range: Range<usize> },
+}
+
+/// The tags of an XML document with their positions. Text, comments, processing instructions
+/// (`<?xpacket ...?>`), CDATA and declarations are skipped.
+fn tokenize(text: &str) -> Result<Vec<Token>, String> {
+    let b = text.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    let find = |from: usize, pat: &str| text[from..].find(pat).map(|p| from + p);
+    while let Some(lt) = find(i, "<") {
+        let rest = &text[lt..];
+        if rest.starts_with("<?") {
+            i = find(lt, "?>").ok_or("unterminated <?")? + 2;
+        } else if rest.starts_with("<!--") {
+            i = find(lt, "-->").ok_or("unterminated comment")? + 3;
+        } else if rest.starts_with("<![CDATA[") {
+            i = find(lt, "]]>").ok_or("unterminated CDATA")? + 3;
+        } else if rest.starts_with("<!") {
+            i = find(lt, ">").ok_or("unterminated declaration")? + 1;
+        } else if rest.starts_with("</") {
+            let gt = find(lt, ">").ok_or("unterminated end tag")?;
+            tokens.push(Token::End { range: lt..gt + 1 });
+            i = gt + 1;
+        } else {
+            let mut j = lt + 1;
+            while j < b.len() && !b[j].is_ascii_whitespace() && b[j] != b'>' && b[j] != b'/' {
+                j += 1;
+            }
+            let name = text[lt + 1..j].to_string();
+            let mut attrs = Vec::new();
+            loop {
+                let ws = j;
+                while j < b.len() && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j >= b.len() {
+                    return Err("unterminated tag".into());
+                }
+                if b[j] == b'>' || (b[j] == b'/' && b.get(j + 1) == Some(&b'>')) {
+                    let empty = b[j] == b'/';
+                    let end = if empty { j + 2 } else { j + 1 };
+                    tokens.push(Token::Start { name, attrs, range: lt..end, attrs_end: ws, empty });
+                    i = end;
+                    break;
+                }
+                let name_start = j;
+                while j < b.len() && b[j] != b'=' && !b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let attr_name = text[name_start..j].to_string();
+                while j < b.len() && (b[j].is_ascii_whitespace() || b[j] == b'=') {
+                    j += 1;
+                }
+                let quote = *b.get(j).ok_or("unterminated attribute")?;
+                if quote != b'"' && quote != b'\'' {
+                    return Err(format!("unquoted attribute {attr_name}"));
+                }
+                let value_start = j + 1;
+                let value_end = text[value_start..].find(quote as char).ok_or("unterminated attribute value")? + value_start;
+                attrs.push(Attr {
+                    name: attr_name,
+                    value: unescape(&text[value_start..value_end]),
+                    value_range: value_start..value_end,
+                    whole: ws..value_end + 1,
+                });
+                j = value_end + 1;
+            }
+        }
+    }
+    Ok(tokens)
+}
+
+fn escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+fn unescape(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp..];
+        let Some(semi) = after.find(';') else {
+            out.push_str(after);
+            return out;
+        };
+        let entity = &after[1..semi];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => entity
+                .strip_prefix("#x")
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                .or_else(|| entity.strip_prefix('#').and_then(|d| d.parse().ok()))
+                .and_then(char::from_u32),
+        };
+        match decoded {
+            Some(c) => out.push(c),
+            None => out.push_str(&after[..=semi]),
+        }
+        rest = &after[semi + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Shaped like Lightroom's sidecars, including a nested Description inside crs:Preset that
+    /// has an xmp:Rating of its own, which must be left alone.
+    const LIGHTROOM: &str = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 7.0-c000 1.000000, 0000/00/00-00:00:00        ">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:tiff="http://ns.adobe.com/tiff/1.0/"
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+   xmp:Rating="0"
+   xmp:ModifyDate="2026-05-24T17:19:11.036-06:00"
+   tiff:Make="Panasonic"
+   crs:Exposure2012="+0.35">
+   <crs:Preset>
+    <rdf:Description
+     xmp:Rating="9"
+     crs:Name="Nested"/>
+   </crs:Preset>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+"#;
+
+    fn changed_lines(before: &str, after: &str) -> Vec<String> {
+        let old: Vec<&str> = before.lines().collect();
+        after.lines().filter(|l| !old.contains(l)).map(str::to_string).collect()
+    }
+
+    #[test]
+    fn reads_lightroom() {
+        assert_eq!(parse(LIGHTROOM), Some(Metadata::default()));
+    }
+
+    #[test]
+    fn updates_lightroom_in_place() {
+        let meta = Metadata { rating: 4, label: Some("Red".into()), pick: Pick::Picked };
+        let out = update(LIGHTROOM, &meta).unwrap();
+        assert_eq!(parse(&out), Some(meta));
+        // Only our values changed or appeared; every other line is as it was.
+        let mut changed = changed_lines(LIGHTROOM, &out);
+        changed.sort();
+        assert_eq!(
+            changed,
+            vec![
+                "    xmlns:windedit=\"urn:windedit:1.0\"".to_string(),
+                "   crs:Exposure2012=\"+0.35\"".to_string(), // the tag's `>` moved after our new attributes
+                "   windedit:Pick=\"1\">".to_string(),
+                "   xmp:Label=\"Red\"".to_string(),
+                "   xmp:Rating=\"4\"".to_string(),
+            ]
+        );
+        assert!(out.contains("xmp:Rating=\"9\""), "the nested Description is untouched");
+        assert_eq!(out.lines().count(), LIGHTROOM.lines().count() + 3);
+
+        // And back: clearing them restores the original, apart from our (now unused) namespace
+        // declaration, which is harmless and left in place.
+        let cleared = update(&out, &Metadata::default()).unwrap();
+        let expected = LIGHTROOM.replace(
+            "crs:Exposure2012=\"+0.35\">",
+            "crs:Exposure2012=\"+0.35\"
+    xmlns:windedit=\"urn:windedit:1.0\">",
+        );
+        assert_eq!(cleared, expected);
+    }
+
+    #[test]
+    fn element_form_and_old_prefix() {
+        let old = r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+<rdf:Description rdf:about="" xmlns:xap="http://ns.adobe.com/xap/1.0/">
+ <xap:Rating>2</xap:Rating>
+ <xap:Label>Blue &amp; green</xap:Label>
+</rdf:Description></rdf:RDF></x:xmpmeta>
+<?xpacket end="w"?>"#;
+        let meta = parse(old).unwrap();
+        assert_eq!(meta.rating, 2);
+        assert_eq!(meta.label.as_deref(), Some("Blue & green"));
+
+        let out = update(old, &Metadata { rating: 5, label: None, pick: Pick::Unflagged }).unwrap();
+        assert!(out.contains("<xap:Rating>5</xap:Rating>"));
+        assert!(!out.contains("Label"));
+        assert!(out.starts_with("<?xpacket") && out.ends_with("<?xpacket end=\"w\"?>"));
+    }
+
+    #[test]
+    fn bridge_reject_is_read() {
+        let bridge = LIGHTROOM.replace("xmp:Rating=\"0\"", "xmp:Rating=\"-1\"");
+        assert_eq!(parse(&bridge).unwrap().pick, Pick::Rejected);
+    }
+
+    #[test]
+    fn new_sidecar_round_trips() {
+        let meta = Metadata { rating: 3, label: Some("Green".into()), pick: Pick::Rejected };
+        assert_eq!(parse(&new_sidecar(&meta)), Some(meta.clone()));
+        let path = std::env::temp_dir().join(format!("windedit-xmp-test-{}.xmp", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        write(&path, &meta).unwrap();
+        assert_eq!(read(&path), meta);
+        write(&path, &Metadata { rating: 1, ..meta.clone() }).unwrap();
+        assert_eq!(read(&path).rating, 1);
+        std::fs::remove_file(&path).unwrap();
+    }
+}

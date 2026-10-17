@@ -17,7 +17,9 @@ use std::sync::Mutex;
 
 use crate::engine::Engine;
 use crate::pipeline::Zoom;
+use crate::ratings::{LABELS, label_code};
 use crate::viewer::FrameEvent;
+use crate::xmp::Pick;
 
 pub struct Handle {
     engine: Engine,
@@ -210,5 +212,115 @@ pub extern "C" fn we_save_snapshot(handle: *const Handle, path: *const u16) -> i
         let (w, h, px) = e.snapshot().ok_or("nothing drawn yet")?;
         image::save_buffer(wide_to_path(path), &px, w, h, image::ExtendedColorType::Rgba8).map_err(|err| err.to_string())?;
         Ok(0)
+    })
+}
+
+/// A photo's stars (0–5), pick flag (1 picked, -1 rejected, 0 neither) and color label
+/// (1–5: Red, Yellow, Green, Blue, Purple; 6 some other name; 0 none).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PhotoMeta {
+    pub rating: i32,
+    pub pick: i32,
+    pub label: i32,
+}
+
+/// Copies every photo's metadata (up to `count`) into `out`; returns how many photos there are.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_get_metadata(handle: *const Handle, out: *mut PhotoMeta, count: i32) -> i32 {
+    guard(handle, |e| {
+        let all = e.ratings().all();
+        for (i, m) in all.iter().take(count.max(0) as usize).enumerate() {
+            let pick = match m.pick {
+                Pick::Picked => 1,
+                Pick::Rejected => -1,
+                Pick::Unflagged => 0,
+            };
+            unsafe { *out.add(i) = PhotoMeta { rating: m.rating as i32, pick, label: label_code(&m.label) } };
+        }
+        Ok(all.len() as i32)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn we_set_rating(handle: *const Handle, index: i32, rating: i32) -> i32 {
+    guard(handle, |e| {
+        let ok = e.ratings().set(index as usize, |m| m.rating = rating.clamp(0, 5) as u8);
+        if ok { Ok(0) } else { Err(format!("there's no photo {index}")) }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn we_set_pick(handle: *const Handle, index: i32, pick: i32) -> i32 {
+    guard(handle, |e| {
+        let pick = match pick.signum() {
+            1 => Pick::Picked,
+            -1 => Pick::Rejected,
+            _ => Pick::Unflagged,
+        };
+        let ok = e.ratings().set(index as usize, |m| m.pick = pick);
+        if ok { Ok(0) } else { Err(format!("there's no photo {index}")) }
+    })
+}
+
+/// Sets the color label: 1–5 for Red, Yellow, Green, Blue, Purple; 0 clears it.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_set_label(handle: *const Handle, index: i32, label: i32) -> i32 {
+    guard(handle, |e| {
+        let name = match label {
+            1..=5 => Some(LABELS[label as usize - 1].to_string()),
+            0 => None,
+            _ => return Err(format!("there's no label {label}")),
+        };
+        let ok = e.ratings().set(index as usize, |m| m.label = name);
+        if ok { Ok(0) } else { Err(format!("there's no photo {index}")) }
+    })
+}
+
+fn indices(list: *const i32, count: i32) -> Vec<usize> {
+    if list.is_null() || count <= 0 {
+        return Vec::new();
+    }
+    unsafe { std::slice::from_raw_parts(list, count as usize) }.iter().filter(|&&i| i >= 0).map(|&i| i as usize).collect()
+}
+
+/// The order the user moves through the photos (after sorting and filtering), so the engine
+/// decodes the right neighbours ahead.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_set_order(handle: *const Handle, order: *const i32, count: i32) -> i32 {
+    guard(handle, |e| {
+        e.set_order(indices(order, count));
+        Ok(0)
+    })
+}
+
+/// The photos whose thumbnails are on screen, most important first. Each one's thumbnail is
+/// made in the background and announced with an EVENT_THUMBNAIL event.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_set_visible(handle: *const Handle, visible: *const i32, count: i32) -> i32 {
+    guard(handle, |e| {
+        e.set_visible(indices(visible, count));
+        Ok(0)
+    })
+}
+
+/// Copies a photo's thumbnail (8-bit BGRA, opaque, upright, at most 256 pixels on its longer
+/// side) into `buf` if it's ready and fits in `capacity` bytes, writing its size. Returns 1 if
+/// copied, 0 if not ready yet, 2 if there won't be one (no usable preview in the photo).
+#[unsafe(no_mangle)]
+pub extern "C" fn we_thumbnail(handle: *const Handle, index: i32, buf: *mut u8, capacity: i32, width: *mut i32, height: *mut i32) -> i32 {
+    guard(handle, |e| {
+        let Some(t) = e.jobs().thumbnail(index as usize) else {
+            return Ok(if e.jobs().failed(index as usize, crate::jobs::Kind::Thumb) { 2 } else { 0 });
+        };
+        if t.bgra.len() > capacity.max(0) as usize {
+            return Err(format!("the thumbnail needs {} bytes", t.bgra.len()));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(t.bgra.as_ptr(), buf, t.bgra.len());
+            *width = t.width as i32;
+            *height = t.height as i32;
+        }
+        Ok(1)
     })
 }

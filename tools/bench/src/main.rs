@@ -30,6 +30,8 @@ fn main() {
         "jpegtime" => jpeg_time(&files),
         "previewpng" => preview_png(&files),
         "snapshot" => snapshot(&files),
+        "xmpcheck" => xmp_check(&files_any(rest)),
+        "thumbs" => bench_thumbs(&rest.iter().map(PathBuf::from).collect::<Vec<_>>()),
         "cull" => bench_cull(&rest.iter().map(PathBuf::from).collect::<Vec<_>>()),
         _ => {
             eprintln!("unknown command {cmd}");
@@ -131,6 +133,7 @@ fn bench_preview(files: &[PathBuf]) {
         }
     }
     for (label, want) in [
+        ("thumb 256 px", preview::Want::Cover(256)),
         ("fast", preview::Want::Fast),
         ("loupe 2560 px", preview::Want::Cover(2560)),
         ("largest (100%)", preview::Want::Largest),
@@ -495,5 +498,118 @@ fn snapshot(files: &[PathBuf]) {
         let path = out_dir.join(format!("{}.snapshot.png", f.file_stem().unwrap().to_string_lossy()));
         image::save_buffer(&path, &px, w, h, image::ExtendedColorType::Rgba8).unwrap();
         println!("{}", path.display());
+    }
+}
+
+/// Every .xmp file in the given folders (or the files given).
+fn files_any(args: &[String]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for a in args {
+        let p = PathBuf::from(a);
+        if p.is_dir() {
+            out.extend(std::fs::read_dir(&p).unwrap().flatten().map(|e| e.path()).filter(|f| {
+                f.extension().is_some_and(|e| e.eq_ignore_ascii_case("xmp"))
+            }));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Checks that updating real sidecars changes only our values, in memory: nothing is written.
+fn xmp_check(files: &[PathBuf]) {
+    use windedit_core::xmp::{self, Metadata, Pick};
+    let meta = Metadata { rating: 3, label: Some("Green".into()), pick: Pick::Picked };
+    let (mut ok, mut failed) = (0, 0);
+    for f in files {
+        let text = std::fs::read_to_string(f).unwrap();
+        let before = xmp::parse(&text);
+        let result = xmp::update(&text, &meta).map_err(|e| e.to_string()).and_then(|out| {
+            if xmp::parse(&out).as_ref() != Some(&meta) {
+                return Err("doesn't read back".into());
+            }
+            let old: std::collections::HashSet<&str> = text.lines().collect();
+            let new_lines: Vec<&str> = out.lines().filter(|l| !old.contains(l)).collect();
+            let foreign: Vec<&&str> = new_lines
+                .iter()
+                .filter(|l| !(l.contains("xmp:Rating") || l.contains("xmp:Label") || l.contains("windedit:") || l.contains("xmlns:windedit")))
+                .collect();
+            // At most one foreign line may change: the tag whose `>` our attributes now precede.
+            if foreign.len() > 1 || out.lines().count() > text.lines().count() + 3 {
+                return Err(format!("unexpected changes: {foreign:?}"));
+            }
+            Ok(())
+        });
+        match result {
+            Ok(()) => ok += 1,
+            Err(e) => {
+                failed += 1;
+                println!("{}: {e} (read as {before:?})", f.display());
+            }
+        }
+    }
+    println!("{ok} sidecars update cleanly, {failed} don't");
+}
+
+/// Opening a folder and filling a grid: how soon the first screenful of thumbnails (48) is
+/// ready, and the whole folder.
+fn bench_thumbs(files: &[PathBuf]) {
+    use std::sync::mpsc::channel;
+    use windedit_core::engine::Engine;
+    use windedit_core::viewer::{EVENT_THUMBNAIL, FrameEvent};
+    let Some(dir) = files.first() else { return };
+    let (tx, rx) = channel();
+    let engine = Engine::new(Box::new(move |e: &FrameEvent| {
+        if e.kind == EVENT_THUMBNAIL {
+            let _ = tx.send(e.photo);
+        }
+    }))
+    .unwrap();
+    if std::env::var_os("PLAIN").is_some() {
+        // The same work without the job system, for comparison.
+        let photos = library::scan_folder(dir).unwrap();
+        let start = Instant::now();
+        let made = photos
+            .par_iter()
+            .filter_map(|p| preview::load(p, preview::Want::Cover(256)).ok())
+            .map(|p| windedit_core::jobs::Thumbnail::from_preview(&p, 256).width)
+            .count();
+        println!("plain parallel loop: {made} thumbnails in {:.0} ms", ms(start.elapsed()));
+        return;
+    }
+    let start = Instant::now();
+    let count = engine.open_folder(dir).unwrap();
+    let opened = ms(start.elapsed());
+    let rated = engine.ratings().all().iter().filter(|m| m.rating > 0 || m.label.is_some()).count();
+    println!("{count} photos; folder and sidecars read in {opened:.1} ms ({rated} with ratings or labels)");
+    // As a grid would: the first screen, then the rest.
+    engine.set_visible((0..count).collect());
+    if std::env::var_os("IDLE").is_some() {
+        engine.jobs().wait_idle(Duration::from_secs(60));
+        let made = (0..count).filter(|&i| engine.jobs().thumbnail(i).is_some()).count();
+        println!("jobs idle after {:.0} ms with {made} thumbnails", ms(start.elapsed()));
+        return;
+    }
+    let (mut first_screen, mut done) = (None, 0);
+    while done < count {
+        if rx.recv_timeout(Duration::from_secs(30)).is_err() {
+            break;
+        }
+        done += 1;
+        if [100, 400, 800, 1200].contains(&done) {
+            let made = (0..count).filter(|&i| engine.jobs().thumbnail(i).is_some()).count();
+            println!("  event {done} at {:.0} ms; thumbnails made by then: {made}", ms(start.elapsed()));
+        }
+        if done == 48.min(count) {
+            first_screen = Some(ms(start.elapsed()));
+        }
+    }
+    let all = ms(start.elapsed());
+    println!("first 48 thumbnails: {:.0} ms; all {done}: {all:.0} ms ({:.0} per second)", first_screen.unwrap_or(0.0), done as f64 / (all / 1000.0));
+    let photos = engine.photos();
+    for (i, p) in photos.iter().enumerate().filter(|&(i, _)| engine.jobs().thumbnail(i).is_none()) {
+        println!("  no thumbnail for {} (raw {:?}, jpeg {:?})", p.name, p.raw.is_some(), p.jpeg.is_some());
+        let _ = i;
     }
 }
