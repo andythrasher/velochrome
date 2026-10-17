@@ -68,6 +68,7 @@ public sealed partial class MainWindow : Window
         PrepareRememberedSizes();
         LoadLayout();
         BuildEditPanel();
+        InitCrop();
         InitExport();
         BuildFolderTree();
         SetFoldersPanel(layout.GetValueOrDefault("folders", true));
@@ -109,6 +110,7 @@ public sealed partial class MainWindow : Window
             return;
         }
         folder = path;
+        ExitCrop(cancel: false);
         realized.Clear();
         var metadata = engine.GetMetadata(count);
         all = new PhotoItem[count];
@@ -191,6 +193,7 @@ public sealed partial class MainWindow : Window
     {
         if (newPosition < 0 || newPosition >= shown.Count)
             return;
+        ExitCrop(cancel: false);
         CommitEdit(); // a slider change still being dragged belongs to the photo it started on
         if (CurrentPhoto is { } old)
             old.IsCurrent = false;
@@ -338,6 +341,11 @@ public sealed partial class MainWindow : Window
             return;
         var ctrl = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control).HasFlag(CoreVirtualKeyStates.Down);
         var shift = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift).HasFlag(CoreVirtualKeyStates.Down);
+        if (all.Length > 0 && CropShortcut(e.Key, ctrl))
+        {
+            e.Handled = true;
+            return;
+        }
         if (ctrl && shift && e.Key == VirtualKey.E)
         {
             ShowExportFlyout();
@@ -425,6 +433,8 @@ public sealed partial class MainWindow : Window
 
     void SetGridMode(bool on)
     {
+        if (on)
+            ExitCrop(cancel: false);
         gridMode = on;
         LoupeToggle.IsChecked = !on;
         GridToggle.IsChecked = on;
@@ -445,6 +455,8 @@ public sealed partial class MainWindow : Window
     /// <summary>Opening the Edit panel is what shows the developed raw.</summary>
     void SetEditMode(bool on)
     {
+        if (!on)
+            ExitCrop(cancel: false);
         editMode = on;
         EditToggle.IsChecked = on;
         engine.SetEditMode(on);
@@ -597,6 +609,8 @@ public sealed partial class MainWindow : Window
             return;
         }
         last = e;
+        if (cropping && e.Photo == CurrentPhoto?.Index)
+            UpdateCropOverlay();
         // The as-shot white balance is known once the raw is decoded: show it.
         if (e.Layer == 4 && e.Photo == CurrentPhoto?.Index && edit.CustomWhiteBalance == 0 && !editPending)
             ShowEdit();

@@ -12,7 +12,7 @@
 // Like the other kernels', but with four inputs: the image, the tone parameters, the guided
 // filter's coefficients and the statistics.
 #define DEVELOP_ROOT_SIGNATURE \
-    "RootConstants(num32BitConstants=48, b0)," \
+    "RootConstants(num32BitConstants=52, b0)," \
     "DescriptorTable(SRV(t0, numDescriptors=4), UAV(u0))," \
     "StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR," \
     " addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)"
@@ -38,6 +38,7 @@ cbuffer Constants : register(b0)
     float4 lensK;     // distortion terms
     float4 lensR;     // red chromatic aberration terms
     float4 lensB;     // blue chromatic aberration terms
+    float4 clip;      // the picture on the output, in pixels: left, top, right, bottom (outside is canvas)
 };
 
 Texture2D<float4> image : register(t0);
@@ -140,9 +141,13 @@ void main(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= outWidth || id.y >= outHeight)
         return;
-    float2 uv = origin + (id.x + 0.5) * stepX + (id.y + 0.5) * stepY;
+    float2 at = id.xy + 0.5;
+    float2 uv = origin + at.x * stepX + at.y * stepY;
     float2 uv_in = uv;
-    if (any(uv < 0.0) || any(uv > 1.0))
+    // Outside the picture is canvas; a pixel less than one output pixel past the photo's edge is
+    // still the photo (clamped), so cropping right up to a turned edge shows no dark fringe.
+    float2 slack = abs(stepX) + abs(stepY);
+    if (any(at < clip.xy) || any(at > clip.zw) || any(uv < -slack) || any(uv > 1.0 + slack))
     {
         output[id.xy] = float4(0.11, 0.11, 0.11, 1.0); // the empty canvas around the photo
         return;

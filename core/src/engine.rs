@@ -33,6 +33,7 @@ struct ViewState {
     view_size: (u32, u32),
     actual_size: bool,
     edit_mode: bool,
+    crop_mode: bool,
 }
 
 impl Engine {
@@ -64,6 +65,7 @@ impl Engine {
                 view_size: (2560, 1440),
                 actual_size: false,
                 edit_mode: false,
+                crop_mode: false,
             }),
         })
     }
@@ -115,6 +117,15 @@ impl Engine {
             self.refocus(&v);
         }
         let _ = self.viewer.send(Command::EditMode(on));
+    }
+
+    pub fn set_crop_mode(&self, on: bool) {
+        {
+            let mut v = self.view.lock().unwrap();
+            v.crop_mode = on;
+            self.refocus(&v);
+        }
+        let _ = self.viewer.send(Command::CropMode(on));
     }
 
     /// Changes a photo's adjustments: `commit` false while a slider is dragged (shown, not
@@ -216,7 +227,7 @@ impl Engine {
             index,
             direction: v.direction,
             loupe_edge: v.view_size.0.max(v.view_size.1),
-            need_raw: v.edit_mode || v.actual_size,
+            need_raw: v.edit_mode || v.crop_mode || v.actual_size,
         });
     }
 }

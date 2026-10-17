@@ -22,10 +22,16 @@ public sealed unsafe partial class Engine : IDisposable
         public int Photo;
         /// <summary>1 quick preview, 2 loupe preview, 3 full-size preview, 4 the raw.</summary>
         public uint Layer;
-        /// <summary>The photo's size after rotation.</summary>
+        /// <summary>The size in photo pixels of what the view shows: the crop, or the frame in crop mode.</summary>
         public uint Width, Height;
         /// <summary>The raw's sensor size, once decoded (else 0).</summary>
         public uint RawWidth, RawHeight;
+        /// <summary>Where that picture sits on the view, in physical pixels. In crop mode, the whole
+        /// frame; the crop box is part of it.</summary>
+        public float ViewX, ViewY, ViewW, ViewH;
+        /// <summary>The frame's size in photo pixels (the photo after the camera's orientation and the
+        /// quarter turns), whatever is shown.</summary>
+        public uint FrameWidth, FrameHeight;
         public double SinceShowMs, GpuMs, CpuMs, OpenMs;
         /// <summary>For export events: the job, its state (0 working, 1 saved, 2 failed), how far it is
         /// (0–1) and a UTF-16 text valid only during the callback (see <see cref="ExportChanged"/>).</summary>
@@ -45,6 +51,8 @@ public sealed unsafe partial class Engine : IDisposable
     [LibraryImport(Dll)] private static partial int we_show(IntPtr engine, int index);
     [LibraryImport(Dll)] private static partial int we_set_zoom(IntPtr engine, int actual, float x, float y);
     [LibraryImport(Dll)] private static partial int we_set_edit_mode(IntPtr engine, int on);
+    [LibraryImport(Dll)] private static partial int we_set_crop_mode(IntPtr engine, int on);
+    [LibraryImport(Dll)] private static partial int we_constrain_crop(float width, float height, float angle, int mode, float a, float b, float* b0, float* desired, float* output);
     [LibraryImport(Dll)] private static partial int we_view_resize(IntPtr engine, uint width, uint height, float scale, out IntPtr chain);
     [LibraryImport(Dll)] private static partial int we_prepare(IntPtr engine, uint width, uint height);
     [LibraryImport(Dll, StringMarshalling = StringMarshalling.Utf16)] private static partial int we_export(IntPtr engine, int index, string path, int quality);
@@ -88,6 +96,16 @@ public sealed unsafe partial class Engine : IDisposable
         public float Temperature, Tint;
         public float Contrast, Highlights, Shadows, Whites, Blacks;
         public float Vibrance, Saturation;
+        /// <summary>Quarter turns clockwise, on top of the camera's orientation.</summary>
+        public uint Rotation;
+        /// <summary>Straighten, degrees clockwise (−45 to 45).</summary>
+        public float Angle;
+        /// <summary>The crop as fractions of the frame. 0, 0, 1, 1 is none (a zeroed Edit is read as that
+        /// too, but use <see cref="None"/>).</summary>
+        public float CropLeft, CropTop, CropRight, CropBottom;
+
+        /// <summary>The photo as shot: no adjustments, no crop.</summary>
+        public static Edit None => new() { CropRight = 1, CropBottom = 1 };
     }
 
     IntPtr handle;
@@ -192,6 +210,28 @@ public sealed unsafe partial class Engine : IDisposable
     public int Export(int index, string path, int quality) => Check(we_export(handle, index, path, quality));
 
     public void SetEditMode(bool on) => Check(we_set_edit_mode(handle, on ? 1 : 0));
+
+    /// <summary>Crop mode shows the whole frame at Fit, with the photo turned beneath it; frames then
+    /// report the frame's rectangle (<see cref="Frame.ViewX"/>).</summary>
+    public void SetCropMode(bool on) => Check(we_set_crop_mode(handle, on ? 1 : 0));
+
+    public enum Constrain { Shrink = 0, Slide = 1, Edges = 2, Scale = 3, Aspect = 4 }
+
+    /// <summary>
+    /// Keeps a crop (left, top, right, bottom, as fractions of the frame) inside the photo: the valid
+    /// crop nearest to <paramref name="desired"/>, from <paramref name="current"/> (valid). See
+    /// geometry.rs <c>constrain_crop</c>; <paramref name="a"/> and <paramref name="b"/> are the anchor for
+    /// Scale, and <paramref name="a"/> the width-over-height ratio for Aspect.
+    /// </summary>
+    public static float[] ConstrainCrop(float frameWidth, float frameHeight, float angle, Constrain mode,
+        float[] current, float[] desired, float a = 0, float b = 0)
+    {
+        var output = new float[4];
+        fixed (float* c = current, d = desired, o = output)
+            if (we_constrain_crop(frameWidth, frameHeight, angle, (int)mode, a, b, c, d, o) != 0)
+                throw new InvalidOperationException("constrain_crop failed");
+        return output;
+    }
 
     /// <summary>Allocates GPU memory for photos with this sensor size, ahead of the first one.</summary>
     public void Prepare(uint width, uint height) => Check(we_prepare(handle, width, height));

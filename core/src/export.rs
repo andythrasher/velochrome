@@ -1,5 +1,5 @@
 //! Full-size export. The develop pass runs over the photo in tiles of `TILE` × `TILE` pixels,
-//! each an exact 1:1 window (`Zoom::Region`) of the rotated photo, so a tile needs no more
+//! each an exact 1:1 window (`Zoom::Region`) of the frame (the rotated, straightened photo), so a tile needs no more
 //! memory than a screen-sized view. Tiles are read back and arranged into bands of rows, and
 //! each finished band goes to an encoder thread while the next is rendered. The photo is never
 //! held in memory whole: at most a few bands are (about 32 MB each at 24 megapixels).
@@ -16,6 +16,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Result;
 
 use crate::exif;
+use crate::geometry;
 use crate::gpu::Gpu;
 use crate::jpeg;
 use crate::pipeline::{Edit, Image, Layer, Target, Zoom, render};
@@ -26,24 +27,20 @@ pub const TILE: u32 = 2048;
 
 pub const DEFAULT_QUALITY: u8 = 92;
 
-/// What to export, besides the adjustments and the photo.
+/// What to export, besides the adjustments (which carry the crop, rotation and angle) and the photo.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Request {
     /// JPEG quality, 1–100.
     pub quality: u8,
-    /// The part of the rotated photo to keep, as fractions: x, y, width, height. None is all.
-    pub crop: Option<[f32; 4]>,
-    /// Straightening, in degrees. Not applied yet: only 0 is accepted.
-    pub angle: f32,
 }
 
 impl Default for Request {
     fn default() -> Self {
-        Request { quality: DEFAULT_QUALITY, crop: None, angle: 0.0 }
+        Request { quality: DEFAULT_QUALITY }
     }
 }
 
-/// A rectangle of the rotated photo, in pixels.
+/// A rectangle of the frame, in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Window {
     pub x: u32,
@@ -52,23 +49,19 @@ pub struct Window {
     pub height: u32,
 }
 
-impl Request {
-    /// The pixels this request keeps, out of a rotated photo of `photo` size.
-    pub fn window(&self, photo: (u32, u32)) -> std::result::Result<Window, String> {
-        if self.angle != 0.0 {
-            return Err("straightening isn't supported in export yet".into());
-        }
-        let Some([x, y, w, h]) = self.crop else {
-            return Ok(Window { x: 0, y: 0, width: photo.0, height: photo.1 });
-        };
-        let edge = |from: f32, len: f32, size: u32| {
-            let a = (from * size as f32).round().clamp(0.0, size as f32 - 1.0) as u32;
-            let b = ((from + len) * size as f32).round().clamp(a as f32 + 1.0, size as f32) as u32;
-            (a, b - a)
-        };
-        let ((x, width), (y, height)) = (edge(x, w, photo.0), edge(y, h, photo.1));
-        Ok(Window { x, y, width, height })
-    }
+/// The pixels an edit keeps: its crop in whole pixels of the frame, which is the photo (`photo`
+/// is its size after the camera's orientation) turned by the edit's rotation. The output is
+/// that size, and the angle is applied by the render, not here.
+pub fn window(photo: (u32, u32), edit: &Edit) -> Window {
+    let frame = geometry::frame_size(photo, edit.rotation);
+    let edge = |from: f32, to: f32, size: u32| {
+        let a = (from * size as f32).round().clamp(0.0, size as f32 - 1.0) as u32;
+        let b = (to * size as f32).round().clamp(a as f32 + 1.0, size as f32) as u32;
+        (a, b - a)
+    };
+    let [l, t, r, b] = edit.crop;
+    let ((x, width), (y, height)) = (edge(l, r, frame.0), edge(t, b, frame.1));
+    Window { x, y, width, height }
 }
 
 /// A band of finished rows: 8-bit BGR with no padding, as the encoder takes it.
@@ -277,14 +270,16 @@ mod tests {
 
     #[test]
     fn window_defaults_to_the_whole_photo_and_crops_to_whole_pixels() {
-        let r = Request::default();
-        assert_eq!(r.window((5184, 3888)), Ok(Window { x: 0, y: 0, width: 5184, height: 3888 }));
-        let r = Request { crop: Some([0.25, 0.5, 0.5, 0.5]), ..Default::default() };
-        assert_eq!(r.window((4000, 3000)), Ok(Window { x: 1000, y: 1500, width: 2000, height: 1500 }));
-        // A crop past the edge is held inside the photo.
-        let r = Request { crop: Some([0.9, 0.9, 0.5, 0.5]), ..Default::default() };
-        assert_eq!(r.window((100, 100)), Ok(Window { x: 90, y: 90, width: 10, height: 10 }));
-        assert!(Request { angle: 1.0, ..Default::default() }.window((100, 100)).is_err());
+        let edit = Edit::default();
+        assert_eq!(window((5184, 3888), &edit), Window { x: 0, y: 0, width: 5184, height: 3888 });
+        let edit = Edit { crop: [0.25, 0.5, 0.75, 1.0], ..Default::default() };
+        assert_eq!(window((4000, 3000), &edit), Window { x: 1000, y: 1500, width: 2000, height: 1500 });
+        // A sliver stays a pixel wide, and a crop past the edge is held inside the photo.
+        let edit = Edit { crop: [0.999, 0.9, 1.5, 1.0], ..Default::default() };
+        assert_eq!(window((100, 100), &edit), Window { x: 99, y: 90, width: 1, height: 10 });
+        // The frame is the turned photo: a quarter turn swaps the sides.
+        let edit = Edit { rotation: 1, crop: [0.0, 0.0, 0.5, 1.0], ..Default::default() };
+        assert_eq!(window((6000, 4000), &edit), Window { x: 0, y: 0, width: 2000, height: 6000 });
     }
 
     #[test]

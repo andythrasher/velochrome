@@ -16,6 +16,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use crate::develop::Edit;
+use crate::geometry;
 
 pub const NS_RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 pub const NS_XMP: &str = "http://ns.adobe.com/xap/1.0/";
@@ -73,6 +74,8 @@ pub fn parse(text: &str) -> Option<Metadata> {
         }
     }
     e.custom_white_balance = number(FIRST_EDIT + 1).is_some() as u32;
+    e.rotation = number(ROTATION).map_or(0.0, |v| v.rem_euclid(4.0)) as u32;
+    geometry::clean(e);
     Some(meta)
 }
 
@@ -166,7 +169,7 @@ const PICK: usize = 2;
 /// (namespace, the prefix to declare if the file has none for it, local name)
 const FIRST_EDIT: usize = 3;
 /// (namespace, the prefix to declare if the file has none for it, local name)
-const PROPS: [(&str, &str, &str); 13] = [
+const PROPS: [(&str, &str, &str); 19] = [
     (NS_XMP, "xmp", "Rating"),
     (NS_XMP, "xmp", "Label"),
     (NS_WINDEDIT, "windedit", "Pick"),
@@ -180,6 +183,12 @@ const PROPS: [(&str, &str, &str); 13] = [
     (NS_WINDEDIT, "windedit", "Blacks"),
     (NS_WINDEDIT, "windedit", "Vibrance"),
     (NS_WINDEDIT, "windedit", "Saturation"),
+    (NS_WINDEDIT, "windedit", "CropAngle"),
+    (NS_WINDEDIT, "windedit", "CropLeft"),
+    (NS_WINDEDIT, "windedit", "CropTop"),
+    (NS_WINDEDIT, "windedit", "CropRight"),
+    (NS_WINDEDIT, "windedit", "CropBottom"),
+    (NS_WINDEDIT, "windedit", "Rotation"),
 ];
 
 /// The edit's fields, in PROPS order from FIRST_EDIT.
@@ -195,9 +204,14 @@ enum EditField {
     Blacks,
     Vibrance,
     Saturation,
+    Angle,
+    CropLeft,
+    CropTop,
+    CropRight,
+    CropBottom,
 }
 
-const EDIT_FIELDS: [EditField; 10] = [
+const EDIT_FIELDS: [EditField; 15] = [
     EditField::Exposure,
     EditField::Temperature,
     EditField::Tint,
@@ -208,7 +222,15 @@ const EDIT_FIELDS: [EditField; 10] = [
     EditField::Blacks,
     EditField::Vibrance,
     EditField::Saturation,
+    EditField::Angle,
+    EditField::CropLeft,
+    EditField::CropTop,
+    EditField::CropRight,
+    EditField::CropBottom,
 ];
+
+/// Where Rotation (a whole number, not one of the `f32` fields) sits in PROPS.
+const ROTATION: usize = FIRST_EDIT + EDIT_FIELDS.len();
 
 fn field_mut(e: &mut Edit, f: EditField) -> &mut f32 {
     match f {
@@ -222,6 +244,11 @@ fn field_mut(e: &mut Edit, f: EditField) -> &mut f32 {
         EditField::Blacks => &mut e.blacks,
         EditField::Vibrance => &mut e.vibrance,
         EditField::Saturation => &mut e.saturation,
+        EditField::Angle => &mut e.angle,
+        EditField::CropLeft => &mut e.crop[0],
+        EditField::CropTop => &mut e.crop[1],
+        EditField::CropRight => &mut e.crop[2],
+        EditField::CropBottom => &mut e.crop[3],
     }
 }
 
@@ -235,18 +262,28 @@ fn values(meta: &Metadata, keep_zero_rating: bool) -> Vec<Option<String>> {
         pick_value(meta.pick).map(str::to_string),
     ];
     let mut e = meta.edit;
+    let mut none = Edit::default();
     for field in EDIT_FIELDS {
         let white_balance = matches!(field, EditField::Temperature | EditField::Tint);
         let value = *field_mut(&mut e, field);
-        let written = if white_balance { meta.edit.custom_white_balance != 0 } else { value != 0.0 };
-        v.push(written.then(|| number_text(value)));
+        let crop = matches!(field, EditField::CropLeft | EditField::CropTop | EditField::CropRight | EditField::CropBottom);
+        let text = number_text(value, if crop { 5 } else { 2 });
+        let written = if white_balance {
+            meta.edit.custom_white_balance != 0
+        } else {
+            text.parse::<f32>().ok() != Some(*field_mut(&mut none, field))
+        };
+        v.push(written.then_some(text));
     }
+    v.push((e.rotation != 0).then(|| e.rotation.to_string()));
     v
 }
 
-/// A number as short as it can be: two decimals at most, no trailing zeros.
-fn number_text(v: f32) -> String {
-    let rounded = (v * 100.0).round() / 100.0;
+/// A number as short as it can be: `decimals` at most (two for the sliders, five for crop edges),
+/// no trailing zeros.
+fn number_text(v: f32, decimals: i32) -> String {
+    let scale = 10f32.powi(decimals);
+    let rounded = (v * scale).round() / scale;
     if rounded == 0.0 { "0".into() } else { rounded.to_string() }
 }
 
@@ -599,6 +636,29 @@ mod tests {
         assert_eq!(parse(&out), Some(meta));
         let back = update(&out, &Metadata { rating: 2, ..Default::default() }).unwrap();
         assert!(!back.contains("windedit:Exposure") && !back.contains("windedit:Temperature"));
+    }
+
+    #[test]
+    fn geometry_round_trips_and_defaults_are_not_written() {
+        let edit = Edit { rotation: 3, angle: -2.35, crop: [0.0125, 0.1, 0.9, 0.87654], ..Default::default() };
+        let meta = Metadata { edit, ..Default::default() };
+        let fresh = new_sidecar(&meta);
+        assert!(fresh.contains("windedit:Rotation=\"3\"") && fresh.contains("windedit:CropAngle=\"-2.35\""), "{fresh}");
+        assert!(fresh.contains("windedit:CropLeft=\"0.0125\"") && fresh.contains("windedit:CropBottom=\"0.87654\""), "{fresh}");
+        // The default edges are left out: only the left, top and bottom here.
+        assert!(!fresh.contains("CropRight=\"1\""));
+        assert_eq!(parse(&fresh), Some(meta.clone()));
+        let out = update(LIGHTROOM, &meta).unwrap();
+        assert_eq!(parse(&out), Some(meta));
+        // A photo with no geometry has none of it in the file, and reads back as uncropped.
+        let plain = new_sidecar(&Metadata { rating: 1, ..Default::default() });
+        assert!(!plain.contains("Crop") && !plain.contains("Rotation"));
+        let read = parse(&plain).unwrap().edit;
+        assert_eq!(read.crop, [0.0, 0.0, 1.0, 1.0]);
+        assert!(read.is_default());
+        // A damaged crop reads as none.
+        let bad = out.replace("windedit:CropLeft=\"0.0125\"", "windedit:CropLeft=\"0.95\"");
+        assert_eq!(parse(&bad).unwrap().edit.crop, [0.0, 0.0, 1.0, 1.0]);
     }
 
     #[test]

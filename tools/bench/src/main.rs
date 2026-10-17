@@ -7,6 +7,7 @@
 //!     bench gpu <file or folder>...      open and develop times on the GPU; writes a PNG of
 //!                                        each photo's fitted view next to the benchmark
 
+mod crop;
 mod lens;
 
 use std::path::{Path, PathBuf};
@@ -39,6 +40,7 @@ fn main() {
         "exportengine" => bench_export_engine(rest),
         "jpegsegments" => jpeg_segments(&files),
         "lens" => lens::bench_lens(&files),
+        "crop" => crop::bench_crop(&files),
         "lensscan" => lens::lens_scan(rest),
         "cull" => bench_cull(&rest.iter().map(PathBuf::from).collect::<Vec<_>>()),
         _ => {
@@ -680,7 +682,7 @@ fn bench_look(files: &[PathBuf]) {
 /// against the fitted develop (the same edit at 1024 px), and across tile seams.
 fn bench_export(args: &[String]) {
     use std::sync::mpsc::sync_channel;
-    use windedit_core::export::{self, Request, TileRenderer};
+    use windedit_core::export::{self, TileRenderer};
 
     let at = args.iter().position(|a| a == "--out").expect("usage: bench export <raw>... --out <folder>");
     let out_dir = PathBuf::from(&args[at + 1]);
@@ -705,7 +707,7 @@ fn bench_export(args: &[String]) {
             let path = out_dir.join(format!("{name}.jpg"));
             let _ = std::fs::remove_file(&path);
             let start = Instant::now();
-            let window = Request::default().window(size).unwrap();
+            let window = export::window(size, &edit);
             let mut renderer = TileRenderer::new(&gpu, window).unwrap();
             let (tx, rx) = sync_channel(1);
             let raw = f.clone();

@@ -33,7 +33,7 @@ public sealed partial class MainWindow
     Adjustment temperature = null!, tint = null!;
     TextBlock whiteBalanceText = null!;
     /// <summary>The adjustments of the photo in view, as last sent to the engine.</summary>
-    Engine.Edit edit;
+    Engine.Edit edit = Engine.Edit.None;
     /// <summary>A slider moved since the last commit.</summary>
     bool editPending;
     /// <summary>Sliders are being set from the edit, so their changes aren't edits.</summary>
@@ -41,6 +41,8 @@ public sealed partial class MainWindow
 
     void BuildEditPanel()
     {
+        BuildCropGroup();
+
         Header("White balance");
         whiteBalanceText = new TextBlock { Opacity = 0.6, FontSize = 12, Margin = new Thickness(0, 0, 0, 2) };
         var asShot = new HyperlinkButton { Content = "As shot", Padding = new Thickness(4, 0, 4, 0), FontSize = 12 };
@@ -85,7 +87,7 @@ public sealed partial class MainWindow
         AddPercent("Saturation", e => e.Saturation, (e, v) => e with { Saturation = v });
 
         var reset = new Button { Content = "Reset all", Margin = new Thickness(0, 16, 0, 0), HorizontalAlignment = HorizontalAlignment.Stretch };
-        reset.Click += (_, _) => Change(_ => default, commit: true);
+        reset.Click += (_, _) => Change(_ => Engine.Edit.None, commit: true);
         EditControls.Children.Add(reset);
         EditControls.Children.Add(new TextBlock
         {
@@ -204,7 +206,10 @@ public sealed partial class MainWindow
         engine.SetEdit(p.Index, edit, commit);
         editPending = !commit;
         if (commit)
+        {
+            Committed();
             AfterCommit(p);
+        }
         ShowEdit();
     }
 
@@ -214,6 +219,7 @@ public sealed partial class MainWindow
             return;
         editPending = false;
         engine.SetEdit(p.Index, edit, commit: true);
+        Committed();
         AfterCommit(p);
     }
 
@@ -230,6 +236,8 @@ public sealed partial class MainWindow
         if (engine.Undo(p.Index, redo) is { } now)
         {
             edit = now;
+            if (cropping)
+                cropCommits += redo ? 1 : -1;
             AfterCommit(p);
             ShowEdit();
         }
@@ -239,7 +247,7 @@ public sealed partial class MainWindow
     void LoadEdit()
     {
         CommitEdit();
-        edit = CurrentPhoto is { } p ? engine.GetEdit(p.Index) : default;
+        edit = CurrentPhoto is { } p ? engine.GetEdit(p.Index) : Engine.Edit.None;
         ShowEdit();
     }
 
@@ -255,6 +263,8 @@ public sealed partial class MainWindow
             a.Slider.Value = a.Get(edit);
             a.Value.Text = a.Format(a.Slider.Value);
         }
+        if (cropping)
+            UpdateCropOverlay();
         var shown = edit;
         var asShot = CurrentPhoto is { } p && edit.CustomWhiteBalance == 0 ? engine.AsShotWhiteBalance(p.Index) : null;
         if (asShot is { } s)

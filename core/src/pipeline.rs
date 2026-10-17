@@ -14,6 +14,7 @@ use windows::core::Result;
 use crate::color::{self, Mat3};
 use crate::decode::{Orientation, RawFrame};
 use crate::develop;
+use crate::geometry;
 use crate::lens::{LensCorrection, LensModel};
 use crate::gpu::{Gpu, new_buffer, new_texture};
 use crate::tone;
@@ -197,6 +198,7 @@ struct DevelopConstants {
     base_scale: [f32; 2],
     base_size: [f32; 2],
     lens: [[f32; 4]; 4],
+    clip: [f32; 4],
 }
 
 /// What the tone shaders read, field for field as in tone.hlsli: the model's numbers, the
@@ -389,13 +391,15 @@ pub enum Zoom {
     /// The whole photo, as large as fits.
     Fit,
     /// One photo pixel per screen pixel, centered on this point, given as fractions (0..1) of the
-    /// rotated photo's width and height. Fractions, so the point stays put when a preview is
+    /// cropped photo's width and height. Fractions, so the point stays put when a preview is
     /// replaced by a bigger one or by the raw.
     Actual { x: f32, y: f32 },
-    /// An exact window of the rotated photo, for export: its top-left corner in photo pixels,
+    /// An exact window of the frame, for export: its top-left corner in frame pixels,
     /// and output pixels per photo pixel (1 for the photo's own size). Output pixel (0, 0) sits
     /// on the corner, so tiles at whole-pixel corners line up without any resampling.
     Region { x: f32, y: f32, scale: f32 },
+    /// The whole frame (not just the crop) as large as fits, with the photo turned beneath it: crop mode.
+    Frame,
 }
 
 /// A texture the develop pass draws into, the size of the view.
@@ -441,8 +445,9 @@ const MODE_DEVELOP: u32 = 0;
 const MODE_PREVIEW: u32 = 1;
 
 /// Records drawing `layer` into `target` (between `gpu.begin` and `gpu.submit`).
-/// `photo_size` is the photo's full size after rotation, which 100% zoom is relative to; a
-/// preview smaller than that is scaled up to stand in for it.
+/// `photo_size` is the photo's full size after the camera's orientation (before the edit's own
+/// turns); a preview smaller than that is scaled up to stand in for it. The edit's rotation,
+/// angle and crop decide what part of it is shown, and `zoom` is relative to that.
 pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32, u32), target: &Target) {
     let params = ToneParams {
         model: tone::MODEL,
@@ -471,15 +476,16 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
         }
         Layer::Preview(_) => ([[0.0; 4]; 3], [0.0; 4], MODE_PREVIEW, ([1.0; 2], [1.0; 2])),
     };
-    let (origin, step_x, step_y, lod) =
-        view_transform(layer.texture_size(), layer.orientation(), photo_size, zoom, target.width, target.height);
+    let frame = geometry::frame_size(photo_size, edit.rotation);
+    let turns = geometry::turns(layer.orientation(), edit.rotation);
+    let view = geometry::view_map(layer.texture_size(), turns, frame, edit.angle, edit.crop, zoom, (target.width, target.height));
     let constants = DevelopConstants {
         rows,
         lum,
-        origin,
-        step_x,
-        step_y,
-        lod,
+        origin: view.origin,
+        step_x: view.step_x,
+        step_y: view.step_y,
+        lod: view.lod,
         mode,
         out_width: target.width,
         out_height: target.height,
@@ -488,6 +494,7 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
         base_scale: base.0,
         base_size: base.1,
         lens: lens_constants(layer),
+        clip: view.clip,
     };
     match layer {
         Layer::Raw(image) => gpu.srv_texture(&image.linear, LINEAR_FORMAT, 0, image.levels, SLOT_DEVELOP),
@@ -551,48 +558,6 @@ fn tone_prepass(gpu: &Gpu, image: &Image, lum: [f32; 4], exposure: f32) -> ([f32
 /// Draws a developed raw on its own (the benchmark and tests).
 pub fn render_image(gpu: &Gpu, image: &Image, edit: &Edit, zoom: Zoom, target: &Target) {
     render(gpu, Layer::Raw(image), edit, zoom, image.oriented_size(), target);
-}
-
-/// Where each output pixel samples the texture: an affine map from output pixels to texture
-/// coordinates covering zoom, pan and the camera's rotation, plus the pyramid level to use.
-/// Worked out in the rotated photo's own pixels, then normalized, so the texture's resolution
-/// only affects the pyramid level.
-fn view_transform(
-    texture: (u32, u32),
-    orientation: Orientation,
-    photo: (u32, u32),
-    zoom: Zoom,
-    out_w: u32,
-    out_h: u32,
-) -> ([f32; 2], [f32; 2], [f32; 2], f32) {
-    // In double precision: the shader adds a step per pixel, so a step off by one part in 10^7
-    // is a visible fraction of a pixel by the far side of a big export tile.
-    let (pw, ph) = (photo.0 as f64, photo.1 as f64);
-    let (out_w, out_h) = (out_w as f64, out_h as f64);
-    let (scale, center) = match zoom {
-        Zoom::Fit => ((out_w / pw).min(out_h / ph), (pw / 2.0, ph / 2.0)),
-        Zoom::Actual { x, y } => (1.0, (x.clamp(0.0, 1.0) as f64 * pw, y.clamp(0.0, 1.0) as f64 * ph)),
-        Zoom::Region { x, y, scale } => (scale as f64, (x as f64 + out_w / scale as f64 / 2.0, y as f64 + out_h / scale as f64 / 2.0)),
-    };
-    // Output pixel → rotated photo (0..1) → texture (0..1).
-    let map = |px: f64, py: f64| -> [f64; 2] {
-        let u = (center.0 + (px - out_w / 2.0) / scale) / pw;
-        let v = (center.1 + (py - out_h / 2.0) / scale) / ph;
-        match orientation {
-            Orientation::Normal => [u, v],
-            Orientation::Rotate90 => [v, 1.0 - u],
-            Orientation::Rotate180 => [1.0 - u, 1.0 - v],
-            Orientation::Rotate270 => [1.0 - v, u],
-        }
-    };
-    let o = map(0.0, 0.0);
-    let x = map(1.0, 0.0);
-    let y = map(0.0, 1.0);
-    // Texture pixels per screen pixel, along the photo's width.
-    let texture_w = if orientation.swaps_axes() { texture.1 } else { texture.0 } as f64;
-    let lod = (texture_w / pw / scale).log2().max(0.0);
-    let f = |v: [f64; 2]| [v[0] as f32, v[1] as f32];
-    (f(o), f([x[0] - o[0], x[1] - o[1]]), f([y[0] - o[0], y[1] - o[1]]), lod as f32)
 }
 
 const PREVIEW_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;

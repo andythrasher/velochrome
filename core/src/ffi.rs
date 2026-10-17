@@ -182,7 +182,8 @@ pub extern "C" fn we_get_edit(handle: *const Handle, index: i32, edit: *mut Edit
 #[unsafe(no_mangle)]
 pub extern "C" fn we_set_edit(handle: *const Handle, index: i32, edit: *const Edit, commit: i32) -> i32 {
     guard(handle, |e| {
-        let edit = unsafe { *edit };
+        let mut edit = unsafe { *edit };
+        crate::geometry::clean(&mut edit); // a zeroed Edit from a wrapper means no crop
         if e.set_edit(index as usize, edit, commit != 0) { Ok(0) } else { Err(format!("there's no photo {index}")) }
     })
 }
@@ -255,7 +256,7 @@ pub extern "C" fn we_prepare(handle: *const Handle, width: u32, height: u32) -> 
 #[unsafe(no_mangle)]
 pub extern "C" fn we_export(handle: *const Handle, index: i32, path: *const u16, quality: i32) -> i32 {
     guard(handle, |e| {
-        let request = Request { quality: quality.clamp(1, 100) as u8, ..Default::default() };
+        let request = Request { quality: quality.clamp(1, 100) as u8 };
         let id = e.export(index.max(0) as usize, wide_to_path(path), request)?;
         Ok(id as i32)
     })
@@ -382,4 +383,53 @@ pub extern "C" fn we_thumbnail(handle: *const Handle, index: i32, buf: *mut u8, 
         }
         Ok(1)
     })
+}
+
+/// Crop mode (1) shows the whole frame at Fit with the photo turned beneath it, for the app's
+/// crop overlay; each frame event then carries the frame's rectangle on the view. Mode 0 shows
+/// the cropped photo again.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_set_crop_mode(handle: *const Handle, on: i32) -> i32 {
+    guard(handle, |e| {
+        e.set_crop_mode(on != 0);
+        Ok(0)
+    })
+}
+
+/// Keeps a crop inside the photo (geometry.rs `constrain_crop`; pure maths, no handle). The
+/// frame is `width` × `height` pixels, the photo turned by `angle` degrees clockwise beneath it;
+/// `base` is the crop before this step (left, top, right, bottom as fractions of the frame, and
+/// valid), `desired` what the user's drag asks for. `mode`: 0 shrink about the centre (angle
+/// changes), 1 slide, 2 move the edges that differ, 3 scale about the point (`a`, `b`), 4 the
+/// largest box of aspect `a` (width over height in pixels) inside `desired`. Writes the valid
+/// crop to `out`.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_constrain_crop(
+    width: f32,
+    height: f32,
+    angle: f32,
+    mode: i32,
+    a: f32,
+    b: f32,
+    base: *const f32,
+    desired: *const f32,
+    out: *mut f32,
+) -> i32 {
+    use crate::geometry::{Constrain, constrain_crop};
+    let how = match mode {
+        0 => Constrain::Shrink,
+        1 => Constrain::Slide,
+        2 => Constrain::Edges,
+        3 => Constrain::Scale([a as f64, b as f64]),
+        4 => Constrain::Aspect(a as f64),
+        _ => return -2,
+    };
+    let rect = |p: *const f32| unsafe { std::slice::from_raw_parts(p, 4) }.iter().map(|&v| v as f64).collect::<Vec<_>>();
+    let (base, desired) = (rect(base), rect(desired));
+    let frame = (width.max(1.0) as f64, height.max(1.0) as f64);
+    let result = constrain_crop(frame, angle as f64, [base[0], base[1], base[2], base[3]], [desired[0], desired[1], desired[2], desired[3]], how);
+    for (i, v) in result.iter().enumerate() {
+        unsafe { *out.add(i) = *v as f32 };
+    }
+    0
 }

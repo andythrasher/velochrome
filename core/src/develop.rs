@@ -7,7 +7,7 @@ use crate::color::{self, Mat3};
 /// A photo's adjustments. All zero (with `custom_white_balance` off) is the photo as shot.
 /// Sliders follow Lightroom's ranges.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Edit {
     /// Stops, −5 to +5.
     pub exposure: f32,
@@ -25,6 +25,36 @@ pub struct Edit {
     pub blacks: f32,
     pub vibrance: f32,
     pub saturation: f32,
+    /// Quarter turns clockwise (0–3), on top of the camera's orientation.
+    pub rotation: u32,
+    /// Straighten, in degrees clockwise, −45 to 45 (see `geometry.rs`).
+    pub angle: f32,
+    /// Left, top, right and bottom of the crop, as fractions of the frame. [0, 0, 1, 1] is none.
+    pub crop: [f32; 4],
+}
+
+/// No crop.
+pub const FULL_CROP: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+impl Default for Edit {
+    fn default() -> Self {
+        Edit {
+            exposure: 0.0,
+            custom_white_balance: 0,
+            temperature: 0.0,
+            tint: 0.0,
+            contrast: 0.0,
+            highlights: 0.0,
+            shadows: 0.0,
+            whites: 0.0,
+            blacks: 0.0,
+            vibrance: 0.0,
+            saturation: 0.0,
+            rotation: 0,
+            angle: 0.0,
+            crop: FULL_CROP,
+        }
+    }
 }
 
 impl Edit {
@@ -134,6 +164,18 @@ mod tests {
     use super::*;
 
     const OM5_XYZ_TO_CAM: Mat3 = [[1.2008, -0.523, -0.1123], [-0.2265, 1.0496, 0.2046], [0.0069, 0.0734, 0.4938]];
+
+    #[test]
+    fn no_crop_is_the_default() {
+        let e = Edit::default();
+        assert_eq!(e.crop, FULL_CROP);
+        assert!(e.is_default());
+        assert!(!Edit { rotation: 1, ..Default::default() }.is_default());
+        assert!(!Edit { angle: 0.5, ..Default::default() }.is_default());
+        assert!(!Edit { crop: [0.1, 0.0, 1.0, 1.0], ..Default::default() }.is_default());
+        // Struct update from a default keeps the whole-frame crop.
+        assert!(Edit { exposure: 0.0, ..Default::default() }.is_default());
+    }
 
     #[test]
     fn temperature_round_trips() {

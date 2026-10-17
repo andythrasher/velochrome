@@ -19,6 +19,7 @@ use windows::core::Interface;
 
 use crate::decode::{self, RawFrame};
 use crate::export::{self, Encoded, Request, Strip, TileRenderer};
+use crate::geometry;
 use crate::gpu::Gpu;
 use crate::jobs::{Jobs, Kind};
 use crate::pipeline::{Edit, Image, ImageMemory, Layer, PreviewTexture, Slot, Target, Zoom, render, warm_up};
@@ -33,6 +34,8 @@ pub enum Command {
     SetEdit(Edit),
     /// Edit mode shows the developed raw; Cull mode shows camera JPEGs.
     EditMode(bool),
+    /// Crop mode shows the whole frame at Fit, with the photo turned beneath it (and no zoom).
+    CropMode(bool),
     /// Create or resize the swap chain. Replies with the IDXGISwapChain pointer.
     Resize { width: u32, height: u32, scale: f32, reply: Sender<Result<usize, String>> },
     /// Draw into an offscreen target of this size instead of a swap chain (the benchmark).
@@ -76,13 +79,23 @@ pub struct FrameEvent {
     pub photo: i32,
     /// What was drawn: 1 quick preview, 2 loupe preview, 3 full-size preview, 4 the raw.
     pub layer: u32,
-    /// The photo's full size after rotation (the raw's once it's decoded, before that its biggest
-    /// JPEG's): what fractions in `we_set_zoom` are relative to.
+    /// The size in photo pixels of what the view shows: the crop, or in crop mode the whole frame
+    /// (the raw's once it's decoded, before that its biggest JPEG's): what fractions in
+    /// `we_set_zoom` are relative to.
     pub width: u32,
     pub height: u32,
     /// The raw's sensor size, once decoded (else 0): what `we_prepare` takes.
     pub raw_width: u32,
     pub raw_height: u32,
+    /// Where that picture sits on the view, in the view's pixels: left, top, width, height. In
+    /// crop mode, the frame; the crop box is a part of it.
+    pub view_x: f32,
+    pub view_y: f32,
+    pub view_w: f32,
+    pub view_h: f32,
+    /// The frame's size in photo pixels, whatever is shown (`width` and `height` are of the crop).
+    pub frame_width: u32,
+    pub frame_height: u32,
     /// From the request to show this photo until this frame was handed to the screen.
     pub since_show_ms: f64,
     pub gpu_ms: f64,
@@ -111,6 +124,12 @@ impl Default for FrameEvent {
             height: 0,
             raw_width: 0,
             raw_height: 0,
+            view_x: 0.0,
+            view_y: 0.0,
+            view_w: 0.0,
+            view_h: 0.0,
+            frame_width: 0,
+            frame_height: 0,
             since_show_ms: 0.0,
             gpu_ms: 0.0,
             cpu_ms: 0.0,
@@ -237,6 +256,7 @@ struct Viewer {
     zoom: Zoom,
     edit: Edit,
     edit_mode: bool,
+    crop_mode: bool,
     /// Previews on the GPU, one per tier (quick, loupe, full size). Separate, so moving between
     /// tiers (sharpening up, zooming in and out) never swaps one texture between two sizes,
     /// which would reallocate it each time (50–170 ms on some laptops). Each is reused for the
@@ -269,6 +289,7 @@ impl Viewer {
             zoom: Zoom::Fit,
             edit: Edit::default(),
             edit_mode: false,
+            crop_mode: false,
             previews: Default::default(),
             image: None,
             dirty: false,
@@ -357,6 +378,10 @@ impl Viewer {
                 self.edit_mode = on;
                 self.dirty = true;
             }
+            Command::CropMode(on) => {
+                self.crop_mode = on;
+                self.dirty = true;
+            }
             Command::Resize { width, height, scale, reply } => {
                 let result = self.resize(width, height, scale);
                 let _ = reply.send(result.map_err(|e| e.to_string()));
@@ -429,13 +454,13 @@ impl Viewer {
     /// What to draw for the photo in view, best first. Cull mode sticks to the camera's JPEGs;
     /// the raw comes in for editing, and at 100% when there's no full-size JPEG to check focus.
     fn preferences(&self, index: usize) -> &'static [Kind] {
-        if self.edit_mode {
+        if self.edit_mode || self.crop_mode {
             return &[Kind::Raw, Kind::Full, Kind::Loupe, Kind::Fast];
         }
         match self.zoom {
             Zoom::Fit => &[Kind::Loupe, Kind::Full, Kind::Fast],
             Zoom::Actual { .. } if self.has_full_size_jpeg(index) => &[Kind::Full, Kind::Raw, Kind::Loupe, Kind::Fast],
-            Zoom::Actual { .. } | Zoom::Region { .. } => &[Kind::Raw, Kind::Full, Kind::Loupe, Kind::Fast],
+            Zoom::Actual { .. } | Zoom::Region { .. } | Zoom::Frame => &[Kind::Raw, Kind::Full, Kind::Loupe, Kind::Fast],
         }
     }
 
@@ -501,9 +526,15 @@ impl Viewer {
             None => Layer::Raw(&self.image.as_ref().unwrap().1),
             Some(s) => Layer::Preview(self.previews[s].texture.as_ref().unwrap()),
         };
-        let (width, height) = photo_size;
         let (raw_width, raw_height) = self.jobs.raw(index).map_or((0, 0), |r| (r.width, r.height));
-        let (edit, zoom) = (self.edit, self.zoom);
+        let edit = self.edit;
+        let zoom = if self.crop_mode { Zoom::Frame } else { self.zoom };
+        // What the view shows: the crop, or in crop mode the whole frame, and where on the view.
+        let frame = geometry::frame_size(photo_size, edit.rotation);
+        let shown = if self.crop_mode { [0.0, 0.0, frame.0 as f64, frame.1 as f64] } else { geometry::window(frame, edit.crop) };
+        let (width, height) = (shown[2].round().max(1.0) as u32, shown[3].round().max(1.0) as u32);
+        let out = self.presenter.as_ref().map(|p| p.size()).or(self.offscreen.as_ref().map(|t| (t.width, t.height))).unwrap_or((1, 1));
+        let rect = geometry::view_map((1, 1), 0, frame, edit.angle, edit.crop, zoom, out).clip;
         let timings = match &mut self.presenter {
             Some(p) => p.present(&mut self.gpu, |gpu, target| render(gpu, layer, &edit, zoom, photo_size, target))?,
             None => {
@@ -526,6 +557,12 @@ impl Viewer {
             height,
             raw_width,
             raw_height,
+            view_x: rect[0],
+            view_y: rect[1],
+            view_w: rect[2] - rect[0],
+            view_h: rect[3] - rect[1],
+            frame_width: frame.0,
+            frame_height: frame.1,
             since_show_ms: self.shown_at.elapsed().as_secs_f64() * 1000.0,
             gpu_ms: timings.gpu_ms,
             cpu_ms: timings.cpu_ms,
@@ -661,7 +698,7 @@ impl Viewer {
                 return Ok(Next::Wait);
             }
             let image = &self.image.as_ref().unwrap().1;
-            let window = a.job.request.window(image.oriented_size())?;
+            let window = export::window(image.oriented_size(), &a.job.edit);
             let renderer = TileRenderer::new(&self.gpu, window).map_err(|e| e.to_string())?;
             let (strips, bands) = sync_channel(1);
             let (id, quality, raw, path, commands) =

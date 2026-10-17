@@ -194,6 +194,8 @@
                                 SizeChanged="Panel_SizeChanged"
                                 CompositionScaleChanged="Panel_CompositionScaleChanged"
                                 PointerPressed="Panel_PointerPressed" />
+                <!-- Crop mode's overlay (MainWindow.Crop.cs): follows the panel's size, so it follows the window and the side panels. -->
+                <Canvas x:Name="CropCanvas" Visibility="Collapsed" Background="Transparent" />
                 <ScrollViewer x:Name="GridScroller" Visibility="Collapsed" Padding="10"
                               ViewChanged="Scroller_ViewChanged" SizeChanged="Scroller_SizeChanged">
                     <ItemsRepeater x:Name="GridRepeater" ItemTemplate="{StaticResource PhotoTemplate}"
@@ -237,7 +239,7 @@
             </Grid.ColumnDefinitions>
             <TextBlock x:Name="PhotoText" FontWeight="SemiBold" />
             <TextBlock x:Name="KeysText" Grid.Column="1" Opacity="0.55" TextTrimming="CharacterEllipsis"
-                       Text="← → move · 0–5 stars · P pick · X reject · U clear · 6–9 labels · Shift or Caps Lock: rate and move on · Z 100% · G grid · E loupe · D edit · F7 folders · F8 edit panel · Tab both · Ctrl+Shift+E export" />
+                       Text="← → move · 0–5 stars · P pick · X reject · U clear · 6–9 labels · Shift or Caps Lock: rate and move on · R crop · Z 100% · G grid · E loupe · D edit · F7 folders · F8 edit panel · Tab both · Ctrl+Shift+E export" />
             <StackPanel x:Name="ExportStatus" Grid.Column="1" Orientation="Horizontal" Spacing="10" Visibility="Collapsed"
                         VerticalAlignment="Center">
                 <ProgressBar x:Name="ExportProgress" Width="120" Maximum="1" VerticalAlignment="Center" />
