@@ -19,8 +19,8 @@ public sealed partial class MainWindow
     /// <summary>Exports asked for and not finished: job id → photo name.</summary>
     readonly Dictionary<int, string> exporting = [];
     readonly Dictionary<int, float> exportProgress = [];
-    bool exportToChosen, updatingExportFlyout;
-    string? exportChosenFolder;
+    bool exportToChosen = true, updatingExportFlyout;
+    string? exportChosenFolder = DefaultChosenFolder();
     int exportQuality = 92;
     /// <summary>The last file written, for the Open folder link.</summary>
     string? lastExport;
@@ -36,8 +36,9 @@ public sealed partial class MainWindow
             var (name, value) = (line[..at], line[(at + 1)..]);
             switch (name)
             {
-                case "where": exportToChosen = value == "folder"; break;
-                case "folder": exportChosenFolder = value; break;
+                // Only an explicit "choice" counts: older files named "next to the photos" by default.
+                case "choice": exportToChosen = value == "folder"; break;
+                case "folder" when value.Length > 0: exportChosenFolder = value; break;
                 case "quality" when int.TryParse(value, out var q): exportQuality = Math.Clamp(q, 50, 100); break;
             }
         }
@@ -46,11 +47,22 @@ public sealed partial class MainWindow
 
     void SaveExportChoices() => WriteLines(ExportFile,
     [
-        $"where={(exportToChosen ? "folder" : "photos")}",
+        $"choice={(exportToChosen ? "folder" : "photos")}",
         $"folder={exportChosenFolder}",
         $"quality={exportQuality}",
     ]);
 
+    /// <summary>Where exports go unless another folder is chosen: Windedit Exports in Pictures (which may be redirected).</summary>
+    static string DefaultChosenFolder()
+    {
+        var pictures = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures);
+        if (string.IsNullOrEmpty(pictures))
+            pictures = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Pictures");
+        return Path.Combine(pictures, "Windedit Exports");
+    }
+
+    /// <summary>A long path with its middle left out, so the ends (drive and folder) show.</summary>
+    static string Shorten(string path) => path.Length <= 44 ? path : path[..10] + "…" + path[^33..];
     /// <summary>Where this folder's exports go by default: an Export folder inside it.</summary>
     string DefaultExportFolder() => Path.Combine(folder ?? "", "Export");
 
@@ -68,9 +80,8 @@ public sealed partial class MainWindow
         ExportTitle.Text = CurrentPhoto is { } p ? $"Export {p.Name}.jpg" : "Export";
         ExportNextTo.IsChecked = !exportToChosen;
         ExportChoose.IsChecked = exportToChosen;
-        ExportNextToPath.Text = DefaultExportFolder();
-        ExportChosenPath.Text = exportChosenFolder ?? "";
-        ExportChosenPath.Visibility = exportChosenFolder == null ? Visibility.Collapsed : Visibility.Visible;
+        ExportNextToPath.Text = Shorten(DefaultExportFolder());
+        ShowChosenPath();
         ExportQuality.Value = exportQuality;
         ExportQualityText.Text = exportQuality.ToString();
         ExportGo.IsEnabled = CurrentPhoto != null;
@@ -87,23 +98,28 @@ public sealed partial class MainWindow
         }
         else
         {
-            // The first time, "Choose folder…" asks which; after that it just uses it.
-            if (exportChosenFolder == null || !Directory.Exists(exportChosenFolder))
+            // Clicking it while it is already the choice asks for another folder.
+            if (exportToChosen || exportChosenFolder == null)
             {
                 var picked = await PickExportFolder();
                 if (picked == null)
                 {
-                    ExportChoose.IsChecked = false;
-                    ExportNextTo.IsChecked = true;
+                    ExportChoose.IsChecked = exportToChosen; // asking was cancelled: nothing changes
+                    ExportNextTo.IsChecked = !exportToChosen;
                     return;
                 }
                 exportChosenFolder = picked;
-                ExportChosenPath.Text = picked;
-                ExportChosenPath.Visibility = Visibility.Visible;
+                ShowChosenPath();
             }
             exportToChosen = true;
         }
         SaveExportChoices();
+    }
+
+    void ShowChosenPath()
+    {
+        ExportChosenPath.Text = Shorten(exportChosenFolder ?? "");
+        ToolTipService.SetToolTip(ExportChosenPath, exportChosenFolder);
     }
 
     async Task<string?> PickExportFolder()
