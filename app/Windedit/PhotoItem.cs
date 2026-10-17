@@ -73,9 +73,13 @@ public sealed partial class PhotoItem(int index, string name) : INotifyPropertyC
     /// <summary>Rejected photos fade back, as in Lightroom.</summary>
     public double Dimming => metadata.Pick == -1 ? 0.35 : 1.0;
 
-    public Brush CurrentBrush => isCurrent
-        ? (Brush)Application.Current.Resources["AccentFillColorDefaultBrush"]
-        : Transparent;
+    /// <summary>The current photo's border: the theme's accent, set by the window.</summary>
+    public static Brush Accent { get; set; } = Transparent;
+
+    public Brush CurrentBrush => isCurrent ? Accent : Transparent;
+
+    /// <summary>The accent changed with the theme.</summary>
+    public void RefreshAccent() => Changed(nameof(CurrentBrush));
 
     void Set<T>(ref T field, T value, [CallerMemberName] string? name = null)
     {
@@ -85,5 +89,5 @@ public sealed partial class PhotoItem(int index, string name) : INotifyPropertyC
 
     void Changed(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 
-    static string Glyph(int code) => ((char)code).ToString();
+    internal static string Glyph(int code) => ((char)code).ToString();
 }

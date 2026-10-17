@@ -128,6 +128,11 @@ impl Engine {
         let _ = self.viewer.send(Command::CropMode(on));
     }
 
+    /// Sets the colour (0..1 each) of the empty canvas around the photo.
+    pub fn set_canvas_color(&self, rgb: [f32; 3]) {
+        let _ = self.viewer.send(Command::Canvas(rgb));
+    }
+
     /// Changes a photo's adjustments: `commit` false while a slider is dragged (shown, not
     /// saved), true when it's let go (saved, and one step for undo).
     pub fn set_edit(&self, index: usize, edit: Edit, commit: bool) -> bool {

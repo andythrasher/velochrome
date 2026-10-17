@@ -70,6 +70,7 @@ public sealed partial class MainWindow : Window
         BuildEditPanel();
         InitCrop();
         InitExport();
+        InitAppearance();
         BuildFolderTree();
         SetFoldersPanel(layout.GetValueOrDefault("folders", true));
         EmptyText.Text = $"Open a folder of photos (Ctrl+O).\n\n{engine.AdapterName}";

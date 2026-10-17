@@ -118,14 +118,37 @@
 
             <TextBlock x:Name="CountText" Grid.Column="4" VerticalAlignment="Center" Opacity="0.7" />
             <CommandBar Grid.Column="5" Background="Transparent" DefaultLabelPosition="Collapsed" OverflowButtonVisibility="Collapsed">
+                <AppBarButton x:Name="AppearanceButton" Label="Appearance" ToolTipService.ToolTip="Appearance: light or dark, and theme">
+                    <AppBarButton.Icon>
+                        <FontIcon x:Name="AppearanceIcon" />
+                    </AppBarButton.Icon>
+                    <AppBarButton.Flyout>
+                        <Flyout x:Name="AppearanceFlyout" Placement="BottomEdgeAlignedRight">
+                            <StackPanel x:Name="AppearanceContent" Width="330" Spacing="10">
+                                <StackPanel Spacing="4">
+                                    <TextBlock Text="Mode" Opacity="0.7" />
+                                    <StackPanel Orientation="Horizontal" Spacing="4">
+                                        <RadioButton x:Name="ModeAuto" GroupName="Mode" MinWidth="0" Content="Auto" Tag="Default" Checked="Mode_Checked" />
+                                        <RadioButton x:Name="ModeLight" GroupName="Mode" MinWidth="0" Content="Light" Tag="Light" Checked="Mode_Checked" />
+                                        <RadioButton x:Name="ModeDark" GroupName="Mode" MinWidth="0" Content="Dark" Tag="Dark" Checked="Mode_Checked" />
+                                    </StackPanel>
+                                </StackPanel>
+                                <StackPanel Spacing="4">
+                                    <TextBlock Text="Theme" Opacity="0.7" />
+                                    <ListView x:Name="ThemeList" SelectionMode="Single" SelectionChanged="Theme_SelectionChanged" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Flyout>
+                    </AppBarButton.Flyout>
+                </AppBarButton>
                 <AppBarButton x:Name="ExportButton" Label="Export" ToolTipService.ToolTip="Export JPEG (Ctrl+Shift+E)">
                     <AppBarButton.Icon>
-                        <FontIcon Glyph="&#xEDE1;" />
+                        <FontIcon x:Name="ExportIcon" />
                     </AppBarButton.Icon>
                     <AppBarButton.Flyout>
                         <Flyout x:Name="ExportFlyout" Placement="BottomEdgeAlignedRight"
                                 Opening="ExportFlyout_Opening" Closed="ExportFlyout_Closed">
-                            <StackPanel Width="330" Spacing="10">
+                            <StackPanel x:Name="ExportContent" Width="330" Spacing="10">
                                 <TextBlock x:Name="ExportTitle" Style="{StaticResource BodyStrongTextBlockStyle}" TextTrimming="CharacterEllipsis" />
                                 <StackPanel Spacing="2">
                                     <TextBlock Text="Destination" Opacity="0.7" />
@@ -173,7 +196,6 @@
             </Grid.ColumnDefinitions>
 
             <Grid x:Name="FoldersPanel" Width="260" RowSpacing="6"
-                  Background="{ThemeResource LayerFillColorDefaultBrush}"
                   BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="0,0,1,0">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
@@ -189,7 +211,7 @@
                            VerticalAlignment="Top" IsHitTestVisible="False" />
             </Grid>
 
-            <Grid Grid.Column="1">
+            <Grid x:Name="CanvasHost" Grid.Column="1">
                 <SwapChainPanel x:Name="Panel"
                                 SizeChanged="Panel_SizeChanged"
                                 CompositionScaleChanged="Panel_CompositionScaleChanged"
@@ -211,7 +233,6 @@
             </Grid>
 
             <ScrollViewer x:Name="EditPanel" Grid.Column="2" Width="300" Visibility="Collapsed"
-                          Background="{ThemeResource LayerFillColorDefaultBrush}"
                           BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1,0,0,0">
                 <StackPanel x:Name="EditControls" Padding="16,10,16,16" Spacing="2" />
             </ScrollViewer>

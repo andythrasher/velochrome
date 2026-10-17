@@ -226,6 +226,15 @@ pub extern "C" fn we_set_edit_mode(handle: *const Handle, on: i32) -> i32 {
     })
 }
 
+/// Sets the colour (0..1 each) of the empty canvas around the photo, and redraws.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_set_canvas_color(handle: *const Handle, r: f32, g: f32, b: f32) -> i32 {
+    guard(handle, |e| {
+        e.set_canvas_color([r, g, b]);
+        Ok(0)
+    })
+}
+
 /// Creates (or resizes) the swap chain the view shows. Size in physical pixels; `scale` is the
 /// view's DPI scale. Writes the IDXGISwapChain pointer (not AddRef'd; the engine owns it) for
 /// the app to attach, e.g. with ISwapChainPanelNative::SetSwapChain.

@@ -36,6 +36,8 @@ pub enum Command {
     EditMode(bool),
     /// Crop mode shows the whole frame at Fit, with the photo turned beneath it (and no zoom).
     CropMode(bool),
+    /// The colour of the empty canvas around the photo.
+    Canvas([f32; 3]),
     /// Create or resize the swap chain. Replies with the IDXGISwapChain pointer.
     Resize { width: u32, height: u32, scale: f32, reply: Sender<Result<usize, String>> },
     /// Draw into an offscreen target of this size instead of a swap chain (the benchmark).
@@ -380,6 +382,10 @@ impl Viewer {
             }
             Command::CropMode(on) => {
                 self.crop_mode = on;
+                self.dirty = true;
+            }
+            Command::Canvas(rgb) => {
+                crate::pipeline::set_canvas_color(rgb);
                 self.dirty = true;
             }
             Command::Resize { width, height, scale, reply } => {

@@ -278,7 +278,7 @@ impl Gpu {
     /// Like `dispatch`, but for a grid given in thread groups.
     pub fn dispatch_groups<C: Copy>(&self, kernel: &Kernel, constants: &C, table: u32, groups: (u32, u32)) {
         let words = size_of::<C>() / 4;
-        assert!(size_of::<C>().is_multiple_of(4) && words <= 52);
+        assert!(size_of::<C>().is_multiple_of(4) && words <= 56);
         unsafe {
             self.list.SetComputeRootSignature(&kernel.root);
             self.list.SetPipelineState(&kernel.pso);

@@ -5,6 +5,7 @@
 //! - `render` (every slider move): one pass over the *output* pixels, sampling the pyramid level
 //!   that matches the zoom. Its cost follows the window size, not the sensor size.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -199,6 +200,7 @@ struct DevelopConstants {
     base_size: [f32; 2],
     lens: [[f32; 4]; 4],
     clip: [f32; 4],
+    canvas: [f32; 4],
 }
 
 /// What the tone shaders read, field for field as in tone.hlsli: the model's numbers, the
@@ -441,6 +443,21 @@ impl Layer<'_> {
     }
 }
 
+/// The empty canvas around the photo (red, green, blue as f32 bits). The app sets it from its
+/// theme; it's the same for every view.
+static CANVAS: [AtomicU32; 3] = [const { AtomicU32::new(0.11_f32.to_bits()) }; 3];
+
+pub fn set_canvas_color(rgb: [f32; 3]) {
+    for (slot, v) in CANVAS.iter().zip(rgb) {
+        slot.store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+}
+
+fn canvas_color() -> [f32; 4] {
+    let c = |i: usize| f32::from_bits(CANVAS[i].load(Ordering::Relaxed));
+    [c(0), c(1), c(2), 0.0]
+}
+
 const MODE_DEVELOP: u32 = 0;
 const MODE_PREVIEW: u32 = 1;
 
@@ -495,6 +512,7 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
         base_size: base.1,
         lens: lens_constants(layer),
         clip: view.clip,
+        canvas: canvas_color(),
     };
     match layer {
         Layer::Raw(image) => gpu.srv_texture(&image.linear, LINEAR_FORMAT, 0, image.levels, SLOT_DEVELOP),

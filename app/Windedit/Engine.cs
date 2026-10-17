@@ -53,6 +53,7 @@ public sealed unsafe partial class Engine : IDisposable
     [LibraryImport(Dll)] private static partial int we_set_edit_mode(IntPtr engine, int on);
     [LibraryImport(Dll)] private static partial int we_set_crop_mode(IntPtr engine, int on);
     [LibraryImport(Dll)] private static partial int we_constrain_crop(float width, float height, float angle, int mode, float a, float b, float* b0, float* desired, float* output);
+    [LibraryImport(Dll)] private static partial int we_set_canvas_color(IntPtr engine, float r, float g, float b);
     [LibraryImport(Dll)] private static partial int we_view_resize(IntPtr engine, uint width, uint height, float scale, out IntPtr chain);
     [LibraryImport(Dll)] private static partial int we_prepare(IntPtr engine, uint width, uint height);
     [LibraryImport(Dll, StringMarshalling = StringMarshalling.Utf16)] private static partial int we_export(IntPtr engine, int index, string path, int quality);
@@ -232,6 +233,8 @@ public sealed unsafe partial class Engine : IDisposable
                 throw new InvalidOperationException("constrain_crop failed");
         return output;
     }
+    /// <summary>The colour (0..1 each) around the photo, where the view has no picture.</summary>
+    public void SetCanvasColor(float r, float g, float b) => Check(we_set_canvas_color(handle, r, g, b));
 
     /// <summary>Allocates GPU memory for photos with this sensor size, ahead of the first one.</summary>
     public void Prepare(uint width, uint height) => Check(we_prepare(handle, width, height));
