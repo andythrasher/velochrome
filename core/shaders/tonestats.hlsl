@@ -1,4 +1,4 @@
-// Tone pre-pass, step 3: the 99.5th and 25th percentiles of the small copy's tones, which steer
+// Tone pre-pass, step 3: the 99.5th and 25th percentiles of the photo's tones as shot, which steer
 // Whites and Shadows. A histogram in group shared memory, then a prefix sum to find the bins.
 // One thread group.
 
@@ -13,7 +13,7 @@ static const uint BINS = 2048;
 static const float LOW = -24.0;   // stops: the range the histogram covers
 static const float HIGH = 12.0;
 
-RWTexture2D<float> smallCopy : register(u0);
+RWTexture2D<float> scene : register(u5); // the tones as shot (tonesmall.hlsl)
 RWBuffer<float> stats : register(u4);
 
 groupshared uint histogram[BINS];
@@ -45,7 +45,7 @@ void main(uint3 id : SV_GroupThreadID)
     uint n = size.x * size.y;
     for (uint i = t; i < n; i += BINS / 2)
     {
-        float x = smallCopy[uint2(i % size.x, i / size.x)];
+        float x = scene[uint2(i % size.x, i / size.x)];
         uint bin = (uint)clamp((x - LOW) / (HIGH - LOW) * BINS, 0.0, BINS - 1.0);
         InterlockedAdd(histogram[bin], 1);
     }

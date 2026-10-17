@@ -26,7 +26,7 @@ const fn slot_downsample(level: u32) -> u32 {
     2 * level // level - 1, then level
 }
 const SLOT_DEVELOP: u32 = 100; // the whole pyramid, the tone parameters, the base coefficients, the statistics, then the output
-const SLOT_TONE: u32 = 200; // the tone pre-pass: a pyramid level, the parameters, then five outputs
+const SLOT_TONE: u32 = 200; // the tone pre-pass: a pyramid level, the parameters, then six outputs
 
 /// The GPU memory photos are opened into, kept between photos. Allocating it is slow (about
 /// 50 ms on a Lunar Lake laptop, and the GPU's first pass over fresh memory is slower still),
@@ -219,6 +219,7 @@ struct SmallCopyConstants {
     small: [u32; 2],
     source: [u32; 2],
     factor: f32,
+    exposure: f32,
 }
 
 #[repr(C)]
@@ -455,7 +456,7 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
             let lum = [0, 1, 2].map(|c| {
                 gain * wb[c] * (0.2126 * to_srgb[0][c] + 0.7152 * to_srgb[1][c] + 0.0722 * to_srgb[2][c])
             });
-            let base = tone_prepass(gpu, image, [lum[0], lum[1], lum[2], 0.0]);
+            let base = tone_prepass(gpu, image, [lum[0], lum[1], lum[2], 0.0], edit.exposure);
             (rows, [lum[0], lum[1], lum[2], 0.0], MODE_DEVELOP, base)
         }
         Layer::Preview(_) => ([[0.0; 4]; 3], [0.0; 4], MODE_PREVIEW, ([1.0; 2], [1.0; 2])),
@@ -501,7 +502,7 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
 /// percentiles. Reads a coarse pyramid level, never the full-resolution image; the copy is in
 /// the texture's own orientation, like the image. Returns what the develop pass needs to find
 /// the coefficients: image coordinates → small-copy pixels, and the small copy's size.
-fn tone_prepass(gpu: &Gpu, image: &Image, lum: [f32; 4]) -> ([f32; 2], [f32; 2]) {
+fn tone_prepass(gpu: &Gpu, image: &Image, lum: [f32; 4], exposure: f32) -> ([f32; 2], [f32; 2]) {
     let (width, height) = (image.width, image.height);
     let edge = width.max(height);
     // A small copy at most BASE_EDGE across, each pixel a block of `factor` photo pixels, and
@@ -522,8 +523,9 @@ fn tone_prepass(gpu: &Gpu, image: &Image, lum: [f32; 4]) -> ([f32; 2], [f32; 2])
     gpu.uav_texture(&t.scratch_b, DXGI_FORMAT_R32_FLOAT, 0, SLOT_TONE + 4);
     gpu.uav_texture(&t.coefficients, DXGI_FORMAT_R32G32_FLOAT, 0, SLOT_TONE + 5);
     gpu.uav_buffer(&t.stats, DXGI_FORMAT_R32_FLOAT, 2, SLOT_TONE + 6);
+    gpu.uav_texture(&t.scene, DXGI_FORMAT_R32_FLOAT, 0, SLOT_TONE + 7);
 
-    let constants = SmallCopyConstants { lum, small, source: [width, height], factor: factor as f32 };
+    let constants = SmallCopyConstants { lum, small, source: [width, height], factor: factor as f32, exposure };
     gpu.dispatch(&gpu.kernels.tone_small, &constants, SLOT_TONE, (small[0], small[1]));
     gpu.uav_barrier();
     for pass in 0..4 {

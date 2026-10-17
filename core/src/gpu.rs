@@ -76,6 +76,9 @@ pub struct ToneResources {
     /// Two quantities side by side per pixel, for the guided filter's intermediate steps.
     pub scratch_a: ID3D12Resource,
     pub scratch_b: ID3D12Resource,
+    /// The photo's tones as shot (before Exposure and the tone sliders), one pixel per block:
+    /// what the percentiles are taken from.
+    pub scene: ID3D12Resource,
     /// The guided filter's a and b.
     pub coefficients: ID3D12Resource,
     /// The 99.5th and 25th percentiles of the tones.
@@ -90,6 +93,7 @@ impl ToneResources {
             small: new_texture(device, edge, edge, 1, DXGI_FORMAT_R32_FLOAT, uav)?,
             scratch_a: new_texture(device, edge * 2, edge, 1, DXGI_FORMAT_R32_FLOAT, uav)?,
             scratch_b: new_texture(device, edge * 2, edge, 1, DXGI_FORMAT_R32_FLOAT, uav)?,
+            scene: new_texture(device, edge, edge, 1, DXGI_FORMAT_R32_FLOAT, uav)?,
             coefficients: new_texture(device, edge, edge, 1, DXGI_FORMAT_R32G32_FLOAT, uav)?,
             stats: new_uav_buffer(device, 16)?,
         })

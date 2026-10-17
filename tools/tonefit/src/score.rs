@@ -142,7 +142,7 @@ fn params() -> Vec<Param> {
         ("shadows", "shadows_slope", |m| &mut m.shadows_slope, 0.05),
         ("shadows", "shadows_knee", |m| &mut m.shadows_knee, 0.2),
         ("shadows", "shadows_soft", |m| &mut m.shadows_soft, 0.1),
-        ("shadows", "shadows_stretch", |m| &mut m.shadows_stretch, 0.1),
+        ("shadows", "shadows_reach", |m| &mut m.shadows_reach, 0.25),
         ("shadows", "shadows_target", |m| &mut m.shadows_target, 0.25),
         ("shadows", "base_radius", |m| &mut m.base_radius, 0.01),
         ("shadows", "base_eps", |m| &mut m.base_eps, 0.1),

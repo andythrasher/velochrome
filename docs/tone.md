@@ -8,7 +8,7 @@ functions.
 
 ## How it was measured
 
-- **The reference shots.** The user took screenshots of three photos (an S9 RW2, two OM-5 II
+- **The reference shots.** The user took screenshots of three photos (an S1 RW2, two OM-5 II
   ORFs) in Lightroom and in Windedit, at each tone slider's ±50 and ±100 and Exposure ±2: 118
   screenshots, listed in `slider training photos/manifest.csv` (the images themselves stay
   out of git).
@@ -27,7 +27,7 @@ functions.
 - **One base curve for every camera**, `y = 1.05 · s^1.65 / (s^1.65 + σ^1.65)` (with
   log2 σ = −2.34). It fits all three photos within 0.07 stops, from 9 stops below middle grey
   to white.
-- **A brightness offset per camera.** Relative to the sensor's clipping point, the S9 is
+- **A brightness offset per camera.** Relative to the sensor's clipping point, the S1 is
   rendered 0.47 stops darker than the OM-5 II (Adobe's profiles carry such an offset).
   Without it, we rendered OM-5 II midtones about a stop too dark and kept highlight room
   Lightroom doesn't.
@@ -59,7 +59,15 @@ Each pixel's brightness (Rec.709 luminance, in stops) goes through:
 
 The pixel's color is scaled by the resulting change, so ratios between channels are kept, and
 the base curve is applied the hue-keeping way in Rec.2020. Two numbers from the whole image
-steer the adaptive parts: its 99.5th percentile (Whites) and 25th percentile (Shadows).
+steer the adaptive parts: its 99.5th percentile (Whites) and 25th percentile (Shadows), measured
+as shot, before Exposure and the tone sliders.
+
+**No slider may swap tones.** The adaptive parts react to the photo's own brightness, so they
+could outrun it: in the first version, lowering Exposure with Shadows up deepened the shadows,
+Shadows lifted them further, and the photo got brighter. Two rules prevent it: the percentiles
+are measured as shot, so no slider moves them, and Shadows' adaptivity moves where it starts
+acting (its knee) rather than adding lift, with its slope held under 0.75 stop per stop. A test
+(`less_exposure_is_never_brighter`) sweeps Exposure under extreme settings.
 
 ## How close it is
 
@@ -67,17 +75,20 @@ The rms difference from Lightroom, in stops, over the shots of each slider:
 
 | Default | Exposure | Contrast | Highlights | Shadows | Whites | Blacks |
 |---|---|---|---|---|---|---|
-| 0.13 | 0.17 | 0.17 | 0.15 | 0.25 | 0.13 | 0.13 |
+| 0.13 | 0.17 | 0.17 | 0.15 | 0.34 | 0.13 | 0.13 |
 
-Before, with the old curve and sliders, Shadows was 0.76 and most others around 0.2. By eye,
+Shadows gave up some accuracy (0.25 before) for the rule above: Lightroom lifts the starling's
+deep shadows further than a slider that never swaps tones can. Before, with the old curve and
+sliders, Shadows was 0.76 and most others around 0.2. By eye,
 the `pairs` images match Lightroom's closely, without halos.
 
 ## Known gaps
 
 - Three photos from two cameras is a small sample: the adaptive terms (Shadows' and Whites'
-  stretch) are the least certain, and the S1 is untested (it gets the S9's offset).
-- Shadows −100 on the starling's large dark beams is the worst fit (0.55): Lightroom crushes
-  them harder.
+  stretch) are the least certain, and other makes than OM System and Panasonic get Panasonic's
+  offset untested.
+- On the starling, the worst fits: Shadows +100 lifts its deep beams 0.5 stop less than
+  Lightroom, and Shadows −100 crushes them less.
 - Colors are matched only through brightness. Lightroom's camera profiles also adjust hues
   and saturation, which this doesn't attempt.
 

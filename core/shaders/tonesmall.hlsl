@@ -10,11 +10,13 @@ cbuffer Constants : register(b0)
     uint2 smallSize;
     uint2 srcSize;   // the photo, in pixels, before rotation
     float factor;    // photo pixels per small-copy pixel
+    float exposure;  // the Exposure slider, taken back out for the as-shot copy
 };
 
 Texture2D<float4> image : register(t0);
 SamplerState linearClamp : register(s0);
 RWTexture2D<float> smallCopy : register(u0);
+RWTexture2D<float> scene : register(u5); // the tones as shot, for the percentiles
 
 [RootSignature(TONE_ROOT_SIGNATURE)]
 [numthreads(16, 16, 1)]
@@ -24,15 +26,18 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     float2 lo = id.xy * factor;
     float2 hi = min(lo + factor, float2(srcSize));
-    float sum = 0.0;
+    float sum = 0.0, shot = 0.0;
     [unroll] for (int j = 0; j < 4; j++)
     {
         [unroll] for (int i = 0; i < 4; i++)
         {
             float2 uv = lerp(lo, hi, (float2(i, j) + 0.5) / 4.0) / float2(srcSize);
             float3 cam = image.SampleLevel(linearClamp, uv, 0).rgb;
-            sum += toneGlobal(log2(max(dot(lum.xyz, cam), 1e-9)));
+            float x = log2(max(dot(lum.xyz, cam), 1e-9));
+            sum += toneGlobal(x);
+            shot += x;
         }
     }
     smallCopy[id.xy] = sum / 16.0;
+    scene[id.xy] = shot / 16.0 - exposure;
 }

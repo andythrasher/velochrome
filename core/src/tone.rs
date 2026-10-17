@@ -97,9 +97,9 @@ pub struct Model {
     pub shadows_slope: f32,
     pub shadows_knee: f32,
     pub shadows_soft: f32,
-    /// Shadows +100 also lifts the tones below middle grey by `shadows_stretch` times how far
-    /// the image's 25th percentile sits below `shadows_target`.
-    pub shadows_stretch: f32,
+    /// For Shadows +100, the knee moves up by how far the image's 25th percentile sits below
+    /// `shadows_target`, by up to `shadows_reach` stops.
+    pub shadows_reach: f32,
     pub shadows_target: f32,
     /// Whites −100 lowers a pixel by `whites_down` · ramp from `whites_down_from` to
     /// `whites_down_to`, responding as |v|^`whites_down_power`.
@@ -133,20 +133,20 @@ pub const MODEL: Model = Model {
     highlights_from: -2.1719,
     highlights_to: 3.1876,
     highlights_up: 0.8375,
-    shadows_slope: 0.4000,
-    shadows_knee: 0.4750,
-    shadows_soft: 0.2500,
-    shadows_stretch: 3.5063,
-    shadows_target: -3.2656,
+    shadows_slope: 0.4500,
+    shadows_knee: 0.2750,
+    shadows_soft: 0.3250,
+    shadows_reach: 3.0000,
+    shadows_target: -2.5780,
     whites_down: 0.7750,
     whites_down_from: -1.0000,
     whites_down_to: 3.2000,
     whites_down_power: 0.7000,
     whites_up: 0.8531,
-    whites_up_from: -2.5782,
-    whites_up_to: 1.7938,
-    whites_up_power: 1.8500,
-    whites_stretch_floor: 0.4437,
+    whites_up_from: -2.6720,
+    whites_up_to: 2.1688,
+    whites_up_power: 1.8000,
+    whites_stretch_floor: 0.3437,
     whites_stretch_power: 3.0000,
     base_radius: 0.1000,
     base_eps: 0.5000,
@@ -155,8 +155,8 @@ pub const MODEL: Model = Model {
 /// What the tone sliders need to know about the whole image.
 #[derive(Clone, Copy, Debug)]
 pub struct Stats {
-    /// The 99.5th percentile of curve input, after Contrast and Blacks: where the image's
-    /// brightest parts are.
+    /// The 99.5th percentile of curve input, as shot (before Exposure and the tone sliders):
+    /// where the image's brightest parts are.
     pub top: f32,
     /// The 25th percentile: where its shadows are.
     pub dark: f32,
@@ -214,14 +214,13 @@ pub fn local(m: &Model, x: f32, base: f32, s: &Sliders, stats: &Stats) -> f32 {
     let d = base - MIDDLE;
     let h = m.highlights_floor + m.highlights_amount * smoothstep(m.highlights_from, m.highlights_to, d);
     dx += s.highlights * if s.highlights > 0.0 { m.highlights_up * h } else { h };
+    // A photo whose shadows sit deep gets more of its tones treated as shadows: its knee moves
+    // up by how deep they are (measured as shot, so no slider moves it). The slope is held
+    // under 0.75 stop per stop, so tones never swap places, in the photo or as Exposure moves.
+    let depth = if s.shadows > 0.0 { (m.shadows_target - (stats.dark - MIDDLE)).clamp(0.0, m.shadows_reach) } else { 0.0 };
     let w = m.shadows_soft;
-    dx += s.shadows * (m.shadows_slope * w * (1.0 + ((m.shadows_knee - d) / w).exp()).ln()).min(3.5);
-    // A photo whose shadows sit deep is lifted further, toward where Lightroom puts them.
-    if s.shadows > 0.0 {
-        // Capped, so a night shot isn't lifted into noise.
-        let depth = (m.shadows_target - (stats.dark - MIDDLE)).clamp(0.0, 1.5);
-        dx += s.shadows * m.shadows_stretch * depth * (1.0 - smoothstep(-1.0, 1.0, d));
-    }
+    let soft = m.shadows_slope.min(0.75) * w * (1.0 + ((m.shadows_knee + depth - d) / w).min(40.0).exp()).ln();
+    dx += s.shadows * soft.min(3.5);
     let d = x - MIDDLE;
     if s.whites < 0.0 {
         dx -= (-s.whites).powf(m.whites_down_power) * m.whites_down * smoothstep(m.whites_down_from, m.whites_down_to, d);
@@ -337,10 +336,14 @@ pub fn render(m: &Model, linear: &[[f32; 3]], w: usize, h: usize, edit: &Edit, c
     let edge = w.max(h) as f32;
     let factor = ((edge / BASE_EDGE).ceil() as usize).max(1);
     let radius = ((edge * m.base_radius / factor as f32).round() as usize).max(1);
-    // Like the GPU, the guided filter and the percentiles both see the small copy.
+    // Like the GPU, the guided filter and the percentiles both see a small copy. The percentiles
+    // see the photo as shot (before Exposure and the other sliders), so moving a slider never
+    // changes what the adaptive terms react to: otherwise lowering Exposure deepens the
+    // shadows, Shadows lifts them further, and the photo can end up brighter.
     let (small, sw, sh) = small_copy(&xg, w, h, factor);
     let base = base_from_small(&small, sw, sh, &xg, w, h, factor, radius, m.base_eps);
-    let mut sorted = small;
+    let as_shot: Vec<f32> = x.iter().map(|v| v - edit.exposure).collect();
+    let (mut sorted, _, _) = small_copy(&as_shot, w, h, factor);
     sorted.sort_by(f32::total_cmp);
     let at = |q: f32| sorted[((sorted.len() - 1) as f32 * q) as usize];
     let stats = Stats { top: at(0.995), dark: at(0.25) };
@@ -385,6 +388,31 @@ mod tests {
         for x in [-9.0, -3.72, -0.5] {
             assert!((global(&MODEL, x, &s) - x).abs() < 1e-4);
             assert_eq!(local(&MODEL, x, x, &s, &stats), 0.0);
+        }
+    }
+
+    /// Lowering Exposure must never brighten the photo, whatever the other sliders: the
+    /// adaptive terms react to the image's own brightness, so they mustn't outrun it.
+    #[test]
+    fn less_exposure_is_never_brighter() {
+        // A dark scene with a little sky: shadows deep enough for the adaptive lift to act.
+        let (w, h) = (64, 48);
+        let img: Vec<[f32; 3]> = (0..w * h)
+            .map(|k| {
+                let (i, j) = (k % w, k / w);
+                let v = if j < 12 { 0.5 } else { 0.002 * (1.0 + (i * 7 % 13) as f32) * (1.0 + j as f32 / 48.0) };
+                [v, v * 0.9, v * 1.1]
+            })
+            .collect();
+        for (shadows, whites, highlights) in [(0.0, 0.0, 0.0), (50.0, 0.0, 0.0), (100.0, 0.0, 0.0), (100.0, 100.0, -100.0), (100.0, 100.0, 100.0), (-100.0, -100.0, 100.0), (0.0, 100.0, 0.0)] {
+            let mut last = f32::MAX;
+            for step in 0..=80 {
+                let edit = Edit { exposure: 3.0 - step as f32 * 0.1, shadows, whites, highlights, ..Default::default() };
+                let out = render(&MODEL, &img, w, h, &edit, 0.0);
+                let mean = out.iter().map(|p| luminance(*p)).sum::<f32>() / out.len() as f32;
+                assert!(mean <= last + 1e-4, "exposure {} brightened the photo (shadows {shadows}, whites {whites}): {last} → {mean}", edit.exposure);
+                last = mean;
+            }
         }
     }
 }

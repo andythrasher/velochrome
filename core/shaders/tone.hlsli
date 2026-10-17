@@ -8,7 +8,7 @@ struct Model
     float contrast;
     float blacksDown, blacksUp, blacksUpGrowth, blacksPower;
     float highlightsFloor, highlightsAmount, highlightsFrom, highlightsTo, highlightsUp;
-    float shadowsSlope, shadowsKnee, shadowsSoft, shadowsStretch, shadowsTarget;
+    float shadowsSlope, shadowsKnee, shadowsSoft, shadowsReach, shadowsTarget;
     float whitesDown, whitesDownFrom, whitesDownTo, whitesDownPower;
     float whitesUp, whitesUpFrom, whitesUpTo, whitesUpPower;
     float whitesStretchFloor, whitesStretchPower;
@@ -34,7 +34,7 @@ StructuredBuffer<ToneParams> params : register(t1);
 // statistics (u4).
 #define TONE_ROOT_SIGNATURE \
     "RootConstants(num32BitConstants=32, b0)," \
-    "DescriptorTable(SRV(t0, numDescriptors=2), UAV(u0, numDescriptors=5))," \
+    "DescriptorTable(SRV(t0, numDescriptors=2), UAV(u0, numDescriptors=6))," \
     "StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR," \
     " addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)"
 
@@ -69,14 +69,10 @@ float toneLocal(float x, float base, float2 stats)
     float h = m.highlightsFloor + m.highlightsAmount * smoothstep(m.highlightsFrom, m.highlightsTo, d);
     dx += s.highlights * (s.highlights > 0.0 ? m.highlightsUp * h : h);
     float w = m.shadowsSoft;
+    float depth = s.shadows > 0.0 ? clamp(m.shadowsTarget - (stats.y - p.middle), 0.0, m.shadowsReach) : 0.0;
     // The exponent is capped: beyond it the result is far over the 3.5 stop limit anyway.
-    float soft = m.shadowsSlope * w * log(1.0 + exp(min((m.shadowsKnee - d) / w, 40.0)));
+    float soft = min(m.shadowsSlope, 0.75) * w * log(1.0 + exp(min((m.shadowsKnee + depth - d) / w, 40.0)));
     dx += s.shadows * min(soft, 3.5);
-    if (s.shadows > 0.0)
-    {
-        float depth = clamp(m.shadowsTarget - (stats.y - p.middle), 0.0, 1.5);
-        dx += s.shadows * m.shadowsStretch * depth * (1.0 - smoothstep(-1.0, 1.0, d));
-    }
     d = x - p.middle;
     if (s.whites < 0.0)
     {
