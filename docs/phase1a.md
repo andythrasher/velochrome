@@ -53,27 +53,30 @@ the raw decode and the allocation.
 
 Core Ultra 7 256V (7 decode threads), Arc 140V, 16 GB. A folder of 293 photos.
 
-| | Laptop | Target |
-|---|---|---|
-| Next photo, 2 a second | 11.5 ms, 95% within 24.3 ms | < 50 ms |
-| Next photo, 5 a second | 10.5 ms, 95% within 23.2 ms | < 50 ms |
-| Holding the arrow key (30 a second) | every photo, 10.0 ms, 95% within 22.0 ms | keeps up |
-| 100% check after a second on the photo | 47.6 ms, **95% within 119 ms** | < 100 ms |
-| Raw decoded before moving on, at 5 a second | 37 of 39 | |
-| Cold start straight into Edit: first preview / raw | 49 / 595 ms (raw open 172 ms) | |
+| | First run | After the follow-up below | Target |
+|---|---|---|---|
+| Next photo, 2 a second | 11.5 ms, 95% within 24.3 ms | 13.7 ms, 95% within 24.6 ms | < 50 ms |
+| Next photo, 5 a second | 10.5 ms, 95% within 23.2 ms | 13.1 ms, 95% within 25.1 ms | < 50 ms |
+| Holding the arrow key (30 a second) | every photo, 10.0 ms, 95% within 22.0 ms | every photo, 12.6 ms, 95% within 24.7 ms | keeps up |
+| 100% check after a second on the photo | 47.6 ms, **95% within 119 ms** | **2.2 ms, 95% within 2.6 ms** | < 100 ms |
+| Raw decoded before moving on, at 5 a second | 37 of 39 | 37 of 39 | |
+| Cold start straight into Edit: first preview / raw | 49 / 595 ms (raw open 172 ms) | 52 / 501 ms (raw open 146 ms) | |
 
-Everything meets its target except the slowest 100% checks. The likely cause: the viewer kept
+The first run met every target except the slowest 100% checks. The cause: the viewer kept
 one preview texture and reused it only for a preview of the same size, so zooming swapped the
 loupe-size texture for a full-size one (about 100 MB) and back, allocating each time, which
 costs 50–170 ms on this laptop.
 
-**Follow-up (done, awaiting a laptop re-run):** the viewer now keeps a texture per tier (quick,
+**Follow-up:** the viewer now keeps a texture per tier (quick,
 loupe, full), each reused for the next photo of the same size, and uploads the full-size
 preview once a photo has been on screen, fitted, for 150 ms with nothing else happening (so
 never while moving through photos). On the desktop, 100% checks went from about 21 ms to
-0.7–0.9 ms, with stepping unchanged.
+0.7–0.9 ms, with stepping unchanged; on the laptop, from a 48 ms median (119 ms at the 95th
+percentile) to 2.2 ms. **Every 1a target is now met on both machines.** Stepping on the laptop
+measured about 2 ms slower in the second run, held-key stepping included, which never triggers
+the new upload, so it looks like run-to-run variation; it's far inside the target either way.
 
-The cold start's 172 ms raw open is the GPU memory allocation: the benchmark starts with no
+The cold start's raw open (146–172 ms) is the GPU memory allocation: the benchmark starts with no
 remembered sizes, unlike the app from its second launch.
 
 ## Things found along the way
