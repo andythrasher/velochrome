@@ -39,6 +39,11 @@
                     </Grid>
                 </Border>
             </DataTemplate>
+
+            <!-- A folder in the Folders panel: the tree hands the template its node. -->
+            <DataTemplate x:Key="FolderTemplate" x:DataType="TreeViewNode">
+                <ContentPresenter Content="{x:Bind Content}" />
+            </DataTemplate>
         </Grid.Resources>
 
         <Grid.RowDefinitions>
@@ -48,42 +53,41 @@
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <!-- Toolbar -->
-        <Grid Padding="10,6" ColumnSpacing="8">
+        <!-- Toolbar. The Folders and Edit toggles are icon-only and pinned to the two ends, like
+             Windshot's Layers button; their labels live in the tooltips. -->
+        <Grid Padding="4,0" ColumnSpacing="8">
+            <Grid.Resources>
+                <Style TargetType="AppBarToggleButton" BasedOn="{StaticResource DefaultAppBarToggleButtonStyle}">
+                    <Setter Property="Width" Value="36" />
+                </Style>
+            </Grid.Resources>
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition />
                 <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
-            <SplitButton x:Name="OpenButton" Click="OpenFolder_Click" ToolTipService.ToolTip="Open a folder (Ctrl+O)">
-                <StackPanel Orientation="Horizontal" Spacing="6">
-                    <FontIcon Glyph="&#xE838;" FontSize="14" />
-                    <TextBlock Text="Open folder" />
-                </StackPanel>
-                <SplitButton.Flyout>
-                    <MenuFlyout x:Name="RecentMenu" Placement="BottomEdgeAlignedLeft" />
-                </SplitButton.Flyout>
-            </SplitButton>
+            <CommandBar Background="Transparent" DefaultLabelPosition="Collapsed" OverflowButtonVisibility="Collapsed">
+                <AppBarToggleButton x:Name="FoldersToggle" Label="Folders" Click="Folders_Click" ToolTipService.ToolTip="Folders (F7)">
+                    <AppBarToggleButton.Icon>
+                        <FontIcon Glyph="&#xE8B7;" />
+                    </AppBarToggleButton.Icon>
+                </AppBarToggleButton>
+            </CommandBar>
 
-            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="2" Margin="8,0,0,0">
+            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="2" VerticalAlignment="Center">
                 <ToggleButton x:Name="LoupeToggle" Click="Loupe_Click" ToolTipService.ToolTip="Loupe (E)">
                     <FontIcon Glyph="&#xE8B9;" FontSize="14" />
                 </ToggleButton>
                 <ToggleButton x:Name="GridToggle" Click="Grid_Click" ToolTipService.ToolTip="Grid (G)">
                     <FontIcon Glyph="&#xF0E2;" FontSize="14" />
                 </ToggleButton>
-                <ToggleButton x:Name="EditToggle" Click="Edit_Click" Margin="8,0,0,0" ToolTipService.ToolTip="Edit: the developed raw (D)">
-                    <StackPanel Orientation="Horizontal" Spacing="6">
-                        <FontIcon Glyph="&#xE70F;" FontSize="14" />
-                        <TextBlock Text="Edit" />
-                    </StackPanel>
-                </ToggleButton>
             </StackPanel>
 
             <!-- Filters -->
-            <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" Margin="16,0,0,0" VerticalAlignment="Center">
+            <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" Margin="8,0,0,0" VerticalAlignment="Center">
                 <TextBlock Text="Show" VerticalAlignment="Center" Opacity="0.7" />
                 <ComboBox x:Name="FlagFilter" SelectionChanged="Filter_Changed" MinWidth="130">
                     <ComboBoxItem Content="All photos" />
@@ -110,36 +114,65 @@
             </StackPanel>
 
             <TextBlock x:Name="CountText" Grid.Column="4" VerticalAlignment="Center" Opacity="0.7" />
+            <CommandBar Grid.Column="5" Background="Transparent" DefaultLabelPosition="Collapsed" OverflowButtonVisibility="Collapsed">
+                <AppBarToggleButton x:Name="EditToggle" Label="Edit" Click="Edit_Click" ToolTipService.ToolTip="Edit: the developed raw (D, F8)">
+                    <AppBarToggleButton.Icon>
+                        <FontIcon Glyph="&#xE70F;" />
+                    </AppBarToggleButton.Icon>
+                </AppBarToggleButton>
+            </CommandBar>
         </Grid>
 
-        <!-- The photo (with the Edit panel beside it in Edit mode), or the grid -->
+        <!-- Folders on the left, the photo or the grid in the middle, the Edit panel on the right -->
         <Grid Grid.Row="1">
             <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
                 <ColumnDefinition />
                 <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
-            <SwapChainPanel x:Name="Panel"
-                            SizeChanged="Panel_SizeChanged"
-                            CompositionScaleChanged="Panel_CompositionScaleChanged"
-                            PointerPressed="Panel_PointerPressed" />
-            <ScrollViewer x:Name="EditPanel" Grid.Column="1" Width="300" Visibility="Collapsed"
+
+            <Grid x:Name="FoldersPanel" Width="260" RowSpacing="6"
+                  Background="{ThemeResource LayerFillColorDefaultBrush}"
+                  BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="0,0,1,0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition />
+                </Grid.RowDefinitions>
+                <TextBox x:Name="FolderSearch" Margin="8,8,8,0" PlaceholderText="Search folders"
+                         TextChanged="FolderSearch_TextChanged" />
+                <TreeView x:Name="FolderTree" Grid.Row="1" SelectionMode="Single" ItemTemplate="{StaticResource FolderTemplate}"
+                          Expanding="FolderTree_Expanding" ItemInvoked="FolderTree_ItemInvoked" />
+                <TreeView x:Name="SearchTree" Grid.Row="1" SelectionMode="Single" ItemTemplate="{StaticResource FolderTemplate}"
+                          Visibility="Collapsed" ItemInvoked="FolderTree_ItemInvoked" />
+                <TextBlock x:Name="SearchStatus" Grid.Row="1" Margin="12,8" Opacity="0.6" TextWrapping="Wrap"
+                           VerticalAlignment="Top" IsHitTestVisible="False" />
+            </Grid>
+
+            <Grid Grid.Column="1">
+                <SwapChainPanel x:Name="Panel"
+                                SizeChanged="Panel_SizeChanged"
+                                CompositionScaleChanged="Panel_CompositionScaleChanged"
+                                PointerPressed="Panel_PointerPressed" />
+                <ScrollViewer x:Name="GridScroller" Visibility="Collapsed" Padding="10"
+                              ViewChanged="Scroller_ViewChanged" SizeChanged="Scroller_SizeChanged">
+                    <ItemsRepeater x:Name="GridRepeater" ItemTemplate="{StaticResource PhotoTemplate}"
+                                   ElementPrepared="Repeater_ElementPrepared" ElementClearing="Repeater_ElementClearing">
+                        <ItemsRepeater.Layout>
+                            <UniformGridLayout MinItemWidth="190" MinItemHeight="150" MinRowSpacing="6" MinColumnSpacing="6"
+                                               ItemsStretch="Fill" />
+                        </ItemsRepeater.Layout>
+                    </ItemsRepeater>
+                </ScrollViewer>
+                <TextBlock x:Name="EmptyText" HorizontalAlignment="Center" VerticalAlignment="Center"
+                           Opacity="0.6" TextAlignment="Center" TextWrapping="Wrap" MaxWidth="420" />
+            </Grid>
+
+            <ScrollViewer x:Name="EditPanel" Grid.Column="2" Width="300" Visibility="Collapsed"
                           Background="{ThemeResource LayerFillColorDefaultBrush}"
                           BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1,0,0,0">
                 <StackPanel x:Name="EditControls" Padding="16,10,16,16" Spacing="2" />
             </ScrollViewer>
         </Grid>
-        <ScrollViewer x:Name="GridScroller" Grid.Row="1" Visibility="Collapsed" Padding="10"
-                      ViewChanged="Scroller_ViewChanged" SizeChanged="Scroller_SizeChanged">
-            <ItemsRepeater x:Name="GridRepeater" ItemTemplate="{StaticResource PhotoTemplate}"
-                           ElementPrepared="Repeater_ElementPrepared" ElementClearing="Repeater_ElementClearing">
-                <ItemsRepeater.Layout>
-                    <UniformGridLayout MinItemWidth="190" MinItemHeight="150" MinRowSpacing="6" MinColumnSpacing="6"
-                                       ItemsStretch="Fill" />
-                </ItemsRepeater.Layout>
-            </ItemsRepeater>
-        </ScrollViewer>
-        <TextBlock x:Name="EmptyText" Grid.Row="1" HorizontalAlignment="Center" VerticalAlignment="Center"
-                   Opacity="0.6" TextAlignment="Center" TextWrapping="Wrap" MaxWidth="420" />
 
         <!-- Filmstrip (loupe only) -->
         <ScrollViewer x:Name="FilmstripScroller" Grid.Row="2" Height="118" Padding="10,4"
@@ -163,9 +196,13 @@
             </Grid.ColumnDefinitions>
             <TextBlock x:Name="PhotoText" FontWeight="SemiBold" />
             <TextBlock x:Name="KeysText" Grid.Column="1" Opacity="0.55" TextTrimming="CharacterEllipsis"
-                       Text="← → move · 0–5 stars · P pick · X reject · U clear · 6–9 labels · Shift or Caps Lock: rate and move on · Z 100% · G grid · E loupe · D edit" />
+                       Text="← → move · 0–5 stars · P pick · X reject · U clear · 6–9 labels · Shift or Caps Lock: rate and move on · Z 100% · G grid · E loupe · D edit · F7 folders · F8 edit panel · Tab both" />
             <TextBlock x:Name="TimingText" Grid.Column="2" Opacity="0.55" FontFamily="Cascadia Mono, Consolas" FontSize="11"
                        VerticalAlignment="Center" />
         </Grid>
+
+        <!-- Where focus rests, so the culling keys work: it takes keys but shows and does nothing. -->
+        <ContentControl x:Name="KeyFocus" Grid.Row="3" Width="1" Height="1" HorizontalAlignment="Left"
+                        VerticalAlignment="Bottom" IsTabStop="True" UseSystemFocusVisuals="False" />
     </Grid>
 </Window>

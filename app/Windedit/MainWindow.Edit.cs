@@ -49,7 +49,7 @@ public sealed partial class MainWindow
         row.Children.Add(whiteBalanceText);
         row.Children.Add(asShot);
         asShot.HorizontalAlignment = HorizontalAlignment.Right;
-        EditControls.Children.Add(row);
+        group.Children.Add(row);
 
         temperature = Add(new Adjustment
         {
@@ -94,12 +94,49 @@ public sealed partial class MainWindow
         });
     }
 
-    void Header(string text) => EditControls.Children.Add(new TextBlock
+    /// <summary>The panel of the group being built: <see cref="Add"/> puts sliders in it.</summary>
+    StackPanel group = null!;
+
+    /// <summary>Starts a group of sliders under a header that opens and closes it.</summary>
+    void Header(string text)
     {
-        Text = text,
-        Style = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"],
-        Margin = new Thickness(0, EditControls.Children.Count == 0 ? 0 : 14, 0, 2),
-    });
+        var chevron = new FontIcon { FontSize = 12 };
+        var button = new Button
+        {
+            Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.Colors.Transparent),
+            BorderThickness = new Thickness(0),
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            HorizontalContentAlignment = HorizontalAlignment.Left,
+            Padding = new Thickness(4, 6, 4, 6),
+            Margin = new Thickness(0, EditControls.Children.Count == 0 ? 0 : 8, 0, 0),
+            Content = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 8,
+                Children =
+                {
+                    chevron,
+                    new TextBlock { Text = text, Style = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"] },
+                },
+            },
+        };
+        var body = group = new StackPanel { Spacing = 2 };
+        void Show(bool open)
+        {
+            body.Visibility = open ? Visibility.Visible : Visibility.Collapsed;
+            chevron.Glyph = ((char)(open ? 0xE70D : 0xE76C)).ToString(); // down, right
+        }
+        Show(layout.GetValueOrDefault(text, true));
+        button.Click += (_, _) =>
+        {
+            var open = body.Visibility == Visibility.Collapsed;
+            Show(open);
+            SetLayout(text, open);
+            FocusKeys();
+        };
+        EditControls.Children.Add(button);
+        EditControls.Children.Add(body);
+    }
 
     void AddPercent(string name, Func<Engine.Edit, float> get, Func<Engine.Edit, float, Engine.Edit> set) => Add(new Adjustment
     {
@@ -127,8 +164,8 @@ public sealed partial class MainWindow
         a.Slider.AddHandler(UIElement.PointerReleasedEvent, new PointerEventHandler((_, _) => CommitEdit()), true);
         a.Slider.AddHandler(UIElement.PointerCaptureLostEvent, new PointerEventHandler((_, _) => CommitEdit()), true);
         a.Slider.KeyUp += (_, _) => CommitEdit();
-        EditControls.Children.Add(label);
-        EditControls.Children.Add(a.Slider);
+        group.Children.Add(label);
+        group.Children.Add(a.Slider);
         adjustments.Add(a);
         return a;
     }

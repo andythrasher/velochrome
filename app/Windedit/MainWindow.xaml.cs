@@ -24,6 +24,8 @@ public sealed partial class MainWindow : Window
     // Sensor sizes seen, so the next launch can allocate GPU memory for them before it's needed.
     static readonly string SizesFile = Path.Combine(AppData, "sizes.txt");
     static readonly string RecentFile = Path.Combine(AppData, "recent.txt");
+    // Which panels and Edit groups are open, as name=1 or name=0 lines.
+    static readonly string LayoutFile = Path.Combine(AppData, "layout.txt");
     // Filmstrip cells fit a 3:2 thumbnail at the strip's height; the same spacing as the XAML layouts.
     const double FilmstripCellWidth = 133, CellSpacing = 6;
 
@@ -41,7 +43,8 @@ public sealed partial class MainWindow : Window
     int position = -1;
     PhotoItem? CurrentPhoto => position >= 0 && position < shown.Count ? shown[position] : null;
 
-    bool gridMode, actualSize, editMode;
+    bool gridMode, actualSize, editMode, foldersOpen;
+    readonly Dictionary<string, bool> layout = [];
     Engine.Frame last;
     /// <summary>How many repeaters each photo is shown in (filmstrip, grid): its thumbnail is
     /// kept while it's on screen somewhere.</summary>
@@ -59,11 +62,14 @@ public sealed partial class MainWindow : Window
         // Every key goes through here, even ones a control already used, so the culling keys work
         // wherever focus is (except while choosing from a list).
         Root.AddHandler(UIElement.KeyDownEvent, new KeyEventHandler(Root_KeyDown), true);
+        Root.Loaded += (_, _) => FocusKeys();
         FlagFilter.SelectedIndex = RatingFilter.SelectedIndex = LabelFilter.SelectedIndex = 0;
         LoupeToggle.IsChecked = true;
         PrepareRememberedSizes();
+        LoadLayout();
         BuildEditPanel();
-        RefreshRecentMenu();
+        BuildFolderTree();
+        SetFoldersPanel(layout.GetValueOrDefault("folders", true));
         EmptyText.Text = $"Open a folder of photos (Ctrl+O).\n\n{engine.AdapterName}";
         TimingText.Text = $"GPU warm-up {engine.WarmUpMs:F1} ms";
 
@@ -77,8 +83,6 @@ public sealed partial class MainWindow : Window
     }
 
     // ---- Opening ----
-
-    void OpenFolder_Click(SplitButton sender, SplitButtonClickEventArgs args) => PickFolder();
 
     async void PickFolder()
     {
@@ -306,9 +310,26 @@ public sealed partial class MainWindow : Window
 
     void Root_KeyDown(object sender, KeyRoutedEventArgs e)
     {
-        // Leave keys alone while a filter list has focus.
         var focused = FocusManager.GetFocusedElement(Content.XamlRoot);
-        if (focused is ComboBox)
+        // The panels' keys work wherever focus is. Tab is ours too: it doesn't move focus.
+        var alt = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Menu).HasFlag(CoreVirtualKeyStates.Down);
+        if (!alt && e.Key is VirtualKey.F7 or VirtualKey.F8 or VirtualKey.Tab)
+        {
+            switch (e.Key)
+            {
+                case VirtualKey.F7: SetFoldersPanel(!foldersOpen); break;
+                case VirtualKey.F8: SetEditMode(!editMode); break;
+                default:
+                    var both = !foldersOpen || !editMode;
+                    SetFoldersPanel(both);
+                    SetEditMode(both);
+                    break;
+            }
+            e.Handled = true;
+            return;
+        }
+        // Leave keys alone while a filter list or the folder search has focus.
+        if (focused is ComboBox or TextBox)
             return;
         // A focused slider keeps the keys that move it.
         if (focused is Slider && e.Key is VirtualKey.Left or VirtualKey.Right or VirtualKey.Up or VirtualKey.Down
@@ -387,7 +408,7 @@ public sealed partial class MainWindow : Window
     int GridRows() => Math.Max(1, (int)(GridScroller.ViewportHeight / (150 + 6)));
 
     /// <summary>Keeps keyboard focus off the filter lists, so arrow keys move through photos.</summary>
-    void FocusKeys() => OpenButton.Focus(FocusState.Programmatic);
+    void FocusKeys() => KeyFocus.Focus(FocusState.Programmatic);
 
     // ---- Views ----
 
@@ -408,8 +429,13 @@ public sealed partial class MainWindow : Window
         FocusKeys();
     }
 
-    void Edit_Click(object sender, RoutedEventArgs e) => SetEditMode(EditToggle.IsChecked == true);
+    void Edit_Click(object sender, RoutedEventArgs e)
+    {
+        SetEditMode(EditToggle.IsChecked == true);
+        FocusKeys();
+    }
 
+    /// <summary>Opening the Edit panel is what shows the developed raw.</summary>
     void SetEditMode(bool on)
     {
         editMode = on;
@@ -418,6 +444,22 @@ public sealed partial class MainWindow : Window
         EditPanel.Visibility = on && !gridMode ? Visibility.Visible : Visibility.Collapsed;
         if (on)
             ShowEdit();
+    }
+
+    void Folders_Click(object sender, RoutedEventArgs e)
+    {
+        SetFoldersPanel(FoldersToggle.IsChecked == true);
+        FocusKeys();
+    }
+
+    void SetFoldersPanel(bool on)
+    {
+        foldersOpen = on;
+        FoldersToggle.IsChecked = on;
+        FoldersPanel.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+        SetLayout("folders", on);
+        if (!on)
+            FocusKeys(); // focus inside the hidden panel would swallow the keys
     }
 
     void Thumbnail_Tapped(object sender, TappedRoutedEventArgs e)
@@ -590,20 +632,26 @@ public sealed partial class MainWindow : Window
         var recent = ReadLines(RecentFile).Where(p => !string.Equals(p, path, StringComparison.OrdinalIgnoreCase)).Take(9).ToList();
         recent.Insert(0, path);
         WriteLines(RecentFile, recent);
-        RefreshRecentMenu();
+        _ = RefreshRecent();
     }
 
-    void RefreshRecentMenu()
+    void LoadLayout()
     {
-        RecentMenu.Items.Clear();
-        foreach (var path in ReadLines(RecentFile).Where(Directory.Exists))
+        foreach (var line in ReadLines(LayoutFile))
         {
-            var item = new MenuFlyoutItem { Text = path };
-            item.Click += (_, _) => OpenFolder(path, null);
-            RecentMenu.Items.Add(item);
+            var at = line.LastIndexOf('=');
+            if (at > 0)
+                layout[line[..at]] = line[(at + 1)..] == "1";
         }
-        if (RecentMenu.Items.Count == 0)
-            RecentMenu.Items.Add(new MenuFlyoutItem { Text = "No recent folders", IsEnabled = false });
+    }
+
+    /// <summary>Remembers whether a panel or Edit group is open.</summary>
+    void SetLayout(string name, bool open)
+    {
+        if (layout.TryGetValue(name, out var was) && was == open)
+            return;
+        layout[name] = open;
+        WriteLines(LayoutFile, layout.Select(l => $"{l.Key}={(l.Value ? 1 : 0)}"));
     }
 
     static List<string> ReadLines(string path)
