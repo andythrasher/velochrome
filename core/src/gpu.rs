@@ -238,18 +238,7 @@ impl Gpu {
         format: DXGI_FORMAT,
         state: D3D12_RESOURCE_STATES,
     ) -> Result<ID3D12Resource> {
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-            Width: width as u64,
-            Height: height,
-            DepthOrArraySize: 1,
-            MipLevels: mips,
-            Format: format,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            ..Default::default()
-        };
-        committed(&self.device, D3D12_HEAP_TYPE_DEFAULT, &desc, state)
+        new_texture(&self.device, width, height, mips, format, state)
     }
 
     pub fn srv_texture(&self, resource: &ID3D12Resource, format: DXGI_FORMAT, mip: u32, mips: u32, slot: u32) {
@@ -326,7 +315,31 @@ fn kernel(device: &ID3D12Device, dxil: &[u8]) -> Result<Kernel> {
     }
 }
 
-fn new_buffer(
+/// Resource creation needs only the device, which Direct3D 12 lets any thread use, so these can
+/// run off the GPU thread.
+pub fn new_texture(
+    device: &ID3D12Device,
+    width: u32,
+    height: u32,
+    mips: u16,
+    format: DXGI_FORMAT,
+    state: D3D12_RESOURCE_STATES,
+) -> Result<ID3D12Resource> {
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: width as u64,
+        Height: height,
+        DepthOrArraySize: 1,
+        MipLevels: mips,
+        Format: format,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    committed(device, D3D12_HEAP_TYPE_DEFAULT, &desc, state)
+}
+
+pub fn new_buffer(
     device: &ID3D12Device,
     size: u64,
     heap: D3D12_HEAP_TYPE,

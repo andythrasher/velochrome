@@ -1,132 +1,103 @@
-using System.Diagnostics;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
-using Microsoft.UI.Xaml.Media;
 using Windows.Storage.Pickers;
 using Windows.System;
 
 namespace Windedit;
 
 /// <summary>
-/// Phase 0 test window: open a raw file, drag Exposure, and see how long each step takes.
-/// Slider moves are coalesced into at most one render per display frame.
+/// Phase 1a test window: open a photo, move through its folder, and see what the engine drew
+/// and how soon. The engine does the work on its own threads; this window only sends requests
+/// and shows the frame reports it gets back.
 /// </summary>
 public sealed partial class MainWindow : Window
 {
-    static readonly string[] RawExtensions = [".orf", ".rw2"];
+    static readonly string[] Extensions = [".orf", ".rw2", ".dng", ".jpg", ".jpeg"];
+    static readonly string[] LayerNames = ["", "quick preview", "loupe preview", "full-size preview", "raw"];
+    // Sensor sizes seen, so the next launch can allocate GPU memory for them before it's needed.
+    static readonly string SizesFile = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Windedit", "sizes.txt");
 
     readonly Engine engine;
-    string? path;
-    Engine.OpenInfo opened;
-    string openSummary = "";
-    bool hasImage, busy, dirty, actualSize;
-    // From the first slider move since the last frame to that move being on screen.
-    readonly Stopwatch sinceInput = new();
-    // Recent frames, for a steady readout while dragging.
-    readonly Queue<(double develop, double cpu, double input)> recent = new();
+    readonly Microsoft.UI.Dispatching.DispatcherQueue ui;
+    int count, index = -1;
+    bool actualSize;
+    Engine.Frame last;
+    readonly List<(uint, uint)> sizes = [];
 
     public MainWindow(string? startPath)
     {
         InitializeComponent();
         AppWindow.Resize(new Windows.Graphics.SizeInt32(1600, 1000));
+        ui = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
         engine = new Engine();
+        engine.FrameDrawn += frame => ui.TryEnqueue(() => OnFrame(frame));
         Closed += (_, _) => engine.Dispose();
         Content.KeyDown += Content_KeyDown;
-        CompositionTarget.Rendering += OnRendering;
-        Status.Text = $"{engine.AdapterName} · GPU warm-up {engine.WarmUpMs:F0} ms · Ctrl+O opens a raw file";
+        PrepareRememberedSizes();
+        Status.Text = $"{engine.AdapterName} · GPU warm-up {engine.WarmUpMs:F1} ms · Ctrl+O opens a photo";
         if (startPath != null)
-            _ = OpenAsync(startPath);
+            OpenPhoto(startPath);
     }
 
     async void Open_Click(object sender, RoutedEventArgs e)
     {
         var picker = new FileOpenPicker { SuggestedStartLocation = PickerLocationId.PicturesLibrary };
-        foreach (var ext in RawExtensions)
+        foreach (var ext in Extensions)
             picker.FileTypeFilter.Add(ext);
         WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(this));
         var file = await picker.PickSingleFileAsync();
         if (file != null)
-            await OpenAsync(file.Path);
+            OpenPhoto(file.Path);
     }
 
-    async Task OpenAsync(string newPath)
+    /// <summary>Opens the photo's folder and shows it.</summary>
+    void OpenPhoto(string path)
     {
-        if (busy)
-            return;
-        busy = true;
-        Status.Text = $"Opening {Path.GetFileName(newPath)}…";
-        var clock = Stopwatch.StartNew();
         try
         {
-            // Decoding takes a while; keep the window responsive. Nothing else touches the
-            // engine meanwhile (busy blocks rendering).
-            opened = await Task.Run(() => engine.Open(newPath));
-            path = newPath;
-            hasImage = true;
-            actualSize = false;
-            recent.Clear();
-            busy = false;
-            Render();
-            var o = opened;
-            openSummary = $"{engine.AdapterName} · {Path.GetFileName(path)} {o.Width}×{o.Height} · " +
-                $"open {o.TotalMs:F0} ms (decode {o.DecodeMs:F0}, {(o.AllocMs > 0 ? $"new GPU memory {o.AllocMs:F0}" : "GPU memory reused")}, upload {o.UploadMs:F1}, copy {o.CopyMs:F1}, " +
-                $"demosaic {o.DemosaicMs:F1}, pyramid {o.PyramidMs:F1}) · on screen after {clock.Elapsed.TotalMilliseconds:F0} ms";
-            Status.Text = openSummary;
-            Title = $"{Path.GetFileName(path)} – Windedit";
+            count = engine.OpenFolder(Path.GetDirectoryName(path)!);
+            Show(Math.Max(0, engine.FindPhoto(path)));
         }
         catch (Exception ex)
         {
-            Status.Text = $"Couldn't open {Path.GetFileName(newPath)}: {ex.Message}";
-        }
-        finally
-        {
-            busy = false;
+            Status.Text = $"Couldn't open {Path.GetFileName(path)}: {ex.Message}";
         }
     }
+
+    void Show(int newIndex)
+    {
+        if (newIndex < 0 || newIndex >= count)
+            return;
+        index = newIndex;
+        engine.Show(index);
+        Title = $"{engine.PhotoName(index)} ({index + 1} of {count}) – Windedit";
+    }
+
+    void OnFrame(Engine.Frame f)
+    {
+        last = f;
+        RememberSize(f.RawWidth, f.RawHeight);
+        if (f.Photo != index)
+            return;
+        var open = f.OpenMs > 0 ? $", raw opened on the GPU in {f.OpenMs:F1} ms" : "";
+        Status.Text = $"{engine.AdapterName} · {engine.PhotoName(index)} ({index + 1} of {count}) " +
+            $"{f.Width}×{f.Height} · {(actualSize ? "100%" : "fit")}{(EditToggle.IsChecked == true ? " · Edit" : "")}\n" +
+            $"Showing the {LayerNames[f.Layer]}, {f.SinceShowMs:F1} ms after it was asked for{open} · " +
+            $"frame: GPU {f.GpuMs:F2} ms, total {f.CpuMs:F2} ms";
+    }
+
+    void Edit_Click(object sender, RoutedEventArgs e) => engine.SetEditMode(EditToggle.IsChecked == true);
 
     void Exposure_ValueChanged(object sender, RangeBaseValueChangedEventArgs e)
     {
         ExposureText.Text = e.NewValue.ToString("+0.00;-0.00;0.00");
         engine.SetExposure((float)e.NewValue);
-        Invalidate();
     }
 
     void Exposure_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e) => ExposureSlider.Value = 0;
-
-    void Invalidate()
-    {
-        if (!dirty)
-            sinceInput.Restart();
-        dirty = true;
-    }
-
-    void OnRendering(object? sender, object e)
-    {
-        if (dirty && !busy)
-            Render();
-    }
-
-    void Render()
-    {
-        dirty = false;
-        if (!hasImage)
-            return;
-        var t = engine.Render();
-        var input = sinceInput.IsRunning ? sinceInput.Elapsed.TotalMilliseconds : t.CpuMs;
-        sinceInput.Reset();
-        recent.Enqueue((t.DevelopMs, t.CpuMs, input));
-        while (recent.Count > 30)
-            recent.Dequeue();
-        if (recent.Count > 1)
-        {
-            Status.Text = $"{openSummary}\n" +
-                $"Last {recent.Count} frames: " +
-                $"develop {recent.Average(r => r.develop):F3} ms on the GPU, render call {recent.Average(r => r.cpu):F2} ms, " +
-                $"slider-to-screen {recent.Average(r => r.input):F1} ms · {(actualSize ? "100%" : "fit")}";
-        }
-    }
 
     void Panel_SizeChanged(object sender, SizeChangedEventArgs e) => ResizeView();
 
@@ -134,16 +105,15 @@ public sealed partial class MainWindow : Window
 
     void ResizeView()
     {
-        if (busy || Panel.ActualWidth < 1 || Panel.ActualHeight < 1)
+        if (Panel.ActualWidth < 1 || Panel.ActualHeight < 1)
             return;
         var scale = Panel.CompositionScaleX;
         engine.ResizeView(Panel, (uint)Math.Round(Panel.ActualWidth * scale), (uint)Math.Round(Panel.ActualHeight * scale), scale);
-        Render();
     }
 
     void Panel_PointerPressed(object sender, PointerRoutedEventArgs e)
     {
-        if (!hasImage || busy)
+        if (index < 0 || last.Width == 0)
             return;
         if (actualSize)
         {
@@ -154,26 +124,70 @@ public sealed partial class MainWindow : Window
             // Where the click landed on the fitted photo, as fractions of its size.
             var p = e.GetCurrentPoint(Panel).Position;
             double w = Panel.ActualWidth, h = Panel.ActualHeight;
-            var fit = Math.Min(w / opened.Width, h / opened.Height);
-            var x = (p.X - (w - opened.Width * fit) / 2) / (opened.Width * fit);
-            var y = (p.Y - (h - opened.Height * fit) / 2) / (opened.Height * fit);
+            var fit = Math.Min(w / last.Width, h / last.Height);
+            var x = (p.X - (w - last.Width * fit) / 2) / (last.Width * fit);
+            var y = (p.Y - (h - last.Height * fit) / 2) / (last.Height * fit);
             engine.ZoomToActual((float)x, (float)y);
         }
         actualSize = !actualSize;
-        Invalidate();
     }
 
     void Content_KeyDown(object sender, KeyRoutedEventArgs e)
     {
-        if (path == null || busy || (e.Key != VirtualKey.Left && e.Key != VirtualKey.Right))
+        if (index < 0)
             return;
-        var files = Directory.EnumerateFiles(Path.GetDirectoryName(path)!)
-            .Where(f => RawExtensions.Contains(Path.GetExtension(f).ToLowerInvariant()))
-            .Order(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-        var next = files.IndexOf(path) + (e.Key == VirtualKey.Right ? 1 : -1);
-        if (next >= 0 && next < files.Count)
-            _ = OpenAsync(files[next]);
+        switch (e.Key)
+        {
+            case VirtualKey.Right: Show(index + 1); break;
+            case VirtualKey.Left: Show(index - 1); break;
+            case VirtualKey.Home: Show(0); break;
+            case VirtualKey.End: Show(count - 1); break;
+            case VirtualKey.F12:
+                // Diagnostic: what the engine drew, to compare with the screen.
+                engine.SaveSnapshot(Path.Combine(Path.GetTempPath(), "windedit-snapshot.png"));
+                break;
+            case VirtualKey.E:
+                EditToggle.IsChecked = EditToggle.IsChecked != true;
+                engine.SetEditMode(EditToggle.IsChecked == true);
+                break;
+            default: return;
+        }
         e.Handled = true;
+    }
+
+    void PrepareRememberedSizes()
+    {
+        try
+        {
+            foreach (var line in File.ReadAllLines(SizesFile))
+            {
+                var parts = line.Split(' ');
+                if (parts.Length == 2 && uint.TryParse(parts[0], out var w) && uint.TryParse(parts[1], out var h))
+                {
+                    sizes.Add((w, h));
+                    engine.Prepare(w, h);
+                }
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    /// <summary>Keeps the two most recent sensor sizes (the engine keeps memory for two).</summary>
+    void RememberSize(uint width, uint height)
+    {
+        if (width == 0 || (sizes.Count > 0 && sizes[0] == (width, height)))
+            return;
+        sizes.Remove((width, height));
+        sizes.Insert(0, (width, height));
+        if (sizes.Count > 2)
+            sizes.RemoveAt(2);
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(SizesFile)!);
+            File.WriteAllLines(SizesFile, sizes.Select(s => $"{s.Item1} {s.Item2}"));
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 }

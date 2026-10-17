@@ -9,7 +9,10 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{Interface, Result};
 
 use crate::gpu::Gpu;
-use crate::pipeline::{Edit, Image, TARGET_FORMAT, Target, Zoom, render};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::Threading::WaitForSingleObjectEx;
+
+use crate::pipeline::{TARGET_FORMAT, Target};
 
 const BUFFERS: u32 = 2;
 
@@ -27,8 +30,14 @@ pub struct FrameTimings {
 pub struct Presenter {
     pub chain: IDXGISwapChain3,
     buffers: Vec<ID3D12Resource>,
-    target: Target,
+    pub target: Target,
+    /// Signaled when the swap chain can take another frame.
+    frame_ready: HANDLE,
 }
+
+// Lets the GPU thread wait until a frame is needed before drawing it, so what's drawn is as
+// fresh as possible.
+const FLAGS: DXGI_SWAP_CHAIN_FLAG = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
 impl Presenter {
     /// `width` and `height` in physical pixels; `scale` is the panel's DPI scale, undone with
@@ -45,10 +54,16 @@ impl Presenter {
             Scaling: DXGI_SCALING_STRETCH,
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
             AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+            Flags: FLAGS.0 as u32,
             ..Default::default()
         };
         let chain: IDXGISwapChain3 = unsafe { gpu.factory.CreateSwapChainForComposition(&gpu.queue, &desc, None)? }.cast()?;
-        let presenter = Presenter { buffers: buffers(&chain)?, target: Target::new(gpu, width, height)?, chain };
+        let frame_ready = unsafe {
+            chain.SetMaximumFrameLatency(1)?;
+            chain.GetFrameLatencyWaitableObject()
+        };
+        let presenter =
+            Presenter { buffers: buffers(&chain)?, target: Target::new(gpu, width, height)?, chain, frame_ready };
         presenter.set_scale(scale)?;
         Ok(presenter)
     }
@@ -58,7 +73,7 @@ impl Presenter {
         if width != self.target.width || height != self.target.height {
             gpu.wait_idle()?;
             self.buffers.clear();
-            unsafe { self.chain.ResizeBuffers(BUFFERS, width, height, TARGET_FORMAT, DXGI_SWAP_CHAIN_FLAG(0))? };
+            unsafe { self.chain.ResizeBuffers(BUFFERS, width, height, TARGET_FORMAT, FLAGS)? };
             self.buffers = buffers(&self.chain)?;
             self.target = Target::new(gpu, width, height)?;
         }
@@ -71,12 +86,22 @@ impl Presenter {
         unsafe { self.chain.SetMatrixTransform(&matrix) }
     }
 
-    pub fn present(&mut self, gpu: &mut Gpu, image: &Image, edit: &Edit, zoom: Zoom) -> Result<FrameTimings> {
+    pub fn size(&self) -> (u32, u32) {
+        (self.target.width, self.target.height)
+    }
+
+    /// Blocks until the swap chain is ready for another frame (at most `timeout_ms`).
+    pub fn wait_for_frame(&self, timeout_ms: u32) {
+        unsafe { WaitForSingleObjectEx(self.frame_ready, timeout_ms, true) };
+    }
+
+    /// Records `draw` into the view's target and shows the result.
+    pub fn present(&mut self, gpu: &mut Gpu, draw: impl FnOnce(&Gpu, &Target)) -> Result<FrameTimings> {
         let start = Instant::now();
         let back = &self.buffers[unsafe { self.chain.GetCurrentBackBufferIndex() } as usize];
         gpu.begin()?;
         let t0 = gpu.timestamp();
-        render(gpu, image, edit, zoom, &self.target);
+        draw(gpu, &self.target);
         let t1 = gpu.timestamp();
         gpu.transition(&self.target.texture, 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         gpu.transition(back, 0, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -96,4 +121,12 @@ impl Presenter {
 
 fn buffers(chain: &IDXGISwapChain3) -> Result<Vec<ID3D12Resource>> {
     (0..BUFFERS).map(|i| unsafe { chain.GetBuffer(i) }).collect()
+}
+
+impl Drop for Presenter {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.frame_ready);
+        }
+    }
 }

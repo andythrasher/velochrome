@@ -134,12 +134,7 @@ pub fn decode_file(path: &Path) -> Result<RawFrame, DecodeError> {
         });
 
     // rawler leaves orientation unset for ORF and RW2; both keep the standard tag in IFD0.
-    let orientation = match tiff_orientation(source.buf()).unwrap_or(raw.orientation) {
-        rawler::Orientation::Rotate90 => Orientation::Rotate90,
-        rawler::Orientation::Rotate180 => Orientation::Rotate180,
-        rawler::Orientation::Rotate270 => Orientation::Rotate270,
-        _ => Orientation::Normal,
-    };
+    let orientation = to_orientation(tiff_orientation(source.buf()).unwrap_or(raw.orientation));
 
     Ok(RawFrame {
         make: raw.clean_make.clone(),
@@ -157,33 +152,6 @@ pub fn decode_file(path: &Path) -> Result<RawFrame, DecodeError> {
     })
 }
 
-/// The JPEG the camera embedded in the raw file, decoded. This is what culling shows.
-pub struct Preview {
-    pub width: u32,
-    pub height: u32,
-    pub time: Duration,
-}
-
-pub fn decode_preview(path: &Path) -> Result<Preview, DecodeError> {
-    let start = Instant::now();
-    let source = RawSource::new(path).map_err(err)?;
-    // rawler knows where most makers keep the preview (Panasonic's is found this way); for the
-    // rest (Olympus keeps it in its maker notes), look for the biggest JPEG in the file.
-    let params = RawDecodeParams::default();
-    let known = rawler::get_decoder(&source)
-        .ok()
-        .and_then(|d| d.full_image(&source, &params).ok().flatten().or_else(|| d.preview_image(&source, &params).ok().flatten()));
-    let image = match known {
-        Some(image) => image,
-        None => {
-            let bytes = source.buf();
-            let jpeg = largest_embedded_jpeg(bytes).ok_or_else(|| DecodeError("no embedded preview".into()))?;
-            image::load_from_memory_with_format(&bytes[jpeg.offset..], image::ImageFormat::Jpeg).map_err(err)?
-        }
-    };
-    Ok(Preview { width: image.width(), height: image.height(), time: start.elapsed() })
-}
-
 /// Where a JPEG sits inside a raw file, and its size.
 #[derive(Debug, Clone, Copy)]
 pub struct EmbeddedJpeg {
@@ -196,24 +164,34 @@ pub struct EmbeddedJpeg {
 /// previews in different places (Olympus in its maker notes, Panasonic in a JpgFromRaw tag), but
 /// they're all ordinary JPEGs, so a scan finds them without knowing each maker's layout.
 pub fn largest_embedded_jpeg(bytes: &[u8]) -> Option<EmbeddedJpeg> {
-    let mut best: Option<EmbeddedJpeg> = None;
+    embedded_jpegs(bytes).into_iter().max_by_key(|j| j.width as u64 * j.height as u64)
+}
+
+/// Every JPEG in the file that has a readable frame header, in file order. A JPEG's own data
+/// is skipped, so what's nested inside it (an EXIF thumbnail, or a stub whose header claims a
+/// size its data doesn't have, as in Lumix S9 files) isn't taken for a separate image. If a
+/// JPEG runs past the end of `bytes`, the scan stops there.
+pub fn embedded_jpegs(bytes: &[u8]) -> Vec<EmbeddedJpeg> {
+    let mut found = Vec::new();
     let mut i = 0;
     let finder = memchr::memmem::Finder::new(&[0xFF, 0xD8, 0xFF]);
     while let Some(pos) = finder.find(&bytes[i..]) {
         let soi = i + pos;
-        if let Some((width, height)) = jpeg_dimensions(&bytes[soi..]) {
-            let area = width as u64 * height as u64;
-            if best.is_none_or(|b| area > b.width as u64 * b.height as u64) {
-                best = Some(EmbeddedJpeg { offset: soi, width, height });
-            }
+        let Some((width, height)) = jpeg_dimensions(&bytes[soi..]) else {
+            i = soi + 3;
+            continue;
+        };
+        found.push(EmbeddedJpeg { offset: soi, width, height });
+        match jpeg_end(&bytes[soi..], 0) {
+            Some(len) => i = soi + len,
+            None => break,
         }
-        i = soi + 3;
     }
-    best
+    found
 }
 
 /// Walks the JPEG's marker segments up to the scan, returning the frame size.
-fn jpeg_dimensions(jpeg: &[u8]) -> Option<(u32, u32)> {
+pub fn jpeg_dimensions(jpeg: &[u8]) -> Option<(u32, u32)> {
     let mut j = 2;
     while j + 4 <= jpeg.len() && jpeg[j] == 0xFF {
         let marker = jpeg[j + 1];
@@ -253,4 +231,96 @@ fn tiff_orientation(bytes: &[u8]) -> Option<rawler::Orientation> {
         let entry = ifd + 2 + i * 12;
         (u16_at(entry)? == 0x0112).then(|| u16_at(entry + 8).map(rawler::Orientation::from_u16))?
     })
+}
+
+fn to_orientation(o: rawler::Orientation) -> Orientation {
+    match o {
+        rawler::Orientation::Rotate90 => Orientation::Rotate90,
+        rawler::Orientation::Rotate180 => Orientation::Rotate180,
+        rawler::Orientation::Rotate270 => Orientation::Rotate270,
+        _ => Orientation::Normal,
+    }
+}
+
+/// The orientation recorded in a raw file, from its first bytes (Normal if there's none).
+pub fn orientation_of(head: &[u8]) -> Orientation {
+    tiff_orientation(head).map(to_orientation).unwrap_or_default()
+}
+
+/// Where a JPEG ends (just past its end marker), if `jpeg` holds all of it. Only the image data
+/// after the scan header is searched, so a thumbnail's end marker inside the EXIF block isn't
+/// mistaken for it; `from` skips data already searched by an earlier call.
+pub fn jpeg_end(jpeg: &[u8], from: usize) -> Option<usize> {
+    let mut j = 2;
+    let data_start = loop {
+        if j + 4 > jpeg.len() || jpeg[j] != 0xFF {
+            return None;
+        }
+        let len = u16::from_be_bytes([jpeg[j + 2], jpeg[j + 3]]) as usize;
+        if jpeg[j + 1] == 0xDA {
+            break j + 2 + len;
+        }
+        j += 2 + len;
+    };
+    let start = from.max(data_start);
+    if start >= jpeg.len() {
+        return None;
+    }
+    memchr::memmem::find(&jpeg[start..], &[0xFF, 0xD9]).map(|p| start + p + 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal JPEG: frame header with this size, a scan header, some image data, the end.
+    fn jpeg(width: u16, height: u16, data: &[u8]) -> Vec<u8> {
+        let mut j = vec![0xFF, 0xD8];
+        j.extend([0xFF, 0xC0, 0x00, 0x11, 0x08]);
+        j.extend(height.to_be_bytes());
+        j.extend(width.to_be_bytes());
+        j.extend([0x03, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
+        j.extend([0xFF, 0xDA, 0x00, 0x0C, 0x03, 1, 0, 2, 0x11, 3, 0x11, 0, 0x3F, 0]);
+        j.extend_from_slice(data);
+        j.extend([0xFF, 0xD9]);
+        j
+    }
+
+    #[test]
+    fn finds_dimensions_and_end() {
+        let j = jpeg(6000, 4000, &[1, 2, 0xFF, 0x00, 3]);
+        assert_eq!(jpeg_dimensions(&j), Some((6000, 4000)));
+        assert_eq!(jpeg_end(&j, 0), Some(j.len()));
+        // Not all there yet: no end found.
+        assert_eq!(jpeg_end(&j[..j.len() - 1], 0), None);
+    }
+
+    #[test]
+    fn skips_jpegs_nested_inside_another() {
+        // A preview whose data happens to contain a stub claiming to be full size (as in Lumix
+        // S9 files), then a real full-size JPEG after it.
+        let stub = jpeg(6000, 4000, &[]);
+        let mut preview_data = vec![5u8; 16];
+        preview_data.extend(&stub[..stub.len() - 2]); // its end marker would end the preview early
+        let mut file = vec![0u8; 100];
+        file.extend(jpeg(1920, 1280, &preview_data));
+        let full_at = file.len() + 50;
+        file.extend(vec![0u8; 50]);
+        file.extend(jpeg(6000, 4000, &[7; 64]));
+
+        let found = embedded_jpegs(&file);
+        let sizes: Vec<_> = found.iter().map(|j| (j.offset, j.width, j.height)).collect();
+        assert_eq!(sizes, vec![(100, 1920, 1280), (full_at, 6000, 4000)]);
+    }
+
+    #[test]
+    fn orientation_from_tiff_header() {
+        // Little-endian TIFF, IFD0 at 8 with one entry: Orientation = 6 (rotate 90° clockwise).
+        let mut tiff = b"II*\0".to_vec();
+        tiff.extend(8u32.to_le_bytes());
+        tiff.extend(1u16.to_le_bytes());
+        tiff.extend([0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0]);
+        assert_eq!(orientation_of(&tiff), Orientation::Rotate90);
+        assert_eq!(orientation_of(b"not a tiff"), Orientation::Normal);
+    }
 }

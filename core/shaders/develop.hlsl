@@ -1,4 +1,5 @@
-// The per-edit pass: runs for every slider change, once per screen pixel.
+// The view pass: runs for every slider change, once per screen pixel. It develops a raw, or
+// shows one of the camera's JPEGs (mode 1) through the same zoom and rotation.
 //
 // It samples the cached pyramid at the level matching the zoom, so its cost depends on the
 // window size, not the sensor size. White balance, exposure and both color conversions are
@@ -15,7 +16,7 @@ cbuffer Constants : register(b0)
     float2 stepX;   // change in image coordinates per output pixel to the right
     float2 stepY;   // ... and per output pixel down
     float lod;      // pyramid level to sample
-    float pad0;
+    uint mode;      // 0: develop a raw; 1: show a camera JPEG (BGRA, already display-ready)
     uint outWidth;
     uint outHeight;
 };
@@ -48,7 +49,13 @@ void main(uint3 id : SV_DispatchThreadID)
         output[id.xy] = float4(0.11, 0.11, 0.11, 1.0); // the empty canvas around the photo
         return;
     }
-    float3 cam = image.SampleLevel(linearClamp, uv, lod).rgb;
+    float4 texel = image.SampleLevel(linearClamp, uv, lod);
+    if (mode == 1)
+    {
+        output[id.xy] = float4(texel.bgr, 1.0);
+        return;
+    }
+    float3 cam = texel.rgb;
     float3 rgb = float3(dot(row0.xyz, cam), dot(row1.xyz, cam), dot(row2.xyz, cam));
     rgb = tone(max(rgb, 0.0));
     output[id.xy] = float4(srgbEncode(rgb), 1.0);

@@ -13,7 +13,7 @@ use windows::core::Result;
 
 use crate::color::{self, Mat3};
 use crate::decode::{Orientation, RawFrame};
-use crate::gpu::Gpu;
+use crate::gpu::{Gpu, new_buffer, new_texture};
 
 const LINEAR_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
 pub const TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -40,9 +40,11 @@ pub struct ImageMemory {
 /// costs about 350 MB for a 24-megapixel photo.
 const SLOTS: usize = 2;
 
-struct Slot {
-    width: u32,
-    height: u32,
+/// The GPU memory for one photo size. Can be allocated on any thread (`Slot::allocate`) and
+/// handed to the GPU thread's `ImageMemory`.
+pub struct Slot {
+    pub width: u32,
+    pub height: u32,
     levels: u32,
     /// Sensor data, in memory the CPU writes and the GPU can read. Mapped for its whole life.
     upload: ID3D12Resource,
@@ -77,24 +79,51 @@ impl ImageMemory {
         if self.slots.len() >= SLOTS {
             self.slots.pop();
         }
-        let bytes = width as u64 * height as u64 * 2;
-        let upload = gpu.buffer(bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)?;
-        let mut ptr = std::ptr::null_mut();
-        unsafe { upload.Map(0, Some(&D3D12_RANGE::default()), Some(&mut ptr))? };
-        let raw = if gpu.uma {
-            None
-        } else {
-            Some(gpu.buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON)?)
-        };
-        let levels = 32 - width.max(height).leading_zeros();
-        let linear = gpu.texture(width, height, levels as u16, LINEAR_FORMAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
-        self.slots.insert(
-            0,
-            Slot { width, height, levels, upload, upload_ptr: ptr as *mut u16, raw, linear, used: false },
-        );
+        let slot = Slot::allocate(&gpu.device, gpu.uma, width, height)?;
+        self.slots.insert(0, slot);
         Ok(true)
     }
+
+    /// Whether this photo size already has memory.
+    pub fn has(&self, width: u32, height: u32) -> bool {
+        self.slots.iter().any(|s| s.width == width && s.height == height)
+    }
+
+    /// Adds memory allocated elsewhere (see `Slot::allocate`), as the most recently used.
+    pub fn insert(&mut self, slot: Slot) {
+        if self.has(slot.width, slot.height) {
+            return;
+        }
+        if self.slots.len() >= SLOTS {
+            self.slots.pop();
+        }
+        self.slots.insert(0, slot);
+    }
 }
+
+impl Slot {
+    /// Allocates the memory for one photo size. Needs only the device, so it can run on a
+    /// helper thread while the GPU thread keeps drawing.
+    pub fn allocate(device: &ID3D12Device, uma: bool, width: u32, height: u32) -> Result<Slot> {
+        let bytes = width as u64 * height as u64 * 2;
+        let upload = new_buffer(device, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+        let mut ptr = std::ptr::null_mut();
+        unsafe { upload.Map(0, Some(&D3D12_RANGE::default()), Some(&mut ptr))? };
+        let raw = if uma {
+            None
+        } else {
+            Some(new_buffer(device, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON)?)
+        };
+        let levels = 32 - width.max(height).leading_zeros();
+        let linear =
+            new_texture(device, width, height, levels as u16, LINEAR_FORMAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
+        Ok(Slot { width, height, levels, upload, upload_ptr: ptr as *mut u16, raw, linear, used: false })
+    }
+}
+
+// SAFETY: Direct3D 12 resources may be used from any thread, and the mapped upload pointer is
+// only written by whichever thread owns the slot.
+unsafe impl Send for Slot {}
 
 /// A photo ready to develop: demosaiced and on the GPU.
 pub struct Image {
@@ -148,7 +177,7 @@ struct DevelopConstants {
     step_x: [f32; 2],
     step_y: [f32; 2],
     lod: f32,
-    pad: f32,
+    mode: u32,
     out_width: u32,
     out_height: u32,
 }
@@ -290,7 +319,7 @@ pub fn warm_up(gpu: &mut Gpu) -> Result<f64> {
     let (image, _) = Image::open(gpu, &mut ImageMemory::new(), &frame)?;
     let target = Target::new(gpu, SIZE, SIZE)?;
     gpu.begin()?;
-    render(gpu, &image, &Edit::default(), Zoom::Fit, &target);
+    render_image(gpu, &image, &Edit::default(), Zoom::Fit, &target);
     gpu.submit()?;
     Ok(start.elapsed().as_secs_f64() * 1000.0)
 }
@@ -306,7 +335,9 @@ pub struct Edit {
 pub enum Zoom {
     /// The whole photo, as large as fits.
     Fit,
-    /// One image pixel per screen pixel, centered on this point (in rotated image pixels).
+    /// One photo pixel per screen pixel, centered on this point, given as fractions (0..1) of the
+    /// rotated photo's width and height. Fractions, so the point stays put when a preview is
+    /// replaced by a bigger one or by the raw.
     Actual { x: f32, y: f32 },
 }
 
@@ -325,54 +356,219 @@ impl Target {
     }
 }
 
-/// Records the develop pass (between `gpu.begin` and `gpu.submit`).
-pub fn render(gpu: &Gpu, image: &Image, edit: &Edit, zoom: Zoom, target: &Target) {
-    let to_display = color::mul(&color::REC2020_TO_SRGB, &image.cam_to_working);
-    let gain = edit.exposure.exp2();
-    let rows = to_display.map(|r| [r[0] * gain, r[1] * gain, r[2] * gain, 0.0]);
-    let (origin, step_x, step_y, lod) = view_transform(image, zoom, target.width, target.height);
+/// What the view draws: a developed raw, or one of the camera's JPEGs.
+#[derive(Clone, Copy)]
+pub enum Layer<'a> {
+    Raw(&'a Image),
+    Preview(&'a PreviewTexture),
+}
+
+impl Layer<'_> {
+    /// Size of the texture, before rotation.
+    fn texture_size(&self) -> (u32, u32) {
+        match self {
+            Layer::Raw(i) => (i.width, i.height),
+            Layer::Preview(p) => (p.width, p.height),
+        }
+    }
+
+    fn orientation(&self) -> Orientation {
+        match self {
+            Layer::Raw(i) => i.orientation,
+            Layer::Preview(p) => p.orientation,
+        }
+    }
+}
+
+const MODE_DEVELOP: u32 = 0;
+const MODE_PREVIEW: u32 = 1;
+
+/// Records drawing `layer` into `target` (between `gpu.begin` and `gpu.submit`).
+/// `photo_size` is the photo's full size after rotation, which 100% zoom is relative to; a
+/// preview smaller than that is scaled up to stand in for it.
+pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32, u32), target: &Target) {
+    let (rows, mode) = match layer {
+        Layer::Raw(image) => {
+            let to_display = color::mul(&color::REC2020_TO_SRGB, &image.cam_to_working);
+            let gain = edit.exposure.exp2();
+            (to_display.map(|r| [r[0] * gain, r[1] * gain, r[2] * gain, 0.0]), MODE_DEVELOP)
+        }
+        Layer::Preview(_) => ([[0.0; 4]; 3], MODE_PREVIEW),
+    };
+    let (origin, step_x, step_y, lod) =
+        view_transform(layer.texture_size(), layer.orientation(), photo_size, zoom, target.width, target.height);
     let constants = DevelopConstants {
         rows,
         origin,
         step_x,
         step_y,
         lod,
-        pad: 0.0,
+        mode,
         out_width: target.width,
         out_height: target.height,
     };
-    gpu.srv_texture(&image.linear, LINEAR_FORMAT, 0, image.levels, SLOT_DEVELOP);
+    match layer {
+        Layer::Raw(image) => gpu.srv_texture(&image.linear, LINEAR_FORMAT, 0, image.levels, SLOT_DEVELOP),
+        Layer::Preview(p) => gpu.srv_texture(&p.texture, PREVIEW_FORMAT, 0, p.levels, SLOT_DEVELOP),
+    }
     gpu.uav_texture(&target.texture, TARGET_FORMAT, 0, SLOT_DEVELOP + 1);
     gpu.dispatch(&gpu.kernels.develop, &constants, SLOT_DEVELOP, (target.width, target.height));
 }
 
-/// Where each output pixel samples the image: an affine map from output pixels to texture
-/// coordinates, covering zoom, pan and the camera's rotation, plus the pyramid level to use.
-fn view_transform(image: &Image, zoom: Zoom, out_w: u32, out_h: u32) -> ([f32; 2], [f32; 2], [f32; 2], f32) {
-    let (ow, oh) = image.oriented_size();
-    let (w, h) = (image.width as f32, image.height as f32);
+/// Draws a developed raw on its own (the benchmark and tests).
+pub fn render_image(gpu: &Gpu, image: &Image, edit: &Edit, zoom: Zoom, target: &Target) {
+    render(gpu, Layer::Raw(image), edit, zoom, image.oriented_size(), target);
+}
+
+/// Where each output pixel samples the texture: an affine map from output pixels to texture
+/// coordinates covering zoom, pan and the camera's rotation, plus the pyramid level to use.
+/// Worked out in the rotated photo's own pixels, then normalized, so the texture's resolution
+/// only affects the pyramid level.
+fn view_transform(
+    texture: (u32, u32),
+    orientation: Orientation,
+    photo: (u32, u32),
+    zoom: Zoom,
+    out_w: u32,
+    out_h: u32,
+) -> ([f32; 2], [f32; 2], [f32; 2], f32) {
+    let (pw, ph) = (photo.0 as f32, photo.1 as f32);
     let (scale, center) = match zoom {
-        Zoom::Fit => ((out_w as f32 / ow as f32).min(out_h as f32 / oh as f32), (ow as f32 / 2.0, oh as f32 / 2.0)),
-        Zoom::Actual { x, y } => (1.0, (x, y)),
+        Zoom::Fit => ((out_w as f32 / pw).min(out_h as f32 / ph), (pw / 2.0, ph / 2.0)),
+        Zoom::Actual { x, y } => (1.0, (x.clamp(0.0, 1.0) * pw, y.clamp(0.0, 1.0) * ph)),
     };
-    let orientation = image.orientation;
-    // Output pixel → rotated image pixel → sensor pixel → texture coordinate.
+    // Output pixel → rotated photo (0..1) → texture (0..1).
     let map = |px: f32, py: f32| -> [f32; 2] {
-        let qx = center.0 + (px - out_w as f32 / 2.0) / scale;
-        let qy = center.1 + (py - out_h as f32 / 2.0) / scale;
-        let (rx, ry) = match orientation {
-            Orientation::Normal => (qx, qy),
-            Orientation::Rotate90 => (qy, h - qx),
-            Orientation::Rotate180 => (w - qx, h - qy),
-            Orientation::Rotate270 => (w - qy, qx),
-        };
-        [rx / w, ry / h]
+        let u = (center.0 + (px - out_w as f32 / 2.0) / scale) / pw;
+        let v = (center.1 + (py - out_h as f32 / 2.0) / scale) / ph;
+        match orientation {
+            Orientation::Normal => [u, v],
+            Orientation::Rotate90 => [v, 1.0 - u],
+            Orientation::Rotate180 => [1.0 - u, 1.0 - v],
+            Orientation::Rotate270 => [1.0 - v, u],
+        }
     };
     let o = map(0.0, 0.0);
     let x = map(1.0, 0.0);
     let y = map(0.0, 1.0);
-    let lod = (1.0 / scale).log2().max(0.0);
+    // Texture pixels per screen pixel, along the photo's width.
+    let texture_w = if orientation.swaps_axes() { texture.1 } else { texture.0 } as f32;
+    let lod = (texture_w / pw / scale).log2().max(0.0);
     (o, [x[0] - o[0], x[1] - o[1]], [y[0] - o[0], y[1] - o[1]], lod)
+}
+
+const PREVIEW_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
+// Pyramid levels of a preview: level - 1, then level.
+const fn slot_preview(level: u32) -> u32 {
+    120 + 2 * level
+}
+
+/// A camera JPEG on the GPU, with a pyramid so a big one can be shown small without shimmer.
+/// Holds WIC's BGRA bytes as they are; the shader swaps the channels back.
+pub struct PreviewTexture {
+    pub texture: ID3D12Resource,
+    pub width: u32,
+    pub height: u32,
+    pub levels: u32,
+    pub orientation: Orientation,
+    upload: ID3D12Resource,
+    upload_size: u64,
+}
+
+impl PreviewTexture {
+    /// Puts `pixels` on the GPU, reusing this texture's memory when the size matches.
+    pub fn upload(
+        gpu: &mut Gpu,
+        reuse: Option<PreviewTexture>,
+        pixels: &crate::jpeg::Pixels,
+        orientation: Orientation,
+    ) -> Result<PreviewTexture> {
+        let (width, height) = (pixels.width, pixels.height);
+        let levels = 32 - width.max(height).leading_zeros();
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: width as u64,
+            Height: height,
+            DepthOrArraySize: 1,
+            MipLevels: levels as u16,
+            Format: PREVIEW_FORMAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut upload_size = 0u64;
+        unsafe {
+            gpu.device.GetCopyableFootprints(&desc, 0, 1, 0, Some(&mut footprint), None, None, Some(&mut upload_size))
+        };
+
+        let mut tex = match reuse {
+            Some(t) if (t.width, t.height) == (width, height) => {
+                // Back from where the last preview left it, to receive a copy.
+                gpu.begin()?;
+                gpu.transition(
+                    &t.texture,
+                    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                );
+                gpu.submit()?;
+                PreviewTexture { orientation, ..t }
+            }
+            reuse => {
+                let texture = gpu.texture(width, height, levels as u16, PREVIEW_FORMAT, D3D12_RESOURCE_STATE_COPY_DEST)?;
+                let upload = match reuse {
+                    Some(t) if t.upload_size >= upload_size => t.upload,
+                    _ => gpu.buffer(upload_size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)?,
+                };
+                let upload_size = unsafe { upload.GetDesc().Width };
+                PreviewTexture { texture, width, height, levels, orientation, upload, upload_size }
+            }
+        };
+
+        unsafe {
+            let mut ptr = std::ptr::null_mut();
+            tex.upload.Map(0, Some(&D3D12_RANGE::default()), Some(&mut ptr))?;
+            let pitch = footprint.Footprint.RowPitch as usize;
+            let row = width as usize * 4;
+            for y in 0..height as usize {
+                std::ptr::copy_nonoverlapping(pixels.bgra.as_ptr().add(y * row), (ptr as *mut u8).add(y * pitch), row);
+            }
+            tex.upload.Unmap(0, None);
+        }
+
+        gpu.begin()?;
+        unsafe {
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&tex.texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&tex.upload),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+            };
+            gpu.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        // Level 0 to readable, the rest to writable, then build the pyramid as for raws.
+        gpu.transition(&tex.texture, 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        let (mut w, mut h) = (width, height);
+        for level in 1..levels {
+            gpu.transition(&tex.texture, level, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            let (pw, ph) = (w, h);
+            (w, h) = ((w / 2).max(1), (h / 2).max(1));
+            let slot = slot_preview(level);
+            gpu.srv_texture(&tex.texture, PREVIEW_FORMAT, level - 1, 1, slot);
+            gpu.uav_texture(&tex.texture, PREVIEW_FORMAT, level, slot + 1);
+            let constants = DownsampleConstants { dst_width: w, dst_height: h, src_width: pw, src_height: ph };
+            gpu.dispatch(&gpu.kernels.downsample, &constants, slot, (w, h));
+            gpu.transition(&tex.texture, level, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        gpu.submit()?;
+        tex.levels = levels;
+        Ok(tex)
+    }
 }
 
 /// Copies a target back to the CPU as tightly packed RGBA bytes (for tests and the benchmark).

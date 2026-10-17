@@ -1,49 +1,72 @@
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Microsoft.UI.Xaml.Controls;
 
 namespace Windedit;
 
 /// <summary>
-/// The Rust engine (core/src/ffi.rs). Calls return 0 on success; anything else throws with the
-/// engine's message. Not thread-safe: use it from one thread at a time.
+/// The Rust engine (core/src/ffi.rs). Calls return at once; decoding and drawing happen on the
+/// engine's threads, and each frame drawn raises <see cref="FrameDrawn"/> on the engine's GPU
+/// thread (not the UI thread). Failed calls throw with the engine's message.
 /// </summary>
 sealed unsafe partial class Engine : IDisposable
 {
     const string Dll = "windedit_core";
 
+    /// <summary>What a drawn frame showed (viewer.rs FrameEvent).</summary>
     [StructLayout(LayoutKind.Sequential)]
-    public struct OpenInfo
+    public struct Frame
     {
+        public int Photo;
+        /// <summary>1 quick preview, 2 loupe preview, 3 full-size preview, 4 the raw.</summary>
+        public uint Layer;
+        /// <summary>The photo's size after rotation.</summary>
         public uint Width, Height;
-        public double DecodeMs, AllocMs, UploadMs, CopyMs, DemosaicMs, PyramidMs, TotalMs;
+        /// <summary>The raw's sensor size, once decoded (else 0).</summary>
+        public uint RawWidth, RawHeight;
+        public double SinceShowMs, GpuMs, CpuMs, OpenMs;
     }
 
-    [StructLayout(LayoutKind.Sequential)]
-    public struct FrameTimings
-    {
-        public double DevelopMs, GpuMs, CpuMs;
-    }
-
-    [LibraryImport(Dll)] private static partial IntPtr we_engine_create();
+    [LibraryImport(Dll)] private static partial IntPtr we_engine_create(delegate* unmanaged[Cdecl]<IntPtr, Frame*, void> callback, IntPtr user);
     [LibraryImport(Dll)] private static partial void we_engine_destroy(IntPtr engine);
     [LibraryImport(Dll)] private static partial uint we_last_error(IntPtr engine, char* buf, uint len);
     [LibraryImport(Dll)] private static partial uint we_adapter_name(IntPtr engine, char* buf, uint len);
-    [LibraryImport(Dll, StringMarshalling = StringMarshalling.Utf16)] private static partial int we_open(IntPtr engine, string path, out OpenInfo info);
-    [LibraryImport(Dll)] private static partial int we_view_resize(IntPtr engine, uint width, uint height, float scale, out IntPtr chain);
-    [LibraryImport(Dll)] private static partial int we_set_exposure(IntPtr engine, float stops);
-    [LibraryImport(Dll)] private static partial int we_set_zoom(IntPtr engine, int actual, float x, float y);
-    [LibraryImport(Dll)] private static partial int we_render(IntPtr engine, out FrameTimings timings);
     [LibraryImport(Dll)] private static partial double we_warm_up_ms(IntPtr engine);
+    [LibraryImport(Dll, StringMarshalling = StringMarshalling.Utf16)] private static partial int we_open_folder(IntPtr engine, string path);
+    [LibraryImport(Dll, StringMarshalling = StringMarshalling.Utf16)] private static partial int we_find_photo(IntPtr engine, string path);
+    [LibraryImport(Dll)] private static partial uint we_photo_name(IntPtr engine, int index, char* buf, uint len);
+    [LibraryImport(Dll)] private static partial int we_show(IntPtr engine, int index);
+    [LibraryImport(Dll)] private static partial int we_set_zoom(IntPtr engine, int actual, float x, float y);
+    [LibraryImport(Dll)] private static partial int we_set_exposure(IntPtr engine, float stops);
+    [LibraryImport(Dll)] private static partial int we_set_edit_mode(IntPtr engine, int on);
+    [LibraryImport(Dll)] private static partial int we_view_resize(IntPtr engine, uint width, uint height, float scale, out IntPtr chain);
+    [LibraryImport(Dll)] private static partial int we_prepare(IntPtr engine, uint width, uint height);
+    [LibraryImport(Dll, StringMarshalling = StringMarshalling.Utf16)] private static partial int we_save_snapshot(IntPtr engine, string path);
 
     IntPtr handle;
+    GCHandle self;
+
+    /// <summary>Raised on the engine's GPU thread after every frame drawn.</summary>
+    public event Action<Frame>? FrameDrawn;
 
     public Engine()
     {
-        handle = we_engine_create();
+        self = GCHandle.Alloc(this);
+        handle = we_engine_create(&OnFrame, GCHandle.ToIntPtr(self));
         if (handle == IntPtr.Zero)
+        {
+            self.Free();
             throw new InvalidOperationException("This PC has no graphics card that supports Direct3D 12.");
+        }
         AdapterName = ReadString(&we_adapter_name);
         WarmUpMs = we_warm_up_ms(handle);
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    static void OnFrame(IntPtr user, Frame* frame)
+    {
+        if (GCHandle.FromIntPtr(user).Target is Engine engine)
+            engine.FrameDrawn?.Invoke(*frame);
     }
 
     public string AdapterName { get; }
@@ -51,11 +74,35 @@ sealed unsafe partial class Engine : IDisposable
     /// <summary>How long preparing the GPU kernels took at startup.</summary>
     public double WarmUpMs { get; }
 
-    public OpenInfo Open(string path)
+    /// <summary>Opens a folder; returns how many photos it has.</summary>
+    public int OpenFolder(string path) => Check(we_open_folder(handle, path));
+
+    /// <summary>The index of the photo with this file, or -1.</summary>
+    public int FindPhoto(string path) => Check(we_find_photo(handle, path));
+
+    public string PhotoName(int index)
     {
-        Check(we_open(handle, path, out var info));
-        return info;
+        var buf = stackalloc char[260];
+        var len = we_photo_name(handle, index, buf, 260);
+        return new string(buf, 0, (int)Math.Min(len, 259));
     }
+
+    public void Show(int index) => Check(we_show(handle, index));
+
+    public void ZoomToFit() => Check(we_set_zoom(handle, 0, 0, 0));
+
+    /// <summary>100% zoom centered on (x, y), as fractions of the photo's width and height.</summary>
+    public void ZoomToActual(float x, float y) => Check(we_set_zoom(handle, 1, x, y));
+
+    public void SetExposure(float stops) => Check(we_set_exposure(handle, stops));
+
+    public void SetEditMode(bool on) => Check(we_set_edit_mode(handle, on ? 1 : 0));
+
+    /// <summary>Allocates GPU memory for photos with this sensor size, ahead of the first one.</summary>
+    public void Prepare(uint width, uint height) => Check(we_prepare(handle, width, height));
+
+    /// <summary>Saves the last frame drawn as a PNG (a diagnostic).</summary>
+    public void SaveSnapshot(string path) => Check(we_save_snapshot(handle, path));
 
     /// <summary>Sizes the view's swap chain (physical pixels) and attaches it to the panel.</summary>
     public void ResizeView(SwapChainPanel panel, uint width, uint height, float scale)
@@ -64,32 +111,22 @@ sealed unsafe partial class Engine : IDisposable
         SetSwapChain(panel, chain);
     }
 
-    public void SetExposure(float stops) => Check(we_set_exposure(handle, stops));
-
-    public void ZoomToFit() => Check(we_set_zoom(handle, 0, 0, 0));
-
-    /// <summary>100% zoom centered on (x, y), as fractions of the photo's width and height.</summary>
-    public void ZoomToActual(float x, float y) => Check(we_set_zoom(handle, 1, x, y));
-
-    public FrameTimings Render()
-    {
-        Check(we_render(handle, out var timings));
-        return timings;
-    }
-
     public void Dispose()
     {
         if (handle != IntPtr.Zero)
         {
+            // Waits for the engine's threads, so no callback comes after this.
             we_engine_destroy(handle);
             handle = IntPtr.Zero;
+            self.Free();
         }
     }
 
-    void Check(int result)
+    int Check(int result)
     {
-        if (result != 0)
+        if (result < -1)
             throw new InvalidOperationException(ReadString(&we_last_error));
+        return result;
     }
 
     string ReadString(delegate*<IntPtr, char*, uint, uint> read)

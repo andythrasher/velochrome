@@ -4,8 +4,10 @@ A raw photo editor for Windows, built for speed: a Rust engine that develops pho
 with a native WinUI app on top. Mac and Linux versions are planned, each with its own native app
 on the same engine.
 
-It's at **Phase 0**: an engine test with one adjustment (Exposure). See
-[docs/phase0.md](docs/phase0.md) for what it measured.
+It's at **Phase 1, milestone 1a**: the engine for culling. Previews show at once, raws are
+decoded ahead in the background, and the test window moves through a folder. See
+[docs/phase0.md](docs/phase0.md) for the engine test, [docs/phase1-plan.md](docs/phase1-plan.md)
+for the plan and [docs/phase1a.md](docs/phase1a.md) for what 1a measured.
 
 Cameras tested: OM System OM-5 Mark II, Panasonic Lumix S1 and S9. The decoder (rawler)
 knows many more, but they're untested.
@@ -17,8 +19,12 @@ shader compiler; Visual Studio Build Tools include it).
 
 ```
 dotnet build app/Windedit
-app/Windedit/bin/Debug/net10.0-windows10.0.26100.0/win-x64/Windedit.exe [a raw file]
+app/Windedit/bin/Debug/net10.0-windows10.0.26100.0/win-x64/Windedit.exe [a photo]
 ```
+
+In the window: Ctrl+O opens a photo and its folder, ←/→/Home/End move through it, a click
+zooms to 100% there (and back), E switches between Cull mode (the camera's JPEGs) and Edit mode
+(the developed raw), and F12 saves the last frame the engine drew to `%TEMP%\windedit-snapshot.png`.
 
 Building the app builds the engine first (`cargo build --release -p windedit-core`).
 
@@ -27,9 +33,12 @@ The benchmark:
 ```
 cargo build --release -p bench
 target/release/bench.exe decode|preview|gpu <raw files or folders>
+target/release/bench.exe cull <a folder>
 ```
 
-`gpu` also writes a PNG of each photo's fitted view to `target/release/renders`.
+`gpu` also writes a PNG of each photo's fitted view to `target/release/renders`. `cull` runs
+the whole engine the way culling uses it (see [docs/phase1a.md](docs/phase1a.md)). `jpegs`,
+`previewpng` and `snapshot` are diagnostics.
 
 To run it on another PC (no .NET or Rust needed there):
 
