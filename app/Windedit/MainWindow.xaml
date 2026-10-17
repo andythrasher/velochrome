@@ -129,7 +129,7 @@
             </ScrollViewer>
         </Grid>
         <ScrollViewer x:Name="GridScroller" Grid.Row="1" Visibility="Collapsed" Padding="10"
-                      ViewChanged="Scroller_ViewChanged">
+                      ViewChanged="Scroller_ViewChanged" SizeChanged="Scroller_SizeChanged">
             <ItemsRepeater x:Name="GridRepeater" ItemTemplate="{StaticResource PhotoTemplate}"
                            ElementPrepared="Repeater_ElementPrepared" ElementClearing="Repeater_ElementClearing">
                 <ItemsRepeater.Layout>
@@ -145,7 +145,7 @@
         <ScrollViewer x:Name="FilmstripScroller" Grid.Row="2" Height="118" Padding="10,4"
                       HorizontalScrollMode="Enabled" HorizontalScrollBarVisibility="Auto"
                       VerticalScrollMode="Disabled" VerticalScrollBarVisibility="Disabled"
-                      ViewChanged="Scroller_ViewChanged">
+                      ViewChanged="Scroller_ViewChanged" SizeChanged="Scroller_SizeChanged">
             <ItemsRepeater x:Name="Filmstrip" ItemTemplate="{StaticResource PhotoTemplate}"
                            ElementPrepared="Repeater_ElementPrepared" ElementClearing="Repeater_ElementClearing">
                 <ItemsRepeater.Layout>

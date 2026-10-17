@@ -24,6 +24,8 @@ public sealed partial class MainWindow : Window
     // Sensor sizes seen, so the next launch can allocate GPU memory for them before it's needed.
     static readonly string SizesFile = Path.Combine(AppData, "sizes.txt");
     static readonly string RecentFile = Path.Combine(AppData, "recent.txt");
+    // Filmstrip cells fit a 3:2 thumbnail at the strip's height; the same spacing as the XAML layouts.
+    const double FilmstripCellWidth = 133, CellSpacing = 6;
 
     readonly Engine engine;
     readonly Microsoft.UI.Dispatching.DispatcherQueue ui;
@@ -44,7 +46,7 @@ public sealed partial class MainWindow : Window
     /// <summary>How many repeaters each photo is shown in (filmstrip, grid): its thumbnail is
     /// kept while it's on screen somewhere.</summary>
     readonly Dictionary<int, int> realized = [];
-    bool visibleUpdatePending;
+    bool visibleUpdatePending, bringIntoViewPending;
 
     public MainWindow(string? startPath)
     {
@@ -197,25 +199,64 @@ public sealed partial class MainWindow : Window
         }
         engine.Show(item.Index);
         LoadEdit();
-        BringIntoView(Filmstrip, horizontal: true);
-        if (gridMode)
-            BringIntoView(GridRepeater, horizontal: false);
+        ScheduleBringIntoView();
         UpdatePhotoText();
     }
 
-    void BringIntoView(ItemsRepeater repeater, bool horizontal)
+    /// <summary>
+    /// Scrolls the current photo into view (centered), once per batch of moves. The cells are a
+    /// fixed size, so where a photo is follows from its position: no element has to be realized
+    /// or laid out first (forcing that on every keypress, while thumbnails arrive, can crash XAML).
+    /// </summary>
+    void ScheduleBringIntoView()
     {
-        if (position < 0 || repeater.ItemsSourceView == null || position >= repeater.ItemsSourceView.Count)
+        if (bringIntoViewPending)
             return;
-        var element = repeater.GetOrCreateElement(position);
-        element.UpdateLayout();
-        element.StartBringIntoView(new BringIntoViewOptions
-        {
-            AnimationDesired = false,
-            HorizontalAlignmentRatio = horizontal ? 0.5 : double.NaN,
-            VerticalAlignmentRatio = horizontal ? double.NaN : 0.5,
-        });
+        bringIntoViewPending = true;
+        ui.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, BringIntoView);
     }
+
+    void BringIntoView()
+    {
+        bringIntoViewPending = false;
+        if (position < 0)
+            return;
+        var scroller = gridMode ? GridScroller : FilmstripScroller;
+        // Not laid out yet (just shown, or new photos): try again after the next frame.
+        if (scroller.ViewportWidth == 0 || (gridMode ? GridRepeater : Filmstrip).ActualWidth == 0)
+        {
+            bringIntoViewPending = true;
+            AfterFrame(BringIntoView);
+            return;
+        }
+        if (gridMode)
+        {
+            // Every grid cell is the same size; the rows share the repeater's height.
+            var columns = GridColumns();
+            var rows = (shown.Count + columns - 1) / columns;
+            var pitch = (GridRepeater.ActualHeight + CellSpacing) / rows;
+            var center = GridScroller.Padding.Top + position / columns * pitch + (pitch - CellSpacing) / 2;
+            GridScroller.ChangeView(null, center - GridScroller.ViewportHeight / 2, null, disableAnimation: true);
+        }
+        else
+        {
+            var center = FilmstripScroller.Padding.Left + position * (FilmstripCellWidth + CellSpacing) + FilmstripCellWidth / 2;
+            FilmstripScroller.ChangeView(center - FilmstripScroller.ViewportWidth / 2, null, null, disableAnimation: true);
+        }
+    }
+
+    static void AfterFrame(Action action)
+    {
+        EventHandler<object>? tick = null;
+        tick = (_, _) =>
+        {
+            Microsoft.UI.Xaml.Media.CompositionTarget.Rendering -= tick;
+            action();
+        };
+        Microsoft.UI.Xaml.Media.CompositionTarget.Rendering += tick;
+    }
+
+    void Scroller_SizeChanged(object sender, SizeChangedEventArgs e) => ScheduleBringIntoView();
 
     void UpdatePhotoText()
     {
@@ -363,7 +404,7 @@ public sealed partial class MainWindow : Window
         Panel.Visibility = on ? Visibility.Collapsed : Visibility.Visible;
         FilmstripScroller.Visibility = on ? Visibility.Collapsed : Visibility.Visible;
         EditPanel.Visibility = editMode && !on ? Visibility.Visible : Visibility.Collapsed;
-        ui.TryEnqueue(() => BringIntoView(on ? GridRepeater : Filmstrip, horizontal: !on));
+        ScheduleBringIntoView();
         FocusKeys();
     }
 
@@ -440,6 +481,8 @@ public sealed partial class MainWindow : Window
         if (args.Index >= shown.Count)
             return;
         var item = shown[args.Index];
+        if (sender == Filmstrip)
+            ((FrameworkElement)args.Element).Width = FilmstripCellWidth;
         realized[item.Index] = realized.GetValueOrDefault(item.Index) + 1;
         if (item.Thumbnail == null)
             LoadThumbnail(item);
