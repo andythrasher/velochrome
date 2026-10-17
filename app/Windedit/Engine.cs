@@ -39,12 +39,15 @@ public sealed unsafe partial class Engine : IDisposable
     [LibraryImport(Dll)] private static partial uint we_photo_name(IntPtr engine, int index, char* buf, uint len);
     [LibraryImport(Dll)] private static partial int we_show(IntPtr engine, int index);
     [LibraryImport(Dll)] private static partial int we_set_zoom(IntPtr engine, int actual, float x, float y);
-    [LibraryImport(Dll)] private static partial int we_set_exposure(IntPtr engine, float stops);
     [LibraryImport(Dll)] private static partial int we_set_edit_mode(IntPtr engine, int on);
     [LibraryImport(Dll)] private static partial int we_view_resize(IntPtr engine, uint width, uint height, float scale, out IntPtr chain);
     [LibraryImport(Dll)] private static partial int we_prepare(IntPtr engine, uint width, uint height);
     [LibraryImport(Dll, StringMarshalling = StringMarshalling.Utf16)] private static partial int we_save_snapshot(IntPtr engine, string path);
     [LibraryImport(Dll)] private static partial int we_get_metadata(IntPtr engine, Metadata* output, int count);
+    [LibraryImport(Dll)] private static partial int we_get_edit(IntPtr engine, int index, out Edit edit);
+    [LibraryImport(Dll)] private static partial int we_set_edit(IntPtr engine, int index, in Edit edit, int commit);
+    [LibraryImport(Dll)] private static partial int we_undo(IntPtr engine, int index, int redo, out Edit edit);
+    [LibraryImport(Dll)] private static partial int we_as_shot_white_balance(IntPtr engine, int index, out float kelvin, out float tint);
     [LibraryImport(Dll)] private static partial int we_set_rating(IntPtr engine, int index, int rating);
     [LibraryImport(Dll)] private static partial int we_set_pick(IntPtr engine, int index, int pick);
     [LibraryImport(Dll)] private static partial int we_set_label(IntPtr engine, int index, int label);
@@ -62,6 +65,23 @@ public sealed unsafe partial class Engine : IDisposable
     public struct Metadata
     {
         public int Rating, Pick, Label;
+        /// <summary>1 if the photo has adjustments.</summary>
+        public int Edited;
+    }
+
+    /// <summary>
+    /// A photo's adjustments (develop.rs Edit). All zero, with CustomWhiteBalance 0, is the photo
+    /// as shot. Temperature (kelvin) and Tint apply only with CustomWhiteBalance 1; the rest are
+    /// stops (Exposure) or −100 to 100.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Edit
+    {
+        public float Exposure;
+        public uint CustomWhiteBalance;
+        public float Temperature, Tint;
+        public float Contrast, Highlights, Shadows, Whites, Blacks;
+        public float Vibrance, Saturation;
     }
 
     IntPtr handle;
@@ -118,7 +138,24 @@ public sealed unsafe partial class Engine : IDisposable
     /// <summary>100% zoom centered on (x, y), as fractions of the photo's width and height.</summary>
     public void ZoomToActual(float x, float y) => Check(we_set_zoom(handle, 1, x, y));
 
-    public void SetExposure(float stops) => Check(we_set_exposure(handle, stops));
+    public Edit GetEdit(int index)
+    {
+        Check(we_get_edit(handle, index, out var edit));
+        return edit;
+    }
+
+    /// <summary>
+    /// Changes a photo's adjustments: <paramref name="commit"/> false while a slider is dragged
+    /// (shown, not saved), true when it's let go (saved, and one step for undo).
+    /// </summary>
+    public void SetEdit(int index, Edit edit, bool commit) => Check(we_set_edit(handle, index, in edit, commit ? 1 : 0));
+
+    /// <summary>Undoes (or redoes) a photo's last change: its adjustments now, or null if none.</summary>
+    public Edit? Undo(int index, bool redo) => Check(we_undo(handle, index, redo ? 1 : 0, out var edit)) == 1 ? edit : null;
+
+    /// <summary>The white balance as shot (kelvin, tint), once the raw is decoded.</summary>
+    public (float Kelvin, float Tint)? AsShotWhiteBalance(int index) =>
+        Check(we_as_shot_white_balance(handle, index, out var k, out var t)) == 1 ? (k, t) : null;
 
     public void SetEditMode(bool on) => Check(we_set_edit_mode(handle, on ? 1 : 0));
 

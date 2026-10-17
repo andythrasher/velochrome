@@ -12,6 +12,8 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::{Interface, Result};
 
+use crate::develop::CURVE_SIZE;
+
 /// A compute kernel: its root signature (compiled into the shader) and pipeline state.
 pub struct Kernel {
     root: ID3D12RootSignature,
@@ -50,6 +52,10 @@ pub struct Gpu {
     /// GPU timestamp ticks per second.
     pub timestamp_freq: u64,
     pub kernels: Kernels,
+    /// The tone curve table the develop pass reads: in upload memory, mapped for good, and
+    /// rewritten for each frame (safe, as every submission waits for the GPU).
+    curve: ID3D12Resource,
+    curve_ptr: *mut f32,
 }
 
 impl Gpu {
@@ -119,6 +125,14 @@ impl Gpu {
 
             let query_readback =
                 new_buffer(&device, MAX_TIMESTAMPS as u64 * 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST)?;
+            let curve = new_buffer(
+                &device,
+                (CURVE_SIZE * 4) as u64,
+                D3D12_HEAP_TYPE_UPLOAD,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            )?;
+            let mut curve_ptr = std::ptr::null_mut();
+            curve.Map(0, Some(&D3D12_RANGE::default()), Some(&mut curve_ptr))?;
             Ok(Gpu {
                 factory,
                 adapter_name,
@@ -137,6 +151,8 @@ impl Gpu {
                 timestamps_used: 0,
                 timestamp_freq,
                 kernels,
+                curve,
+                curve_ptr: curve_ptr as *mut f32,
             })
         }
     }
@@ -251,6 +267,16 @@ impl Gpu {
             },
         };
         unsafe { self.device.CreateShaderResourceView(resource, Some(&desc), self.cpu_handle(slot)) };
+    }
+
+    /// Writes the tone curve table for the next develop pass.
+    pub fn set_curve(&self, values: &[f32]) {
+        let n = values.len().min(CURVE_SIZE);
+        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), self.curve_ptr, n) };
+    }
+
+    pub fn srv_curve(&self, slot: u32) {
+        self.srv_buffer(&self.curve, DXGI_FORMAT_R32_FLOAT, CURVE_SIZE as u32, slot);
     }
 
     pub fn srv_buffer(&self, resource: &ID3D12Resource, format: DXGI_FORMAT, elements: u32, slot: u32) {

@@ -12,6 +12,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::Result;
 
 use crate::color::{self, Mat3};
+use crate::develop;
 use crate::decode::{Orientation, RawFrame};
 use crate::gpu::{Gpu, new_buffer, new_texture};
 
@@ -23,7 +24,7 @@ const SLOT_DEMOSAIC: u32 = 0; // raw data, then pyramid level 0
 const fn slot_downsample(level: u32) -> u32 {
     2 * level // level - 1, then level
 }
-const SLOT_DEVELOP: u32 = 100; // the whole pyramid, then the output
+const SLOT_DEVELOP: u32 = 100; // the whole pyramid, the tone curve, then the output
 
 /// The GPU memory photos are opened into, kept between photos. Allocating it is slow (about
 /// 50 ms on a Lunar Lake laptop, and the GPU's first pass over fresh memory is slower still),
@@ -132,6 +133,9 @@ pub struct Image {
     pub levels: u32,
     pub linear: ID3D12Resource,
     pub cam_to_working: Mat3,
+    pub xyz_to_cam: Mat3,
+    /// The white balance the camera recorded, which the demosaic applied.
+    pub as_shot: [f32; 3],
     pub orientation: Orientation,
 }
 
@@ -180,6 +184,8 @@ struct DevelopConstants {
     mode: u32,
     out_width: u32,
     out_height: u32,
+    saturation: f32,
+    vibrance: f32,
 }
 
 impl Image {
@@ -285,6 +291,8 @@ impl Image {
             levels,
             linear,
             cam_to_working: frame.cam_to_working,
+            xyz_to_cam: frame.xyz_to_cam,
+            as_shot: frame.wb,
             orientation: frame.orientation,
         };
         Ok((image, timings))
@@ -313,6 +321,7 @@ pub fn warm_up(gpu: &mut Gpu) -> Result<f64> {
         white: 4095.0,
         wb: [2.0, 1.0, 1.5],
         cam_to_working: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        xyz_to_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         orientation: Orientation::Normal,
         decode_time: Default::default(),
     };
@@ -324,12 +333,7 @@ pub fn warm_up(gpu: &mut Gpu) -> Result<f64> {
     Ok(start.elapsed().as_secs_f64() * 1000.0)
 }
 
-/// The edits. Phase 0 has just one.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Edit {
-    /// Exposure in stops.
-    pub exposure: f32,
-}
+pub use crate::develop::Edit;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Zoom {
@@ -389,9 +393,14 @@ const MODE_PREVIEW: u32 = 1;
 pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32, u32), target: &Target) {
     let (rows, mode) = match layer {
         Layer::Raw(image) => {
-            let to_display = color::mul(&color::REC2020_TO_SRGB, &image.cam_to_working);
+            // White balance change, exposure and both color conversions in one matrix: camera
+            // RGB (as-shot white balance) → linear sRGB, scene-referred.
+            let wb = develop::white_balance_change(edit, &image.xyz_to_cam, image.as_shot);
             let gain = edit.exposure.exp2();
-            (to_display.map(|r| [r[0] * gain, r[1] * gain, r[2] * gain, 0.0]), MODE_DEVELOP)
+            let to_display = color::mul(&color::REC2020_TO_SRGB, &image.cam_to_working);
+            let rows = to_display.map(|r| [r[0] * wb[0] * gain, r[1] * wb[1] * gain, r[2] * wb[2] * gain, 0.0]);
+            gpu.set_curve(&develop::tone_curve(edit));
+            (rows, MODE_DEVELOP)
         }
         Layer::Preview(_) => ([[0.0; 4]; 3], MODE_PREVIEW),
     };
@@ -406,12 +415,15 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
         mode,
         out_width: target.width,
         out_height: target.height,
+        saturation: edit.saturation / 100.0,
+        vibrance: edit.vibrance / 100.0,
     };
     match layer {
         Layer::Raw(image) => gpu.srv_texture(&image.linear, LINEAR_FORMAT, 0, image.levels, SLOT_DEVELOP),
         Layer::Preview(p) => gpu.srv_texture(&p.texture, PREVIEW_FORMAT, 0, p.levels, SLOT_DEVELOP),
     }
-    gpu.uav_texture(&target.texture, TARGET_FORMAT, 0, SLOT_DEVELOP + 1);
+    gpu.srv_curve(SLOT_DEVELOP + 1);
+    gpu.uav_texture(&target.texture, TARGET_FORMAT, 0, SLOT_DEVELOP + 2);
     gpu.dispatch(&gpu.kernels.develop, &constants, SLOT_DEVELOP, (target.width, target.height));
 }
 

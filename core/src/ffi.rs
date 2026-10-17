@@ -15,6 +15,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use crate::develop::Edit;
 use crate::engine::Engine;
 use crate::pipeline::Zoom;
 use crate::ratings::{LABELS, label_code};
@@ -165,11 +166,52 @@ pub extern "C" fn we_set_zoom(handle: *const Handle, actual: i32, x: f32, y: f32
     })
 }
 
+/// A photo's adjustments (develop.rs `Edit`).
 #[unsafe(no_mangle)]
-pub extern "C" fn we_set_exposure(handle: *const Handle, stops: f32) -> i32 {
+pub extern "C" fn we_get_edit(handle: *const Handle, index: i32, edit: *mut Edit) -> i32 {
     guard(handle, |e| {
-        e.set_exposure(stops);
+        let current = e.ratings().edit(index as usize).ok_or(format!("there's no photo {index}"))?;
+        unsafe { *edit = current };
         Ok(0)
+    })
+}
+
+/// Changes a photo's adjustments. Pass `commit` 0 while a slider is being dragged (the photo
+/// shows it, nothing is saved) and 1 when it's let go (saved, and one step for undo).
+#[unsafe(no_mangle)]
+pub extern "C" fn we_set_edit(handle: *const Handle, index: i32, edit: *const Edit, commit: i32) -> i32 {
+    guard(handle, |e| {
+        let edit = unsafe { *edit };
+        if e.set_edit(index as usize, edit, commit != 0) { Ok(0) } else { Err(format!("there's no photo {index}")) }
+    })
+}
+
+/// Undoes (`redo` 0) or redoes (1) a photo's last change, writing its adjustments now into
+/// `edit`. Returns 1 if something changed, 0 if there was nothing to undo or redo.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_undo(handle: *const Handle, index: i32, redo: i32, edit: *mut Edit) -> i32 {
+    guard(handle, |e| match e.undo(index as usize, redo != 0) {
+        Some(now) => {
+            unsafe { *edit = now };
+            Ok(1)
+        }
+        None => Ok(0),
+    })
+}
+
+/// The photo's white balance as shot (temperature in kelvin, and tint). Returns 1 once its raw
+/// has been decoded, 0 before.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_as_shot_white_balance(handle: *const Handle, index: i32, kelvin: *mut f32, tint: *mut f32) -> i32 {
+    guard(handle, |e| match e.as_shot_white_balance(index as usize) {
+        Some((k, t)) => {
+            unsafe {
+                *kelvin = k;
+                *tint = t;
+            }
+            Ok(1)
+        }
+        None => Ok(0),
     })
 }
 
@@ -215,7 +257,7 @@ pub extern "C" fn we_save_snapshot(handle: *const Handle, path: *const u16) -> i
     })
 }
 
-/// A photo's stars (0–5), pick flag (1 picked, -1 rejected, 0 neither) and color label
+/// A photo's stars (0–5), pick flag (1 picked, -1 rejected, 0 neither), color label
 /// (1–5: Red, Yellow, Green, Blue, Purple; 6 some other name; 0 none).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -223,6 +265,8 @@ pub struct PhotoMeta {
     pub rating: i32,
     pub pick: i32,
     pub label: i32,
+    /// 1 if it has adjustments.
+    pub edited: i32,
 }
 
 /// Copies every photo's metadata (up to `count`) into `out`; returns how many photos there are.
@@ -236,7 +280,8 @@ pub extern "C" fn we_get_metadata(handle: *const Handle, out: *mut PhotoMeta, co
                 Pick::Rejected => -1,
                 Pick::Unflagged => 0,
             };
-            unsafe { *out.add(i) = PhotoMeta { rating: m.rating as i32, pick, label: label_code(&m.label) } };
+            let meta = PhotoMeta { rating: m.rating as i32, pick, label: label_code(&m.label), edited: !m.edit.is_default() as i32 };
+            unsafe { *out.add(i) = meta };
         }
         Ok(all.len() as i32)
     })

@@ -10,6 +10,7 @@ use std::thread::JoinHandle;
 use crate::jobs::{self, Focus, Jobs};
 use crate::library::{self, Photo};
 use crate::ratings::Ratings;
+use crate::develop::{self, Edit};
 use crate::pipeline::Zoom;
 use crate::viewer::{self, Command, EventSink, GpuInfo};
 
@@ -89,6 +90,8 @@ impl Engine {
             v.index = Some(index);
             self.refocus(&v);
         }
+        // Its adjustments first, so the first frame of it already has them.
+        let _ = self.viewer.send(Command::SetEdit(self.ratings.edit(index).unwrap_or_default()));
         let _ = self.viewer.send(Command::Show(index));
     }
 
@@ -110,8 +113,29 @@ impl Engine {
         let _ = self.viewer.send(Command::EditMode(on));
     }
 
-    pub fn set_exposure(&self, stops: f32) {
-        let _ = self.viewer.send(Command::Exposure(stops));
+    /// Changes a photo's adjustments: `commit` false while a slider is dragged (shown, not
+    /// saved), true when it's let go (saved, and one step for undo).
+    pub fn set_edit(&self, index: usize, edit: Edit, commit: bool) -> bool {
+        let ok = self.ratings.set_edit(index, edit, commit);
+        if ok && self.view.lock().unwrap().index == Some(index) {
+            let _ = self.viewer.send(Command::SetEdit(edit));
+        }
+        ok
+    }
+
+    /// Undoes (or redoes) a photo's last committed change; returns its adjustments now.
+    pub fn undo(&self, index: usize, redo: bool) -> Option<Edit> {
+        let edit = self.ratings.undo(index, redo)?;
+        if self.view.lock().unwrap().index == Some(index) {
+            let _ = self.viewer.send(Command::SetEdit(edit));
+        }
+        Some(edit)
+    }
+
+    /// The photo's white balance as shot, as temperature (K) and tint, once its raw is decoded.
+    pub fn as_shot_white_balance(&self, index: usize) -> Option<(f32, f32)> {
+        let raw = self.jobs.raw(index)?;
+        Some(develop::multipliers_to_temperature(&raw.xyz_to_cam, raw.wb))
     }
 
     /// Creates or resizes the swap chain (physical pixels; `scale` is the view's DPI scale) and

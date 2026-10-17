@@ -26,7 +26,8 @@ pub enum Command {
     /// Show this photo (index into the folder).
     Show(usize),
     Zoom(Zoom),
-    Exposure(f32),
+    /// The adjustments of the photo in view.
+    SetEdit(Edit),
     /// Edit mode shows the developed raw; Cull mode shows camera JPEGs.
     EditMode(bool),
     /// Create or resize the swap chain. Replies with the IDXGISwapChain pointer.
@@ -258,9 +259,11 @@ impl Viewer {
                 self.zoom = zoom;
                 self.dirty = true;
             }
-            Command::Exposure(stops) => {
-                self.edit.exposure = stops;
-                self.dirty = true;
+            Command::SetEdit(edit) => {
+                if edit != self.edit {
+                    self.edit = edit;
+                    self.dirty = true;
+                }
             }
             Command::EditMode(on) => {
                 self.edit_mode = on;

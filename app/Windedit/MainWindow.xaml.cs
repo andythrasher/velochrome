@@ -60,6 +60,7 @@ public sealed partial class MainWindow : Window
         FlagFilter.SelectedIndex = RatingFilter.SelectedIndex = LabelFilter.SelectedIndex = 0;
         LoupeToggle.IsChecked = true;
         PrepareRememberedSizes();
+        BuildEditPanel();
         RefreshRecentMenu();
         EmptyText.Text = $"Open a folder of photos (Ctrl+O).\n\n{engine.AdapterName}";
         TimingText.Text = $"GPU warm-up {engine.WarmUpMs:F1} ms";
@@ -183,6 +184,7 @@ public sealed partial class MainWindow : Window
     {
         if (newPosition < 0 || newPosition >= shown.Count)
             return;
+        CommitEdit(); // a slider change still being dragged belongs to the photo it started on
         if (CurrentPhoto is { } old)
             old.IsCurrent = false;
         position = newPosition;
@@ -194,6 +196,7 @@ public sealed partial class MainWindow : Window
             engine.ZoomToFit();
         }
         engine.Show(item.Index);
+        LoadEdit();
         BringIntoView(Filmstrip, horizontal: true);
         if (gridMode)
             BringIntoView(GridRepeater, horizontal: false);
@@ -263,9 +266,20 @@ public sealed partial class MainWindow : Window
     void Root_KeyDown(object sender, KeyRoutedEventArgs e)
     {
         // Leave keys alone while a filter list has focus.
-        if (FocusManager.GetFocusedElement(Content.XamlRoot) is ComboBox)
+        var focused = FocusManager.GetFocusedElement(Content.XamlRoot);
+        if (focused is ComboBox)
+            return;
+        // A focused slider keeps the keys that move it.
+        if (focused is Slider && e.Key is VirtualKey.Left or VirtualKey.Right or VirtualKey.Up or VirtualKey.Down
+            or VirtualKey.Home or VirtualKey.End or VirtualKey.PageUp or VirtualKey.PageDown)
             return;
         var ctrl = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control).HasFlag(CoreVirtualKeyStates.Down);
+        var shift = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift).HasFlag(CoreVirtualKeyStates.Down);
+        if (ctrl && all.Length > 0 && EditShortcut(new VirtualKeyWithModifiers(e.Key, shift)))
+        {
+            e.Handled = true;
+            return;
+        }
         if (ctrl && e.Key == VirtualKey.O)
         {
             PickFolder();
@@ -348,6 +362,7 @@ public sealed partial class MainWindow : Window
         GridScroller.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
         Panel.Visibility = on ? Visibility.Collapsed : Visibility.Visible;
         FilmstripScroller.Visibility = on ? Visibility.Collapsed : Visibility.Visible;
+        EditPanel.Visibility = editMode && !on ? Visibility.Visible : Visibility.Collapsed;
         ui.TryEnqueue(() => BringIntoView(on ? GridRepeater : Filmstrip, horizontal: !on));
         FocusKeys();
     }
@@ -359,6 +374,9 @@ public sealed partial class MainWindow : Window
         editMode = on;
         EditToggle.IsChecked = on;
         engine.SetEditMode(on);
+        EditPanel.Visibility = on && !gridMode ? Visibility.Visible : Visibility.Collapsed;
+        if (on)
+            ShowEdit();
     }
 
     void Thumbnail_Tapped(object sender, TappedRoutedEventArgs e)
@@ -484,6 +502,9 @@ public sealed partial class MainWindow : Window
             return;
         }
         last = e;
+        // The as-shot white balance is known once the raw is decoded: show it.
+        if (e.Layer == 4 && e.Photo == CurrentPhoto?.Index && edit.CustomWhiteBalance == 0 && !editPending)
+            ShowEdit();
         RememberSize(e.RawWidth, e.RawHeight);
         if (e.Photo != CurrentPhoto?.Index)
             return;

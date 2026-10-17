@@ -45,6 +45,7 @@ public sealed partial class PhotoItem(int index, string name) : INotifyPropertyC
             Changed(nameof(FlagGlyph));
             Changed(nameof(LabelBrush));
             Changed(nameof(Dimming));
+            Changed(nameof(EditedGlyph));
         }
     }
 
@@ -62,9 +63,12 @@ public sealed partial class PhotoItem(int index, string name) : INotifyPropertyC
     public string Stars => metadata.Rating > 0 ? new string('★', metadata.Rating) : "";
 
     /// <summary>Segoe Fluent Icons: a flag for picks, a cross for rejects.</summary>
-    public string FlagGlyph => metadata.Pick switch { 1 => "", -1 => "", _ => "" };
+    public string FlagGlyph => metadata.Pick switch { 1 => Glyph(0xE7C1), -1 => Glyph(0xE711), _ => "" };
 
     public Brush LabelBrush => metadata.Label is >= 1 and <= 6 ? LabelBrushes[metadata.Label - 1] : Transparent;
+
+    /// <summary>A pencil when the photo has adjustments.</summary>
+    public string EditedGlyph => metadata.Edited != 0 ? Glyph(0xE70F) : "";
 
     /// <summary>Rejected photos fade back, as in Lightroom.</summary>
     public double Dimming => metadata.Pick == -1 ? 0.35 : 1.0;
@@ -80,4 +84,6 @@ public sealed partial class PhotoItem(int index, string name) : INotifyPropertyC
     }
 
     void Changed(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+
+    static string Glyph(int code) => ((char)code).ToString();
 }

@@ -48,6 +48,8 @@ pub struct RawFrame {
     pub wb: [f32; 3],
     /// Camera RGB (white balanced) to linear Rec.2020, rows summing to 1 so white stays white.
     pub cam_to_working: Mat3,
+    /// The camera's XYZ → camera RGB matrix (D65), for white balance in temperature and tint.
+    pub xyz_to_cam: Mat3,
     pub orientation: Orientation,
     pub decode_time: Duration,
 }
@@ -147,6 +149,7 @@ pub fn decode_file(path: &Path) -> Result<RawFrame, DecodeError> {
         white,
         wb,
         cam_to_working: color::camera_to_working(xyz_to_cam),
+        xyz_to_cam,
         orientation,
         decode_time: start.elapsed(),
     })

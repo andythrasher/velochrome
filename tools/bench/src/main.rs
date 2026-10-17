@@ -32,6 +32,7 @@ fn main() {
         "snapshot" => snapshot(&files),
         "xmpcheck" => xmp_check(&files_any(rest)),
         "thumbs" => bench_thumbs(&rest.iter().map(PathBuf::from).collect::<Vec<_>>()),
+        "look" => bench_look(&files),
         "cull" => bench_cull(&rest.iter().map(PathBuf::from).collect::<Vec<_>>()),
         _ => {
             eprintln!("unknown command {cmd}");
@@ -222,7 +223,7 @@ fn bench_gpu(files: &[PathBuf]) {
             let (mut gpu_ms, mut wall_ms) = (Vec::new(), Vec::new());
             for i in 0..60 {
                 // Every frame is a different exposure, as when dragging the slider.
-                let edit = Edit { exposure: (i as f32 / 60.0) * 2.0 - 1.0 };
+                let edit = Edit { exposure: (i as f32 / 60.0) * 2.0 - 1.0, ..Default::default() };
                 let start = Instant::now();
                 gpu.begin().unwrap();
                 let a = gpu.timestamp();
@@ -520,7 +521,7 @@ fn files_any(args: &[String]) -> Vec<PathBuf> {
 /// Checks that updating real sidecars changes only our values, in memory: nothing is written.
 fn xmp_check(files: &[PathBuf]) {
     use windedit_core::xmp::{self, Metadata, Pick};
-    let meta = Metadata { rating: 3, label: Some("Green".into()), pick: Pick::Picked };
+    let meta = Metadata { rating: 3, label: Some("Green".into()), pick: Pick::Picked, ..Default::default() };
     let (mut ok, mut failed) = (0, 0);
     for f in files {
         let text = std::fs::read_to_string(f).unwrap();
@@ -612,4 +613,53 @@ fn bench_thumbs(files: &[PathBuf]) {
         println!("  no thumbnail for {} (raw {:?}, jpeg {:?})", p.name, p.raw.is_some(), p.jpeg.is_some());
         let _ = i;
     }
+}
+
+/// Renders a photo with each slider pushed in turn, side by side, to renders/<name>.look.png:
+/// for checking by eye that every adjustment does what its name says.
+fn bench_look(files: &[PathBuf]) {
+    use windedit_core::develop;
+    let Some(f) = files.first() else { return };
+    let mut gpu = Gpu::new().unwrap();
+    let frame = decode::decode_file(f).unwrap();
+    let (as_shot_k, as_shot_tint) = develop::multipliers_to_temperature(&frame.xyz_to_cam, frame.wb);
+    println!("as shot: {as_shot_k:.0} K, tint {as_shot_tint:+.1}");
+    let (image, _) = Image::open(&mut gpu, &mut ImageMemory::new(), &frame).unwrap();
+    let base = Edit::default();
+    let warm = Edit { custom_white_balance: 1, temperature: as_shot_k + 1500.0, tint: as_shot_tint, ..base };
+    let variants: [(&str, Edit); 12] = [
+        ("as shot", base),
+        ("exposure +1", Edit { exposure: 1.0, ..base }),
+        ("contrast +60", Edit { contrast: 60.0, ..base }),
+        ("highlights -100", Edit { highlights: -100.0, ..base }),
+        ("shadows +100", Edit { shadows: 100.0, ..base }),
+        ("whites +60", Edit { whites: 60.0, ..base }),
+        ("blacks -60", Edit { blacks: -60.0, ..base }),
+        ("temp +1500 K", warm),
+        ("tint +40", Edit { custom_white_balance: 1, temperature: as_shot_k, tint: as_shot_tint + 40.0, ..base }),
+        ("vibrance +80", Edit { vibrance: 80.0, ..base }),
+        ("saturation +60", Edit { saturation: 60.0, ..base }),
+        ("saturation -100", Edit { saturation: -100.0, ..base }),
+    ];
+    let (cw, ch) = (640u32, 427u32);
+    let cols = 4u32;
+    let rows = variants.len() as u32 / cols;
+    let mut sheet = image::RgbaImage::new(cw * cols, ch * rows);
+    let target = Target::new(&gpu, cw, ch).unwrap();
+    for (i, (name, edit)) in variants.iter().enumerate() {
+        gpu.begin().unwrap();
+        render_image(&gpu, &image, edit, Zoom::Fit, &target);
+        gpu.submit().unwrap();
+        let px = read_target(&mut gpu, &target).unwrap();
+        let tile = image::RgbaImage::from_raw(cw, ch, px).unwrap();
+        image::imageops::overlay(&mut sheet, &tile, ((i as u32 % cols) * cw) as i64, ((i as u32 / cols) * ch) as i64);
+        println!("tile {}: {name}", i + 1);
+    }
+    let out = std::env::current_exe().unwrap().parent().unwrap().join("renders").join(format!(
+        "{}.look.png",
+        f.file_stem().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+    sheet.save(&out).unwrap();
+    println!("{}", out.display());
 }

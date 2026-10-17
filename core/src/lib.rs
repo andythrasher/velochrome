@@ -16,3 +16,4 @@ pub mod engine;
 pub mod viewer;
 pub mod xmp;
 pub mod ratings;
+pub mod develop;

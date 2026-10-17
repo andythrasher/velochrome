@@ -15,6 +15,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use crate::develop::Edit;
+
 pub const NS_RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 pub const NS_XMP: &str = "http://ns.adobe.com/xap/1.0/";
 /// Our namespace. A URN, so it claims no web domain; the app's name is still provisional.
@@ -28,13 +30,16 @@ pub enum Pick {
     Rejected,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Metadata {
     /// Stars, 0–5.
     pub rating: u8,
     /// Lightroom's label names: Red, Yellow, Green, Blue, Purple.
     pub label: Option<String>,
     pub pick: Pick,
+    /// The adjustments, saved in our namespace (`windedit:Exposure` and so on). Only those
+    /// that differ from the photo as shot are written.
+    pub edit: Edit,
 }
 
 /// The sidecar for a photo whose files are named `stem` in `dir`.
@@ -60,6 +65,14 @@ pub fn parse(text: &str) -> Option<Metadata> {
         None if rating < 0 => Pick::Rejected, // Bridge's reject
         None => Pick::Unflagged,
     };
+    let number = |i: usize| scan.props[i].as_ref().and_then(|p| p.value.trim().trim_start_matches('+').parse::<f32>().ok());
+    let e = &mut meta.edit;
+    for (i, field) in EDIT_FIELDS.iter().enumerate() {
+        if let Some(v) = number(FIRST_EDIT + i) {
+            *field_mut(e, *field) = v;
+        }
+    }
+    e.custom_white_balance = number(FIRST_EDIT + 1).is_some() as u32;
     Some(meta)
 }
 
@@ -79,12 +92,11 @@ pub fn write(path: &Path, meta: &Metadata) -> std::io::Result<()> {
 /// A fresh sidecar, laid out the way Lightroom lays out its own.
 pub fn new_sidecar(meta: &Metadata) -> String {
     let mut attrs = String::new();
-    attrs.push_str(&format!("\n   xmp:Rating=\"{}\"", meta.rating));
-    if let Some(label) = &meta.label {
-        attrs.push_str(&format!("\n   xmp:Label=\"{}\"", escape(label)));
-    }
-    if let Some(pick) = pick_value(meta.pick) {
-        attrs.push_str(&format!("\n   windedit:Pick=\"{pick}\""));
+    for (i, value) in values(meta, true).into_iter().enumerate() {
+        if let Some(value) = value {
+            let (_, prefix, local) = PROPS[i];
+            attrs.push_str(&format!("\n   {prefix}:{local}=\"{}\"", escape(&value)));
+        }
     }
     format!(
         "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Windedit\">\n \
@@ -109,12 +121,8 @@ pub fn update(text: &str, meta: &Metadata) -> Result<String, String> {
     let scan = scan(text)?;
     let first = scan.descriptions.first().ok_or("no rdf:Description to put the rating in")?;
 
-    let wanted: [Option<String>; 3] = [
-        // Leave a zero rating out unless the file already has one (Lightroom writes 0).
-        (meta.rating > 0 || scan.props[RATING].is_some()).then(|| meta.rating.to_string()),
-        meta.label.clone(),
-        pick_value(meta.pick).map(str::to_string),
-    ];
+    // Leave a zero rating out unless the file already has one (Lightroom writes 0).
+    let wanted = values(meta, scan.props[RATING].is_some());
 
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
     let mut insert = String::new();
@@ -156,8 +164,91 @@ const RATING: usize = 0;
 const LABEL: usize = 1;
 const PICK: usize = 2;
 /// (namespace, the prefix to declare if the file has none for it, local name)
-const PROPS: [(&str, &str, &str); 3] =
-    [(NS_XMP, "xmp", "Rating"), (NS_XMP, "xmp", "Label"), (NS_WINDEDIT, "windedit", "Pick")];
+const FIRST_EDIT: usize = 3;
+/// (namespace, the prefix to declare if the file has none for it, local name)
+const PROPS: [(&str, &str, &str); 13] = [
+    (NS_XMP, "xmp", "Rating"),
+    (NS_XMP, "xmp", "Label"),
+    (NS_WINDEDIT, "windedit", "Pick"),
+    (NS_WINDEDIT, "windedit", "Exposure"),
+    (NS_WINDEDIT, "windedit", "Temperature"),
+    (NS_WINDEDIT, "windedit", "Tint"),
+    (NS_WINDEDIT, "windedit", "Contrast"),
+    (NS_WINDEDIT, "windedit", "Highlights"),
+    (NS_WINDEDIT, "windedit", "Shadows"),
+    (NS_WINDEDIT, "windedit", "Whites"),
+    (NS_WINDEDIT, "windedit", "Blacks"),
+    (NS_WINDEDIT, "windedit", "Vibrance"),
+    (NS_WINDEDIT, "windedit", "Saturation"),
+];
+
+/// The edit's fields, in PROPS order from FIRST_EDIT.
+#[derive(Clone, Copy)]
+enum EditField {
+    Exposure,
+    Temperature,
+    Tint,
+    Contrast,
+    Highlights,
+    Shadows,
+    Whites,
+    Blacks,
+    Vibrance,
+    Saturation,
+}
+
+const EDIT_FIELDS: [EditField; 10] = [
+    EditField::Exposure,
+    EditField::Temperature,
+    EditField::Tint,
+    EditField::Contrast,
+    EditField::Highlights,
+    EditField::Shadows,
+    EditField::Whites,
+    EditField::Blacks,
+    EditField::Vibrance,
+    EditField::Saturation,
+];
+
+fn field_mut(e: &mut Edit, f: EditField) -> &mut f32 {
+    match f {
+        EditField::Exposure => &mut e.exposure,
+        EditField::Temperature => &mut e.temperature,
+        EditField::Tint => &mut e.tint,
+        EditField::Contrast => &mut e.contrast,
+        EditField::Highlights => &mut e.highlights,
+        EditField::Shadows => &mut e.shadows,
+        EditField::Whites => &mut e.whites,
+        EditField::Blacks => &mut e.blacks,
+        EditField::Vibrance => &mut e.vibrance,
+        EditField::Saturation => &mut e.saturation,
+    }
+}
+
+/// Each property's text, in PROPS order; None where it shouldn't be in the file. A zero rating
+/// is written only if `keep_zero_rating`; adjustments only where they differ from as shot (and
+/// temperature and tint only for a custom white balance).
+fn values(meta: &Metadata, keep_zero_rating: bool) -> Vec<Option<String>> {
+    let mut v = vec![
+        (meta.rating > 0 || keep_zero_rating).then(|| meta.rating.to_string()),
+        meta.label.clone(),
+        pick_value(meta.pick).map(str::to_string),
+    ];
+    let mut e = meta.edit;
+    for field in EDIT_FIELDS {
+        let white_balance = matches!(field, EditField::Temperature | EditField::Tint);
+        let value = *field_mut(&mut e, field);
+        let written = if white_balance { meta.edit.custom_white_balance != 0 } else { value != 0.0 };
+        v.push(written.then(|| number_text(value)));
+    }
+    v
+}
+
+/// A number as short as it can be: two decimals at most, no trailing zeros.
+fn number_text(v: f32) -> String {
+    let rounded = (v * 100.0).round() / 100.0;
+    if rounded == 0.0 { "0".into() } else { rounded.to_string() }
+}
 
 /// One of our values, found in the file.
 #[derive(Debug)]
@@ -180,7 +271,7 @@ struct Scan {
     /// The top-level rdf:Descriptions (children of rdf:RDF); nested ones, like those inside
     /// Lightroom's crs:Preset, are left alone.
     descriptions: Vec<Description>,
-    props: [Option<Found>; 3],
+    props: Vec<Option<Found>>,
 }
 
 fn scan(text: &str) -> Result<Scan, String> {
@@ -188,7 +279,7 @@ fn scan(text: &str) -> Result<Scan, String> {
     let mut scopes: Vec<HashMap<String, String>> = vec![HashMap::new()];
     // (namespace, local name, index of the top-level Description it's in, if any)
     let mut stack: Vec<(String, String, Option<usize>)> = Vec::new();
-    let mut result = Scan { descriptions: Vec::new(), props: [None, None, None] };
+    let mut result = Scan { descriptions: Vec::new(), props: PROPS.iter().map(|_| None).collect() };
     // An element-form value being read: (prop, start of its whitespace, start of content).
     let mut open_prop: Option<(usize, usize, usize, usize)> = None;
 
@@ -439,7 +530,7 @@ mod tests {
 
     #[test]
     fn updates_lightroom_in_place() {
-        let meta = Metadata { rating: 4, label: Some("Red".into()), pick: Pick::Picked };
+        let meta = Metadata { rating: 4, label: Some("Red".into()), pick: Pick::Picked, ..Default::default() };
         let out = update(LIGHTROOM, &meta).unwrap();
         assert_eq!(parse(&out), Some(meta));
         // Only our values changed or appeared; every other line is as it was.
@@ -482,10 +573,32 @@ mod tests {
         assert_eq!(meta.rating, 2);
         assert_eq!(meta.label.as_deref(), Some("Blue & green"));
 
-        let out = update(old, &Metadata { rating: 5, label: None, pick: Pick::Unflagged }).unwrap();
+        let out = update(old, &Metadata { rating: 5, ..Default::default() }).unwrap();
         assert!(out.contains("<xap:Rating>5</xap:Rating>"));
         assert!(!out.contains("Label"));
         assert!(out.starts_with("<?xpacket") && out.ends_with("<?xpacket end=\"w\"?>"));
+    }
+
+    #[test]
+    fn edits_round_trip() {
+        let edit = Edit {
+            exposure: 0.35,
+            custom_white_balance: 1,
+            temperature: 5250.0,
+            tint: -7.5,
+            shadows: 40.0,
+            vibrance: 15.0,
+            ..Default::default()
+        };
+        let meta = Metadata { rating: 2, edit, ..Default::default() };
+        let fresh = new_sidecar(&meta);
+        assert!(fresh.contains("windedit:Exposure=\"0.35\"") && !fresh.contains("Contrast"), "{fresh}");
+        assert_eq!(parse(&fresh), Some(meta.clone()));
+        // Into Lightroom's file too, and back out again: only defaults left, nothing written.
+        let out = update(LIGHTROOM, &meta).unwrap();
+        assert_eq!(parse(&out), Some(meta));
+        let back = update(&out, &Metadata { rating: 2, ..Default::default() }).unwrap();
+        assert!(!back.contains("windedit:Exposure") && !back.contains("windedit:Temperature"));
     }
 
     #[test]
@@ -496,7 +609,7 @@ mod tests {
 
     #[test]
     fn new_sidecar_round_trips() {
-        let meta = Metadata { rating: 3, label: Some("Green".into()), pick: Pick::Rejected };
+        let meta = Metadata { rating: 3, label: Some("Green".into()), pick: Pick::Rejected, ..Default::default() };
         assert_eq!(parse(&new_sidecar(&meta)), Some(meta.clone()));
         let path = std::env::temp_dir().join(format!("windedit-xmp-test-{}.xmp", std::process::id()));
         let _ = std::fs::remove_file(&path);
