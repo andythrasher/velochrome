@@ -12,7 +12,7 @@
 // Like the other kernels', but with four inputs: the image, the tone parameters, the guided
 // filter's coefficients and the statistics.
 #define DEVELOP_ROOT_SIGNATURE \
-    "RootConstants(num32BitConstants=48, b0)," \
+    "RootConstants(num32BitConstants=52, b0)," \
     "DescriptorTable(SRV(t0, numDescriptors=4), UAV(u0))," \
     "StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR," \
     " addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)"
@@ -38,6 +38,7 @@ cbuffer Constants : register(b0)
     float4 lensK;     // distortion terms
     float4 lensR;     // red chromatic aberration terms
     float4 lensB;     // blue chromatic aberration terms
+    float4 canvas;    // the empty canvas around the photo (rgb)
 };
 
 Texture2D<float4> image : register(t0);
@@ -144,7 +145,7 @@ void main(uint3 id : SV_DispatchThreadID)
     float2 uv_in = uv;
     if (any(uv < 0.0) || any(uv > 1.0))
     {
-        output[id.xy] = float4(0.11, 0.11, 0.11, 1.0); // the empty canvas around the photo
+        output[id.xy] = float4(canvas.rgb, 1.0); // the empty canvas around the photo
         return;
     }
     if (mode == 1)
