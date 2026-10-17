@@ -4,3 +4,6 @@ obj/
 *.user
 .vs/
 /artifacts
+
+# Lightroom comparison screenshots (hundreds of MB; kept locally)
+/slider training photos/*/
