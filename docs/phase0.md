@@ -101,14 +101,34 @@ What the laptop adds:
   doesn't show this. On top of that, every open spends about 50 ms (laptop) or 6 ms (desktop)
   outside the timed GPU steps, which is mostly allocating that memory.
 
-**Follow-up (done, awaiting a laptop re-run):** the engine now keeps each photo size's GPU
-memory and reuses it (`ImageMemory` in `core/src/pipeline.rs`; two sizes, so a folder mixing
-cameras doesn't thrash), and runs every kernel once on a tiny photo when it starts
-(`warm_up`). On the desktop, opening the next photo went from 18–20 ms to 7–9 ms of GPU-side
-work, and warm-up takes 1.8 ms. `bench gpu` now prints the warm-up time and both a first open
-(new memory) and a next open (reused), and the app says whether the memory was new or reused.
-On the laptop, a slow *first* open that persists after warm-up points at fresh memory rather
-than shader preparation; the *next* open should drop to around 15–25 ms.
+**Follow-up:** the engine now keeps each photo size's GPU memory and reuses it (`ImageMemory`
+in `core/src/pipeline.rs`; two sizes, so a folder mixing cameras doesn't thrash), and runs
+every kernel once on a tiny photo when it starts (`warm_up`). `bench gpu` prints the warm-up
+and both a first open (new memory) and a next open (reused).
+
+| | Laptop S1 | Laptop ORF | Desktop S1 / ORF |
+|---|---|---|---|
+| Warm-up, at startup | 3.7 ms | | 1.8 ms |
+| First open (new memory) | 187 ms, of which allocating 171 | 63 ms, allocating 49 | 20 / 18 ms |
+| Next open (reused) | 17 ms | 14 ms | 9 / 7 ms |
+| Demosaic in the first open | 12 ms (was 142) | 9 ms | 1.6 / 1.5 ms |
+
+What this settled:
+
+- **The 142 ms first demosaic was the Intel driver preparing the shader on first use**, not
+  fresh memory: with the warm-up it's 12 ms. Warming up costs 3.7 ms at startup.
+- **Allocating GPU memory is slow on the laptop:** 50–170 ms per photo size (the first
+  allocation in the process is the slowest), against about 9 ms on the desktop. Reuse removes
+  it from every photo after the first of its size. To take it off the first photo too, allocate
+  on a background thread at startup for the last-used photo sizes (Direct3D 12 allows creating
+  resources from any thread).
+- **Opening is now mostly decoding:** in the app the first S1 took 237 ms, made up of decode 130
+  (the 48 MB file read cold from disk; 71 ms when cached), allocation 90, and GPU work 17. The
+  next photo of the same size costs decode plus about 17 ms.
+
+The remaining wait is a cold raw decode, so it gets hidden rather than shaved. That is Phase 1's
+culling design: show the embedded JPEG at once (12–28 ms), decode the neighbouring photos in
+the background, and allocate GPU memory before the first photo is opened.
 
 ## What it found
 
