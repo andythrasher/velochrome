@@ -57,6 +57,9 @@
              Windshot's Layers button; their labels live in the tooltips. -->
         <Grid Padding="4,0" ColumnSpacing="8">
             <Grid.Resources>
+                <Style TargetType="AppBarButton" BasedOn="{StaticResource DefaultAppBarButtonStyle}">
+                    <Setter Property="Width" Value="36" />
+                </Style>
                 <Style TargetType="AppBarToggleButton" BasedOn="{StaticResource DefaultAppBarToggleButtonStyle}">
                     <Setter Property="Width" Value="36" />
                 </Style>
@@ -115,6 +118,44 @@
 
             <TextBlock x:Name="CountText" Grid.Column="4" VerticalAlignment="Center" Opacity="0.7" />
             <CommandBar Grid.Column="5" Background="Transparent" DefaultLabelPosition="Collapsed" OverflowButtonVisibility="Collapsed">
+                <AppBarButton x:Name="ExportButton" Label="Export" ToolTipService.ToolTip="Export JPEG (Ctrl+Shift+E)">
+                    <AppBarButton.Icon>
+                        <FontIcon Glyph="&#xEDE1;" />
+                    </AppBarButton.Icon>
+                    <AppBarButton.Flyout>
+                        <Flyout x:Name="ExportFlyout" Placement="BottomEdgeAlignedRight"
+                                Opening="ExportFlyout_Opening" Closed="ExportFlyout_Closed">
+                            <StackPanel Width="330" Spacing="10">
+                                <TextBlock x:Name="ExportTitle" Style="{StaticResource BodyStrongTextBlockStyle}" TextTrimming="CharacterEllipsis" />
+                                <StackPanel Spacing="2">
+                                    <TextBlock Text="Destination" Opacity="0.7" />
+                                    <RadioButton x:Name="ExportNextTo" GroupName="ExportWhere" Content="Export folder next to the photos"
+                                                 Click="ExportWhere_Click" />
+                                    <TextBlock x:Name="ExportNextToPath" Margin="30,0,0,6" Opacity="0.55" FontSize="12"
+                                               TextTrimming="CharacterEllipsis" />
+                                    <RadioButton x:Name="ExportChoose" GroupName="ExportWhere" Content="Choose folder…"
+                                                 Click="ExportWhere_Click" />
+                                    <TextBlock x:Name="ExportChosenPath" Margin="30,0,0,0" Opacity="0.55" FontSize="12"
+                                               TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+                                <Grid ColumnSpacing="10">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition />
+                                        <ColumnDefinition Width="Auto" MinWidth="28" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="Quality" VerticalAlignment="Center" Opacity="0.7" />
+                                    <Slider x:Name="ExportQuality" Grid.Column="1" Minimum="50" Maximum="100" StepFrequency="1"
+                                            ValueChanged="ExportQuality_ValueChanged" />
+                                    <TextBlock x:Name="ExportQualityText" Grid.Column="2" VerticalAlignment="Center" HorizontalTextAlignment="End" />
+                                </Grid>
+                                <TextBlock Text="Full size, sRGB, with the camera's EXIF." Opacity="0.55" FontSize="12" />
+                                <Button x:Name="ExportGo" Content="Export" Style="{StaticResource AccentButtonStyle}"
+                                        HorizontalAlignment="Stretch" Click="ExportGo_Click" />
+                            </StackPanel>
+                        </Flyout>
+                    </AppBarButton.Flyout>
+                </AppBarButton>
                 <AppBarToggleButton x:Name="EditToggle" Label="Edit" Click="Edit_Click" ToolTipService.ToolTip="Edit: the developed raw (D, F8)">
                     <AppBarToggleButton.Icon>
                         <FontIcon Glyph="&#xE70F;" />
@@ -196,7 +237,13 @@
             </Grid.ColumnDefinitions>
             <TextBlock x:Name="PhotoText" FontWeight="SemiBold" />
             <TextBlock x:Name="KeysText" Grid.Column="1" Opacity="0.55" TextTrimming="CharacterEllipsis"
-                       Text="← → move · 0–5 stars · P pick · X reject · U clear · 6–9 labels · Shift or Caps Lock: rate and move on · Z 100% · G grid · E loupe · D edit · F7 folders · F8 edit panel · Tab both" />
+                       Text="← → move · 0–5 stars · P pick · X reject · U clear · 6–9 labels · Shift or Caps Lock: rate and move on · Z 100% · G grid · E loupe · D edit · F7 folders · F8 edit panel · Tab both · Ctrl+Shift+E export" />
+            <StackPanel x:Name="ExportStatus" Grid.Column="1" Orientation="Horizontal" Spacing="10" Visibility="Collapsed"
+                        VerticalAlignment="Center">
+                <ProgressBar x:Name="ExportProgress" Width="120" Maximum="1" VerticalAlignment="Center" />
+                <TextBlock x:Name="ExportText" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                <HyperlinkButton x:Name="ExportOpen" Content="Open folder" Padding="4,0" MinHeight="0" Click="ExportOpen_Click" Visibility="Collapsed" />
+            </StackPanel>
             <TextBlock x:Name="TimingText" Grid.Column="2" Opacity="0.55" FontFamily="Cascadia Mono, Consolas" FontSize="11"
                        VerticalAlignment="Center" />
         </Grid>

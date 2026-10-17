@@ -19,3 +19,5 @@ pub mod ratings;
 pub mod develop;
 pub mod tone;
 pub mod lens;
+pub mod exif;
+pub mod export;

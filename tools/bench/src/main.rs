@@ -35,6 +35,9 @@ fn main() {
         "xmpcheck" => xmp_check(&files_any(rest)),
         "thumbs" => bench_thumbs(&rest.iter().map(PathBuf::from).collect::<Vec<_>>()),
         "look" => bench_look(&files),
+        "export" => bench_export(rest),
+        "exportengine" => bench_export_engine(rest),
+        "jpegsegments" => jpeg_segments(&files),
         "lens" => lens::bench_lens(&files),
         "lensscan" => lens::lens_scan(rest),
         "cull" => bench_cull(&rest.iter().map(PathBuf::from).collect::<Vec<_>>()),
@@ -671,4 +674,207 @@ fn bench_look(files: &[PathBuf]) {
     std::fs::create_dir_all(out.parent().unwrap()).unwrap();
     sheet.save(&out).unwrap();
     println!("{}", out.display());
+}
+
+/// `bench export <raw>... --out <folder>`: full-size JPEG export, timed, then checked: the size,
+/// against the fitted develop (the same edit at 1024 px), and across tile seams.
+fn bench_export(args: &[String]) {
+    use std::sync::mpsc::sync_channel;
+    use windedit_core::export::{self, Request, TileRenderer};
+
+    let at = args.iter().position(|a| a == "--out").expect("usage: bench export <raw>... --out <folder>");
+    let out_dir = PathBuf::from(&args[at + 1]);
+    let files: Vec<PathBuf> = args[..at].iter().map(PathBuf::from).collect();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let mut gpu = Gpu::new().expect("no Direct3D 12 GPU");
+    println!("GPU: {}", gpu.adapter_name);
+    warm_up(&mut gpu).unwrap();
+    // Something to see in the output: every part of the develop pass is in play.
+    let edit = Edit { exposure: 0.3, contrast: 15.0, highlights: -25.0, shadows: 30.0, vibrance: 20.0, saturation: 10.0, ..Default::default() };
+
+    for f in &files {
+        let name = f.file_stem().unwrap().to_string_lossy().to_string();
+        let frame = decode::decode_file(f).unwrap();
+        let mut memory = ImageMemory::new();
+        let (image, _) = Image::open(&mut gpu, &mut memory, &frame).unwrap();
+        let size = image.oriented_size();
+        println!("\n{name} ({} {}): {}x{} after rotation", frame.make, frame.model, size.0, size.1);
+
+        let mut results = Vec::new();
+        for run in 0..4 {
+            let path = out_dir.join(format!("{name}.jpg"));
+            let _ = std::fs::remove_file(&path);
+            let start = Instant::now();
+            let window = Request::default().window(size).unwrap();
+            let mut renderer = TileRenderer::new(&gpu, window).unwrap();
+            let (tx, rx) = sync_channel(1);
+            let raw = f.clone();
+            let target = path.clone();
+            let worker = std::thread::spawn(move || export::encode(rx, size, 92, &raw, &target));
+            while !renderer.done() {
+                if let Some(strip) = renderer.step(&mut gpu, &image, &edit).unwrap() {
+                    tx.send(strip).unwrap();
+                }
+            }
+            let rendered = ms(start.elapsed());
+            drop(tx);
+            let done = worker.join().unwrap().unwrap();
+            let total = ms(start.elapsed());
+            if run > 0 {
+                results.push((total, renderer.render_ms, renderer.readback_ms, done.encode_ms, rendered, done.write_ms));
+            }
+            if run == 3 {
+                println!(
+                    "  wrote {} ({:.1} MB, EXIF copied: {})",
+                    done.path.file_name().unwrap().to_string_lossy(),
+                    done.bytes as f64 / 1e6,
+                    done.exif
+                );
+            }
+        }
+        let med = |i: usize| median(results.iter().map(|r| [r.0, r.1, r.2, r.3, r.4, r.5][i]).collect());
+        println!(
+            "  export: {:.0} ms in all (median of 3): develop {:.0} ms GPU, readback {:.0} ms, encode {:.0} ms on its own thread, \
+             rendering finished at {:.0} ms, file written in {:.0} ms",
+            med(0), med(1), med(2), med(3), med(4), med(5)
+        );
+
+        // The file: its size, and against the fitted develop at 1024 px.
+        let jpeg = image::open(out_dir.join(format!("{name}.jpg"))).unwrap().to_rgb8();
+        println!("  decoded: {}x{} {}", jpeg.width(), jpeg.height(), if (jpeg.width(), jpeg.height()) == size { "ok" } else { "WRONG SIZE" });
+        let (fw, fh) = if size.0 >= size.1 {
+            (1024, (1024.0 * size.1 as f32 / size.0 as f32).round() as u32)
+        } else {
+            ((1024.0 * size.0 as f32 / size.1 as f32).round() as u32, 1024)
+        };
+        let fit = Target::new(&gpu, fw, fh).unwrap();
+        gpu.begin().unwrap();
+        render_image(&gpu, &image, &edit, Zoom::Fit, &fit);
+        gpu.submit().unwrap();
+        let reference = read_target(&mut gpu, &fit).unwrap();
+        let small = image::imageops::resize(&jpeg, fw, fh, image::imageops::FilterType::Triangle);
+        let mut diffs: Vec<u8> = Vec::new();
+        for (a, b) in small.pixels().zip(reference.as_chunks::<4>().0) {
+            diffs.extend(a.0.iter().zip(b).map(|(x, y)| x.abs_diff(*y)));
+        }
+        diffs.sort_unstable();
+        let mean = diffs.iter().map(|&d| d as f64).sum::<f64>() / diffs.len() as f64;
+        println!(
+            "  vs fitted develop at {fw}x{fh}: mean {mean:.2} levels, {:.1}% of values within 4 levels, 99th percentile {}, 99.9th {}, max {}",
+            100.0 * diffs.partition_point(|&d| d <= 4) as f64 / diffs.len() as f64,
+            diffs[diffs.len() * 99 / 100],
+            diffs[diffs.len() * 999 / 1000],
+            diffs.last().unwrap()
+        );
+        // The same with fine detail averaged away (8x8 blocks), where filters don't matter and
+        // only tone and color do.
+        let block = |px: &mut dyn Iterator<Item = [u8; 3]>| -> Vec<f64> {
+            let (bw, bh) = (fw as usize / 8, fh as usize / 8);
+            let mut sums = vec![0f64; bw * bh * 3];
+            for (i, p) in px.enumerate() {
+                let (x, y) = (i % fw as usize / 8, i / fw as usize / 8);
+                if x < bw && y < bh {
+                    for c in 0..3 {
+                        sums[(y * bw + x) * 3 + c] += p[c] as f64 / 64.0;
+                    }
+                }
+            }
+            sums
+        };
+        let a = block(&mut small.pixels().map(|p| p.0));
+        let b = block(&mut reference.as_chunks::<4>().0.iter().map(|p| [p[0], p[1], p[2]]));
+        let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+        let mean = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f64>() / a.len() as f64;
+        println!("  at 8x8-block averages: mean {mean:.2} levels, max {worst:.1}");
+
+        // Seams: neighbouring tiles that overlap by one pixel must agree exactly there.
+        let render_region = |gpu: &mut Gpu, x: u32, y: u32, w: u32, h: u32| {
+            let t = Target::new(gpu, w, h).unwrap();
+            gpu.begin().unwrap();
+            render_image(gpu, &image, &edit, Zoom::Region { x: x as f32, y: y as f32, scale: 1.0 }, &t);
+            gpu.submit().unwrap();
+            read_target(gpu, &t).unwrap()
+        };
+        let t = export::TILE;
+        if size.0 > t + 600 {
+            let y = size.1 / 2 - 256;
+            let a = render_region(&mut gpu, t - 512, y, 512, 512); // ends on the last column of the first tile
+            let b = render_region(&mut gpu, t - 1, y, 512, 512); // starts there
+            let worst = (0..512usize).flat_map(|r| (0..4).map(move |c| (r, c))).map(|(r, c)| a[(r * 512 + 511) * 4 + c].abs_diff(b[(r * 512) * 4 + c])).max().unwrap();
+            println!("  seam across x = {t}: largest difference in the shared column {worst}");
+        }
+        if size.1 > t + 600 {
+            let x = size.0 / 2 - 256;
+            let a = render_region(&mut gpu, x, t - 512, 512, 512);
+            let b = render_region(&mut gpu, x, t - 1, 512, 512);
+            let worst = (0..512usize).flat_map(|r| (0..4).map(move |c| (r, c))).map(|(r, c)| a[(511 * 512 + r) * 4 + c].abs_diff(b[r * 4 + c])).max().unwrap();
+            println!("  seam across y = {t}: largest difference in the shared row {worst}");
+        }
+    }
+}
+
+/// `bench jpegsegments <raw>...`: the marker segments at the start of each embedded JPEG.
+fn jpeg_segments(files: &[PathBuf]) {
+    for f in files {
+        let head = std::fs::read(f).unwrap();
+        let head = &head[..head.len().min(1 << 20)];
+        for j in decode::embedded_jpegs(head) {
+            let b = &head[j.offset..];
+            print!("{} @{} {}x{}:", f.file_name().unwrap().to_string_lossy(), j.offset, j.width, j.height);
+            let mut i = 2;
+            while i + 4 <= b.len() && b[i] == 0xFF && b[i + 1] != 0xDA {
+                let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+                print!(" {:02X}({len}:{})", b[i + 1], String::from_utf8_lossy(&b[i + 4..(i + 8).min(b.len())]).replace('\0', "0"));
+                i += 2 + len;
+            }
+            println!();
+        }
+    }
+}
+
+/// `bench exportengine <folder> <out>`: exports through the whole engine, as the app does:
+/// the first photo three times (names must not collide), then the others, all queued at once,
+/// with an Edit applied to the first. The folder should be a scratch copy (saving the Edit
+/// writes a sidecar).
+fn bench_export_engine(args: &[String]) {
+    use std::sync::mpsc::channel;
+    use windedit_core::engine::Engine;
+    use windedit_core::export::Request;
+    use windedit_core::viewer::{EVENT_EXPORT, EXPORT_DONE, EXPORT_FAILED, FrameEvent};
+
+    let (dir, out) = (PathBuf::from(&args[0]), PathBuf::from(&args[1]));
+    let (tx, rx) = channel();
+    let engine = Engine::new(Box::new(move |e: &FrameEvent| {
+        if e.kind == EVENT_EXPORT && e.export_state != 0 {
+            let text = unsafe {
+                let mut n = 0;
+                while *(e.text as *const u16).add(n) != 0 {
+                    n += 1;
+                }
+                String::from_utf16_lossy(std::slice::from_raw_parts(e.text as *const u16, n))
+            };
+            let _ = tx.send((e.export_id, e.photo, e.export_state, text, *e));
+        }
+    }))
+    .unwrap();
+    let count = engine.open_folder(&dir).unwrap();
+    engine.set_edit(0, Edit { exposure: 1.0, saturation: 40.0, ..Default::default() }, true);
+    let mut wanted = Vec::new();
+    for index in [0, 0, 0].into_iter().chain(1..count) {
+        let name = engine.photos()[index].name.clone();
+        let id = engine.export(index, out.join(format!("{name}.jpg")), Request::default()).unwrap();
+        wanted.push(id);
+    }
+    let start = Instant::now();
+    for _ in &wanted {
+        let (id, photo, state, text, e) = rx.recv_timeout(Duration::from_secs(60)).expect("export events");
+        println!(
+            "job {id} (photo {photo}): {} {text} after {:.0} ms (develop {:.0}, readback {:.0}, encode {:.0})",
+            if state == EXPORT_DONE { "saved" } else if state == EXPORT_FAILED { "FAILED" } else { "?" },
+            ms(start.elapsed()),
+            e.gpu_ms,
+            e.cpu_ms,
+            e.open_ms
+        );
+    }
 }

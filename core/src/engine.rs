@@ -2,7 +2,8 @@
 //! decoding happens on worker threads and drawing on the GPU thread, which reports each frame
 //! through the event callback.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -12,7 +13,8 @@ use crate::library::{self, Photo};
 use crate::ratings::Ratings;
 use crate::develop::{self, Edit};
 use crate::pipeline::Zoom;
-use crate::viewer::{self, Command, EventSink, GpuInfo};
+use crate::export::Request;
+use crate::viewer::{self, Command, EventSink, ExportJob, GpuInfo};
 
 pub struct Engine {
     jobs: Arc<Jobs>,
@@ -21,6 +23,7 @@ pub struct Engine {
     pub info: GpuInfo,
     view: Mutex<ViewState>,
     ratings: Ratings,
+    next_export: AtomicU32,
 }
 
 /// What decides which decodes are wanted.
@@ -54,6 +57,7 @@ impl Engine {
             gpu_thread: Some(gpu_thread),
             info,
             ratings: Ratings::new(),
+            next_export: AtomicU32::new(1),
             view: Mutex::new(ViewState {
                 index: None,
                 direction: 1,
@@ -130,6 +134,18 @@ impl Engine {
             let _ = self.viewer.send(Command::SetEdit(edit));
         }
         Some(edit)
+    }
+
+    /// Queues a full-size JPEG export of a photo with its adjustments as they are now. Returns
+    /// the job's id, which the progress and completion events carry (`viewer::EVENT_EXPORT`).
+    pub fn export(&self, index: usize, path: PathBuf, request: Request) -> Result<u32, String> {
+        let photos = self.jobs.photos();
+        let photo = photos.get(index).ok_or(format!("there's no photo {index}"))?;
+        let raw = photo.raw.clone().ok_or(format!("{} has no raw file to export", photo.name))?;
+        let edit = self.ratings.edit(index).unwrap_or_default();
+        let id = self.next_export.fetch_add(1, Ordering::Relaxed);
+        let _ = self.viewer.send(Command::Export(ExportJob { id, index, raw, path, edit, request }));
+        Ok(id)
     }
 
     /// The photo's white balance as shot, as temperature (K) and tint, once its raw is decoded.

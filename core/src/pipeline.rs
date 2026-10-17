@@ -392,6 +392,10 @@ pub enum Zoom {
     /// rotated photo's width and height. Fractions, so the point stays put when a preview is
     /// replaced by a bigger one or by the raw.
     Actual { x: f32, y: f32 },
+    /// An exact window of the rotated photo, for export: its top-left corner in photo pixels,
+    /// and output pixels per photo pixel (1 for the photo's own size). Output pixel (0, 0) sits
+    /// on the corner, so tiles at whole-pixel corners line up without any resampling.
+    Region { x: f32, y: f32, scale: f32 },
 }
 
 /// A texture the develop pass draws into, the size of the view.
@@ -561,15 +565,19 @@ fn view_transform(
     out_w: u32,
     out_h: u32,
 ) -> ([f32; 2], [f32; 2], [f32; 2], f32) {
-    let (pw, ph) = (photo.0 as f32, photo.1 as f32);
+    // In double precision: the shader adds a step per pixel, so a step off by one part in 10^7
+    // is a visible fraction of a pixel by the far side of a big export tile.
+    let (pw, ph) = (photo.0 as f64, photo.1 as f64);
+    let (out_w, out_h) = (out_w as f64, out_h as f64);
     let (scale, center) = match zoom {
-        Zoom::Fit => ((out_w as f32 / pw).min(out_h as f32 / ph), (pw / 2.0, ph / 2.0)),
-        Zoom::Actual { x, y } => (1.0, (x.clamp(0.0, 1.0) * pw, y.clamp(0.0, 1.0) * ph)),
+        Zoom::Fit => ((out_w / pw).min(out_h / ph), (pw / 2.0, ph / 2.0)),
+        Zoom::Actual { x, y } => (1.0, (x.clamp(0.0, 1.0) as f64 * pw, y.clamp(0.0, 1.0) as f64 * ph)),
+        Zoom::Region { x, y, scale } => (scale as f64, (x as f64 + out_w / scale as f64 / 2.0, y as f64 + out_h / scale as f64 / 2.0)),
     };
     // Output pixel → rotated photo (0..1) → texture (0..1).
-    let map = |px: f32, py: f32| -> [f32; 2] {
-        let u = (center.0 + (px - out_w as f32 / 2.0) / scale) / pw;
-        let v = (center.1 + (py - out_h as f32 / 2.0) / scale) / ph;
+    let map = |px: f64, py: f64| -> [f64; 2] {
+        let u = (center.0 + (px - out_w / 2.0) / scale) / pw;
+        let v = (center.1 + (py - out_h / 2.0) / scale) / ph;
         match orientation {
             Orientation::Normal => [u, v],
             Orientation::Rotate90 => [v, 1.0 - u],
@@ -581,9 +589,10 @@ fn view_transform(
     let x = map(1.0, 0.0);
     let y = map(0.0, 1.0);
     // Texture pixels per screen pixel, along the photo's width.
-    let texture_w = if orientation.swaps_axes() { texture.1 } else { texture.0 } as f32;
+    let texture_w = if orientation.swaps_axes() { texture.1 } else { texture.0 } as f64;
     let lod = (texture_w / pw / scale).log2().max(0.0);
-    (o, [x[0] - o[0], x[1] - o[1]], [y[0] - o[0], y[1] - o[1]], lod)
+    let f = |v: [f64; 2]| [v[0] as f32, v[1] as f32];
+    (f(o), f([x[0] - o[0], x[1] - o[1]]), f([y[0] - o[0], y[1] - o[1]]), lod as f32)
 }
 
 const PREVIEW_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;

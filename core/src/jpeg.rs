@@ -5,8 +5,14 @@
 use std::cell::RefCell;
 
 use windows::Win32::Graphics::Imaging::*;
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx};
-use windows::core::{GUID, Interface, Result};
+use windows::Win32::Foundation::{E_FAIL, HGLOBAL};
+use windows::Win32::System::Com::StructuredStorage::{CreateStreamOnHGlobal, PROPBAG2};
+use windows::Win32::System::Ole::PROPBAG2_TYPE_DATA;
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, IStream, STATFLAG_NONAME, STATSTG, STREAM_SEEK_SET,
+};
+use windows::Win32::System::Variant::{VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_R4, VT_UI1};
+use windows::core::{GUID, Interface, PCWSTR, PWSTR, Result};
 
 /// Decoded pixels, 8-bit BGRA (alpha unused), rows packed.
 pub struct Pixels {
@@ -110,5 +116,102 @@ pub fn decode(bytes: &[u8], min_long_edge: u32) -> Result<Pixels> {
         let mut bgra = vec![0u8; (w * h * 4) as usize];
         converter.CopyPixels(std::ptr::null(), w * 4, &mut bgra)?;
         Ok(Pixels { width: w, height: h, bgra })
+    }
+}
+
+/// Writes a JPEG with WIC, a band of rows at a time, so rendering can carry on while the
+/// encoder works on what's done. The file is built in memory (`finish` returns its bytes) so the
+/// caller can add the camera's EXIF before it reaches the disk.
+pub struct Encoder {
+    stream: IStream,
+    encoder: IWICBitmapEncoder,
+    frame: IWICBitmapFrameEncode,
+    width: u32,
+    rows_written: u32,
+    height: u32,
+}
+
+impl Encoder {
+    /// `quality` is 1–100. Chroma is not subsampled (4:4:4), and the file is tagged sRGB with
+    /// Windows' own profile when it's there.
+    pub fn new(width: u32, height: u32, quality: u8) -> Result<Encoder> {
+        let factory = factory()?;
+        unsafe {
+            let stream = CreateStreamOnHGlobal(HGLOBAL::default(), true)?;
+            let encoder = factory.CreateEncoder(&GUID_ContainerFormatJpeg, std::ptr::null())?;
+            encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
+            let mut frame = None;
+            let mut options = None;
+            encoder.CreateNewFrame(&mut frame, &mut options)?;
+            let (frame, options) = (frame.unwrap(), options.unwrap());
+
+            let mut quality_name: Vec<u16> = "ImageQuality\0".encode_utf16().collect();
+            let mut sampling_name: Vec<u16> = "JpegYCrCbSubsampling\0".encode_utf16().collect();
+            let props = [
+                PROPBAG2 { dwType: PROPBAG2_TYPE_DATA.0 as u32, vt: VT_R4, pstrName: PWSTR(quality_name.as_mut_ptr()), ..Default::default() },
+                PROPBAG2 { dwType: PROPBAG2_TYPE_DATA.0 as u32, vt: VT_UI1, pstrName: PWSTR(sampling_name.as_mut_ptr()), ..Default::default() },
+            ];
+            let values = [
+                variant(VT_R4, VARIANT_0_0_0 { fltVal: quality.clamp(1, 100) as f32 / 100.0 }),
+                variant(VT_UI1, VARIANT_0_0_0 { bVal: WICJpegYCrCbSubsampling444.0 as u8 }),
+            ];
+            options.Write(2, props.as_ptr(), values.as_ptr())?;
+            frame.Initialize(&options)?;
+            frame.SetSize(width, height)?;
+            frame.SetResolution(96.0, 96.0)?;
+            let mut format = GUID_WICPixelFormat24bppBGR;
+            frame.SetPixelFormat(&mut format)?;
+            if format != GUID_WICPixelFormat24bppBGR {
+                return Err(windows::core::Error::new(E_FAIL, "the JPEG encoder wants another pixel format"));
+            }
+            if let Ok(profile) = srgb_profile(&factory) {
+                let _ = frame.SetColorContexts(&[Some(profile)]);
+            }
+            Ok(Encoder { stream, encoder, frame, width, rows_written: 0, height })
+        }
+    }
+
+    /// The next `rows` rows, as 8-bit BGR with no padding.
+    pub fn write_rows(&mut self, bgr: &[u8], rows: u32) -> Result<()> {
+        assert!(rows > 0 && bgr.len() >= (rows * self.width * 3) as usize && self.rows_written + rows <= self.height);
+        unsafe { self.frame.WritePixels(rows, self.width * 3, &bgr[..(rows * self.width * 3) as usize])? };
+        self.rows_written += rows;
+        Ok(())
+    }
+
+    /// Finishes the file and returns its bytes.
+    pub fn finish(self) -> Result<Vec<u8>> {
+        unsafe {
+            self.frame.Commit()?;
+            self.encoder.Commit()?;
+            let mut stat = STATSTG::default();
+            self.stream.Stat(&mut stat, STATFLAG_NONAME)?;
+            self.stream.Seek(0, STREAM_SEEK_SET, None)?;
+            let mut bytes = vec![0u8; stat.cbSize as usize];
+            let mut read = 0u32;
+            self.stream.Read(bytes.as_mut_ptr() as *mut _, bytes.len() as u32, Some(&mut read)).ok()?;
+            bytes.truncate(read as usize);
+            Ok(bytes)
+        }
+    }
+}
+
+/// Windows' standard sRGB profile, as a WIC color context.
+fn srgb_profile(factory: &IWICImagingFactory) -> Result<IWICColorContext> {
+    let windir = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let path = format!("{windir}\\System32\\spool\\drivers\\color\\sRGB Color Space Profile.icm\0");
+    let wide: Vec<u16> = path.encode_utf16().collect();
+    unsafe {
+        let context = factory.CreateColorContext()?;
+        context.InitializeFromFilename(PCWSTR(wide.as_ptr()))?;
+        Ok(context)
+    }
+}
+
+fn variant(vt: VARENUM, value: VARIANT_0_0_0) -> VARIANT {
+    VARIANT {
+        Anonymous: VARIANT_0 {
+            Anonymous: std::mem::ManuallyDrop::new(VARIANT_0_0 { vt, wReserved1: 0, wReserved2: 0, wReserved3: 0, Anonymous: value }),
+        },
     }
 }

@@ -68,6 +68,7 @@ public sealed partial class MainWindow : Window
         PrepareRememberedSizes();
         LoadLayout();
         BuildEditPanel();
+        InitExport();
         BuildFolderTree();
         SetFoldersPanel(layout.GetValueOrDefault("folders", true));
         EmptyText.Text = $"Open a folder of photos (Ctrl+O).\n\n{engine.AdapterName}";
@@ -337,6 +338,12 @@ public sealed partial class MainWindow : Window
             return;
         var ctrl = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control).HasFlag(CoreVirtualKeyStates.Down);
         var shift = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift).HasFlag(CoreVirtualKeyStates.Down);
+        if (ctrl && shift && e.Key == VirtualKey.E)
+        {
+            ShowExportFlyout();
+            e.Handled = true;
+            return;
+        }
         if (ctrl && all.Length > 0 && EditShortcut(new VirtualKeyWithModifiers(e.Key, shift)))
         {
             e.Handled = true;

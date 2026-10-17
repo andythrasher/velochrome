@@ -27,6 +27,11 @@ public sealed unsafe partial class Engine : IDisposable
         /// <summary>The raw's sensor size, once decoded (else 0).</summary>
         public uint RawWidth, RawHeight;
         public double SinceShowMs, GpuMs, CpuMs, OpenMs;
+        /// <summary>For export events: the job, its state (0 working, 1 saved, 2 failed), how far it is
+        /// (0–1) and a UTF-16 text valid only during the callback (see <see cref="ExportChanged"/>).</summary>
+        public uint ExportId, ExportState;
+        public float Progress;
+        public IntPtr Text;
     }
 
     [LibraryImport(Dll)] private static partial IntPtr we_engine_create(delegate* unmanaged[Cdecl]<IntPtr, Frame*, void> callback, IntPtr user);
@@ -42,6 +47,7 @@ public sealed unsafe partial class Engine : IDisposable
     [LibraryImport(Dll)] private static partial int we_set_edit_mode(IntPtr engine, int on);
     [LibraryImport(Dll)] private static partial int we_view_resize(IntPtr engine, uint width, uint height, float scale, out IntPtr chain);
     [LibraryImport(Dll)] private static partial int we_prepare(IntPtr engine, uint width, uint height);
+    [LibraryImport(Dll, StringMarshalling = StringMarshalling.Utf16)] private static partial int we_export(IntPtr engine, int index, string path, int quality);
     [LibraryImport(Dll, StringMarshalling = StringMarshalling.Utf16)] private static partial int we_save_snapshot(IntPtr engine, string path);
     [LibraryImport(Dll)] private static partial int we_get_metadata(IntPtr engine, Metadata* output, int count);
     [LibraryImport(Dll)] private static partial int we_get_edit(IntPtr engine, int index, out Edit edit);
@@ -55,7 +61,7 @@ public sealed unsafe partial class Engine : IDisposable
     [LibraryImport(Dll)] private static partial int we_set_visible(IntPtr engine, int* visible, int count);
     [LibraryImport(Dll)] private static partial int we_thumbnail(IntPtr engine, int index, byte* buf, int capacity, out int width, out int height);
 
-    public const uint FrameEvent = 1, ThumbnailEvent = 2;
+    public const uint FrameEvent = 1, ThumbnailEvent = 2, ExportEvent = 3;
 
     /// <summary>
     /// A photo's stars (0–5), pick flag (1 picked, -1 rejected, 0 neither) and color label
@@ -106,11 +112,32 @@ public sealed unsafe partial class Engine : IDisposable
         WarmUpMs = we_warm_up_ms(handle);
     }
 
+    /// <summary>An export's progress, or its end: <see cref="Text"/> is the file written when
+    /// <see cref="State"/> is <see cref="ExportDone"/>, the problem when it is <see cref="ExportFailed"/>.</summary>
+    public readonly record struct ExportUpdate(int Id, int Photo, int State, float Progress, string? Text, double DevelopMs, double ReadbackMs, double EncodeMs, double TotalMs);
+
+    public const int ExportWorking = 0, ExportDone = 1, ExportFailed = 2;
+
+    /// <summary>
+    /// Raised on the engine's GPU thread when an export (<see cref="Export"/>) makes progress,
+    /// finishes or fails.
+    /// </summary>
+    public event Action<ExportUpdate>? ExportChanged;
+
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     static void OnFrame(IntPtr user, Frame* frame)
     {
-        if (GCHandle.FromIntPtr(user).Target is Engine engine)
-            engine.FrameDrawn?.Invoke(*frame);
+        if (GCHandle.FromIntPtr(user).Target is not Engine engine)
+            return;
+        if (frame->Kind == ExportEvent)
+        {
+            // The text is only valid during this call, so it's read here.
+            var text = frame->Text == IntPtr.Zero ? null : Marshal.PtrToStringUni(frame->Text);
+            engine.ExportChanged?.Invoke(new ExportUpdate((int)frame->ExportId, frame->Photo, (int)frame->ExportState,
+                frame->Progress, text, frame->GpuMs, frame->CpuMs, frame->OpenMs, frame->SinceShowMs));
+            return;
+        }
+        engine.FrameDrawn?.Invoke(*frame);
     }
 
     public string AdapterName { get; }
@@ -156,6 +183,13 @@ public sealed unsafe partial class Engine : IDisposable
     /// <summary>The white balance as shot (kelvin, tint), once the raw is decoded.</summary>
     public (float Kelvin, float Tint)? AsShotWhiteBalance(int index) =>
         Check(we_as_shot_white_balance(handle, index, out var k, out var t)) == 1 ? (k, t) : null;
+
+    /// <summary>
+    /// Queues a full-size JPEG export of a photo, with its adjustments as they are now. If the
+    /// name is taken the engine adds -2, -3, …; the file written comes with the done event.
+    /// Returns the job's id, which <see cref="ExportChanged"/> carries.
+    /// </summary>
+    public int Export(int index, string path, int quality) => Check(we_export(handle, index, path, quality));
 
     public void SetEditMode(bool on) => Check(we_set_edit_mode(handle, on ? 1 : 0));
 

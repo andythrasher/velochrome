@@ -17,6 +17,7 @@ use std::sync::Mutex;
 
 use crate::develop::Edit;
 use crate::engine::Engine;
+use crate::export::Request;
 use crate::pipeline::Zoom;
 use crate::ratings::{LABELS, label_code};
 use crate::viewer::FrameEvent;
@@ -244,6 +245,19 @@ pub extern "C" fn we_prepare(handle: *const Handle, width: u32, height: u32) -> 
     guard(handle, |e| {
         e.prepare(width, height);
         Ok(0)
+    })
+}
+
+/// Queues a full-size JPEG export of a photo, with its adjustments as they are now, to `path`
+/// (a taken name gets -2, -3, … added; the file written is named in the done event). `quality`
+/// is 1–100. Exports run one after another in the background; each one's progress, and its
+/// file or its error, arrive as EVENT_EXPORT events carrying the id returned here (always above 0).
+#[unsafe(no_mangle)]
+pub extern "C" fn we_export(handle: *const Handle, index: i32, path: *const u16, quality: i32) -> i32 {
+    guard(handle, |e| {
+        let request = Request { quality: quality.clamp(1, 100) as u8, ..Default::default() };
+        let id = e.export(index.max(0) as usize, wide_to_path(path), request)?;
+        Ok(id as i32)
     })
 }
 
