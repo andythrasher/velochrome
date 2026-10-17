@@ -381,8 +381,11 @@ public sealed partial class MainWindow : Window
 
     void Thumbnail_Tapped(object sender, TappedRoutedEventArgs e)
     {
-        if ((sender as FrameworkElement)?.DataContext is PhotoItem item)
-            ShowAt(shown.IndexOf(item));
+        // The repeaters don't set DataContext (the template uses x:Bind), so ask them for the position.
+        var element = (UIElement)sender;
+        var at = gridMode ? GridRepeater.GetElementIndex(element) : Filmstrip.GetElementIndex(element);
+        if (at != position)
+            ShowAt(at);
         FocusKeys();
     }
 
