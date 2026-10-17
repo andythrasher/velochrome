@@ -1,0 +1,4 @@
+# Link the C runtime statically, so bench.exe and the engine DLL run on a PC without the
+# Visual C++ redistributable (e.g. copied to a laptop to compare).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

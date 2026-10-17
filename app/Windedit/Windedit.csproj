@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <!-- Windows 11 and later. -->
+    <TargetPlatformMinVersion>10.0.22000.0</TargetPlatformMinVersion>
+    <RootNamespace>Windedit</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <RuntimeIdentifier>$(NETCoreSdkRuntimeIdentifier)</RuntimeIdentifier>
+    <Nullable>enable</Nullable>
+    <!-- The swap chain is attached through ISwapChainPanelNative's vtable: see Engine.cs. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <UseWinUI>true</UseWinUI>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+
+    <!-- The engine (core/, Rust) is built with the app and copied next to it. -->
+    <!-- Always the optimized engine: a debug build of the pixel code isn't worth measuring. -->
+    <EngineDir>$(MSBuildThisFileDirectory)..\..\target\release\</EngineDir>
+  </PropertyGroup>
+
+  <Target Name="BuildEngine" BeforeTargets="BeforeBuild">
+    <Exec Command="cargo build --release -p windedit-core" WorkingDirectory="$(MSBuildThisFileDirectory)..\.." />
+  </Target>
+
+  <ItemGroup>
+    <None Include="$(EngineDir)windedit_core.dll" Link="windedit_core.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Just the parts of the Windows App SDK in use (UI, windowing, runtime), as in Windshot. -->
+    <PackageReference Include="Microsoft.WindowsAppSDK.WinUI" Version="2.3.9" />
+    <PackageReference Include="Microsoft.WindowsAppSDK.Foundation" Version="2.3.12" />
+    <PackageReference Include="Microsoft.WindowsAppSDK.Runtime" Version="2.5.1" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2705" />
+  </ItemGroup>
+
+</Project>
