@@ -114,6 +114,14 @@ public sealed unsafe partial class Engine : IDisposable
         /// <summary>1 turns the camera's distortion correction off, 1 its chromatic aberration correction;
         /// both are off-flags so a zeroed Edit keeps them on.</summary>
         public uint NoDistortion, NoChromaticAberration;
+        /// <summary>Sharpening and noise reduction, each as an offset from its slider's default
+        /// (Amount 40, Radius 1.0, Detail 25, Masking 0; Luminance 0 with Detail 50; Color 25 with
+        /// Detail 50), so a zeroed Edit holds the defaults. Use the <c>Detail*</c> helpers for the
+        /// slider values.</summary>
+        public float SharpenAmount, SharpenRadius, SharpenDetail, SharpenMasking;
+        public float NoiseLuminance, NoiseLuminanceDetail, NoiseColor, NoiseColorDetail;
+        /// <summary>Texture and Clarity, −100 to 100 (0 is none).</summary>
+        public float Texture, Clarity;
 
         /// <summary>The photo as shot: no adjustments, no crop.</summary>
         public static Edit None => new() { CropRight = 1, CropBottom = 1 };

@@ -13,7 +13,9 @@ use crate::linear::{display_code_quantiles, scene_linear};
 use crate::util::*;
 
 fn settings() -> Vec<(&'static str, Edit)> {
-    let d = Edit::default();
+    // Detail processing is off: the CPU reference has no sharpening or noise reduction.
+    let mut d = Edit::default();
+    d.set_detail(windedit_core::develop::Detail { amount: 0.0, color: 0.0, ..windedit_core::develop::DETAIL_DEFAULTS });
     vec![
         ("default", d),
         ("exposure+1", Edit { exposure: 1.0, ..d }),
@@ -28,6 +30,9 @@ fn settings() -> Vec<(&'static str, Edit)> {
         ("whites-100", Edit { whites: -100.0, ..d }),
         ("blacks+100", Edit { blacks: 100.0, ..d }),
         ("blacks-100", Edit { blacks: -100.0, ..d }),
+        ("clarity+100", Edit { clarity: 100.0, ..d }),
+        ("clarity-100", Edit { clarity: -100.0, ..d }),
+        ("clarity+60 shadows+50", Edit { clarity: 60.0, shadows: 50.0, contrast: 30.0, ..d }),
     ]
 }
 

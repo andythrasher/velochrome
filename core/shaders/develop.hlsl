@@ -13,15 +13,18 @@
 // filter's coefficients and the statistics.
 #define DEVELOP_ROOT_SIGNATURE \
     "RootConstants(num32BitConstants=60, b0)," \
-    "DescriptorTable(SRV(t0, numDescriptors=4), UAV(u0))," \
+    "DescriptorTable(SRV(t0, numDescriptors=6), UAV(u0))," \
     "StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR," \
     " addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)"
 
 cbuffer Constants : register(b0)
 {
-    float4 row0;    // camera RGB → linear Rec.2020; white balance, exposure and camera offset included
-    float4 row1;
-    float4 row2;
+    float3 row0;    // camera RGB → linear Rec.2020; white balance, exposure and camera offset included
+    uint detailOrigin; // the detail texture's rectangle in the level's texels: left and top (16 bits each),
+    float3 row1;
+    uint detailSize;   // ... and width and height
+    float3 row2;
+    uint detailLevel;  // 0: no detail texture; else the level it was made at, plus one
     float4 lum;     // camera RGB → brightness (the sRGB luminance of the same pixel)
     float2 origin;  // image coordinates (0..1) at output pixel (0, 0)
     float2 stepX;   // change in image coordinates per output pixel to the right
@@ -45,6 +48,7 @@ cbuffer Constants : register(b0)
 
 Texture2D<float4> image : register(t0);
 Texture2D<float2> baseCoefficients : register(t2);
+Texture2D<float2> clarityCoefficients : register(t5); // Clarity's base, when lum.w != 0
 Buffer<float> stats : register(t3); // the 99.5th and 25th percentiles of the tones
 SamplerState linearClamp : register(s0);
 RWTexture2D<unorm float4> output : register(u0);
@@ -117,6 +121,49 @@ float2 lensWarp(float2 uv, float2 dims, float3 ca, bool useCa)
     return 0.5 + q * g / dims;
 }
 
+Texture2D<float4> detailTex : register(t4); // the detail pass's output, when detailLevel != 0
+
+// The image at a sensor position: from the detail texture (sharpened and denoised) where it
+// covers, else from the pyramid. The detail texture is one pyramid level; where a screen pixel
+// covers more than a texel, four taps average it. Positions past the covered rectangle's edge
+// (the image's own edge, for a rectangle that reaches it) clamp to its last texel, as the
+// pyramid does.
+float3 sampleImage(float2 uv, float2 dims)
+{
+    if (detailLevel != 0)
+    {
+        uint level = detailLevel - 1;
+        float2 p = uv * max(floor(dims / (float)(1u << level)), 1.0);
+        float2 origin = float2(detailOrigin & 0xffff, detailOrigin >> 16);
+        float2 size = float2(detailSize & 0xffff, detailSize >> 16);
+        float2 q = p - origin;
+        if (all(q >= 0.0) && all(q <= size))
+        {
+            float2 cap;
+            detailTex.GetDimensions(cap.x, cap.y);
+            float footprint = exp2(lod - (float)level);
+            if (footprint < 1.2)
+                return detailTex.SampleLevel(linearClamp, clamp(q, 0.5, size - 0.5) / cap, 0).rgb;
+            float o = 0.25 * footprint;
+            return 0.25 * (detailTex.SampleLevel(linearClamp, clamp(q + float2(-o, -o), 0.5, size - 0.5) / cap, 0).rgb
+                         + detailTex.SampleLevel(linearClamp, clamp(q + float2(o, -o), 0.5, size - 0.5) / cap, 0).rgb
+                         + detailTex.SampleLevel(linearClamp, clamp(q + float2(-o, o), 0.5, size - 0.5) / cap, 0).rgb
+                         + detailTex.SampleLevel(linearClamp, clamp(q + float2(o, o), 0.5, size - 0.5) / cap, 0).rgb);
+        }
+    }
+    return image.SampleLevel(linearClamp, uv, lod).rgb;
+}
+
+// Clarity (tone.rs `clarity_shift`): the change in stops for a pixel at x whose edge-preserving
+// base is base, for c from -1 to 1.
+float clarityShift(float x, float base, float c)
+{
+    float d = x - params[0].middle;
+    float weight = smoothstep(-10.0, -4.0, d) * (1.0 - smoothstep(1.0, 5.5, d));
+    float deviation = 2.0 * tanh((x - base) / 2.0);
+    return c * (c > 0.0 ? 1.3 : 0.55) * weight * deviation;
+}
+
 [RootSignature(DEVELOP_ROOT_SIGNATURE)]
 [numthreads(16, 16, 1)]
 void main(uint3 id : SV_DispatchThreadID)
@@ -139,27 +186,27 @@ void main(uint3 id : SV_DispatchThreadID)
         output[id.xy] = float4(image.SampleLevel(linearClamp, uv, lod).bgr, 1.0);
         return;
     }
-    float4 texel;
+    float3 texel;
     float2 dims;
     image.GetDimensions(dims.x, dims.y);
     if (lensA.x != 0.0)
     {
         uv = lensWarp(uv, dims, 0.0, false); // the tone base layer follows the sensor image too
-        texel = image.SampleLevel(linearClamp, uv, lod);
+        texel = sampleImage(uv, dims);
         if (lensA.w != 0.0)
         {
-            texel.r = image.SampleLevel(linearClamp, lensWarp(uv_in, dims, lensR.xyz, true), lod).r;
-            texel.b = image.SampleLevel(linearClamp, lensWarp(uv_in, dims, lensB.xyz, true), lod).b;
+            texel.r = sampleImage(lensWarp(uv_in, dims, lensR.xyz, true), dims).r;
+            texel.b = sampleImage(lensWarp(uv_in, dims, lensB.xyz, true), dims).b;
         }
     }
     else
     {
-        texel = image.SampleLevel(linearClamp, uv, lod);
+        texel = sampleImage(uv, dims);
     }
     // Vignetting works on scene light, before white balance and tone, at the radius of the
     // corrected frame (uv_in), so cropping doesn't move it.
-    float3 cam = texel.rgb * exp2(vignetteStops(length((uv_in - 0.5) * dims) / (0.5 * length(dims))));
-    float3 wide = float3(dot(row0.xyz, cam), dot(row1.xyz, cam), dot(row2.xyz, cam));
+    float3 cam = texel * exp2(vignetteStops(length((uv_in - 0.5) * dims) / (0.5 * length(dims))));
+    float3 wide = float3(dot(row0, cam), dot(row1, cam), dot(row2, cam));
     // Brightness in stops, moved by the sliders: the pixel's own for Contrast, Blacks and
     // Whites, and its surroundings' (the base) for Highlights and Shadows.
     float x = log2(max(dot(lum.xyz, cam), 1e-9));
@@ -169,6 +216,15 @@ void main(uint3 id : SV_DispatchThreadID)
     float2 ab = baseCoefficients.SampleLevel(linearClamp, clamp(uv * baseScale, 0.5, baseSize - 0.5) / baseDims, 0);
     float base = ab.x * xg + ab.y;
     float shifted = xg + toneLocal(xg, base, float2(stats[0], stats[1]));
+    if (lum.w != 0.0)
+    {
+        // Clarity's base: its copy's size is the scale rounded up (vignette.zw).
+        float2 claritySize = ceil(vignette.zw);
+        float2 clarityDims;
+        clarityCoefficients.GetDimensions(clarityDims.x, clarityDims.y);
+        float2 ab2 = clarityCoefficients.SampleLevel(linearClamp, clamp(uv * vignette.zw, 0.5, claritySize - 0.5) / clarityDims, 0);
+        shifted += clarityShift(xg, ab2.x * xg + ab2.y, lum.w);
+    }
     float3 rgb = mul(REC2020_TO_SRGB, toneRgb(wide * exp2(shifted - x)));
     rgb = saturate(presence(rgb));
     output[id.xy] = float4(srgbEncode(rgb), 1.0);

@@ -40,6 +40,20 @@ pub struct Edit {
     pub no_distortion: u32,
     /// 1 turns off the camera's chromatic aberration correction.
     pub no_chromatic_aberration: u32,
+    // Detail (docs/phase2b.md). Each is the slider's value as an offset from its default (the
+    // `DETAIL_DEFAULTS`), so a zeroed `Edit` holds the defaults: sharpening on at 40, colour
+    // noise reduction at 25.
+    pub sharpen_amount: f32,
+    pub sharpen_radius: f32,
+    pub sharpen_detail: f32,
+    pub sharpen_masking: f32,
+    pub noise_luminance: f32,
+    pub noise_luminance_detail: f32,
+    pub noise_color: f32,
+    pub noise_color_detail: f32,
+    /// Texture and Clarity, −100 to +100 (0 = none, so no offset is needed).
+    pub texture: f32,
+    pub clarity: f32,
 }
 
 /// No crop.
@@ -66,6 +80,16 @@ impl Default for Edit {
             vignette_midpoint: 0.0,
             no_distortion: 0,
             no_chromatic_aberration: 0,
+            sharpen_amount: 0.0,
+            sharpen_radius: 0.0,
+            sharpen_detail: 0.0,
+            sharpen_masking: 0.0,
+            noise_luminance: 0.0,
+            noise_luminance_detail: 0.0,
+            noise_color: 0.0,
+            noise_color_detail: 0.0,
+            texture: 0.0,
+            clarity: 0.0,
         }
     }
 }
@@ -82,6 +106,92 @@ impl Edit {
         self.vignette_midpoint = fix(self.vignette_midpoint, 50.0);
         self.no_distortion = (self.no_distortion != 0) as u32;
         self.no_chromatic_aberration = (self.no_chromatic_aberration != 0) as u32;
+    }
+
+    /// Puts the detail fields in range (a damaged sidecar, or a wrapper's wild value): each
+    /// slider's value stays inside its range.
+    pub fn clean_detail(&mut self) {
+        let fix = |offset: f32, default: f32, min: f32, max: f32| {
+            if offset.is_finite() { (default + offset).clamp(min, max) - default } else { 0.0 }
+        };
+        let d = DETAIL_DEFAULTS;
+        self.sharpen_amount = fix(self.sharpen_amount, d.amount, 0.0, 150.0);
+        self.sharpen_radius = fix(self.sharpen_radius, d.radius, 0.5, 3.0);
+        self.sharpen_detail = fix(self.sharpen_detail, d.detail, 0.0, 100.0);
+        self.sharpen_masking = fix(self.sharpen_masking, d.masking, 0.0, 100.0);
+        self.noise_luminance = fix(self.noise_luminance, d.luminance, 0.0, 100.0);
+        self.noise_luminance_detail = fix(self.noise_luminance_detail, d.luminance_detail, 0.0, 100.0);
+        self.noise_color = fix(self.noise_color, d.color, 0.0, 100.0);
+        self.noise_color_detail = fix(self.noise_color_detail, d.color_detail, 0.0, 100.0);
+        self.texture = fix(self.texture, 0.0, -100.0, 100.0);
+        self.clarity = fix(self.clarity, 0.0, -100.0, 100.0);
+    }
+
+    /// The detail sliders as the user sees them (absolute values).
+    pub fn detail(&self) -> Detail {
+        let d = DETAIL_DEFAULTS;
+        Detail {
+            amount: d.amount + self.sharpen_amount,
+            radius: d.radius + self.sharpen_radius,
+            detail: d.detail + self.sharpen_detail,
+            masking: d.masking + self.sharpen_masking,
+            luminance: d.luminance + self.noise_luminance,
+            luminance_detail: d.luminance_detail + self.noise_luminance_detail,
+            color: d.color + self.noise_color,
+            color_detail: d.color_detail + self.noise_color_detail,
+            texture: self.texture,
+        }
+    }
+
+    /// Sets the detail sliders from absolute values.
+    pub fn set_detail(&mut self, v: Detail) {
+        let d = DETAIL_DEFAULTS;
+        self.sharpen_amount = v.amount - d.amount;
+        self.sharpen_radius = v.radius - d.radius;
+        self.sharpen_detail = v.detail - d.detail;
+        self.sharpen_masking = v.masking - d.masking;
+        self.noise_luminance = v.luminance - d.luminance;
+        self.noise_luminance_detail = v.luminance_detail - d.luminance_detail;
+        self.noise_color = v.color - d.color;
+        self.noise_color_detail = v.color_detail - d.color_detail;
+        self.texture = v.texture;
+    }
+}
+
+/// The detail sliders: sharpening (Amount 0–150, Radius 0.5–3 pixels, Detail 0–100, Masking
+/// 0–100) and noise reduction (Luminance and Color 0–100, each with a Detail 0–100).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Detail {
+    pub amount: f32,
+    pub radius: f32,
+    pub detail: f32,
+    pub masking: f32,
+    pub luminance: f32,
+    pub luminance_detail: f32,
+    pub color: f32,
+    pub color_detail: f32,
+    /// Texture, −100 to 100.
+    pub texture: f32,
+}
+
+/// Lightroom's defaults for a raw: sharpening 40 / 1.0 / 25 / 0, no luminance noise reduction,
+/// colour 25, both Details 50.
+pub const DETAIL_DEFAULTS: Detail = Detail {
+    amount: 40.0,
+    radius: 1.0,
+    detail: 25.0,
+    masking: 0.0,
+    luminance: 0.0,
+    luminance_detail: 50.0,
+    color: 25.0,
+    color_detail: 50.0,
+    texture: 0.0,
+};
+
+impl Detail {
+    /// Nothing for the detail pass to do: no sharpening, noise reduction or texture.
+    pub fn is_neutral(&self) -> bool {
+        self.amount <= 0.0 && self.luminance <= 0.0 && self.color <= 0.0 && self.texture == 0.0
     }
 }
 
@@ -247,6 +357,27 @@ mod tests {
         let mut e = Edit { vignette_amount: 300.0, vignette_midpoint: f32::NAN, no_distortion: 7, ..Default::default() };
         e.clean_lens();
         assert_eq!((e.vignette_amount, e.vignette_midpoint, e.no_distortion, e.no_chromatic_aberration), (100.0, 0.0, 1, 0));
+    }
+
+    #[test]
+    fn detail_defaults_are_a_zeroed_edit() {
+        let e = Edit::default();
+        assert_eq!(e.detail(), DETAIL_DEFAULTS);
+        assert!(!e.detail().is_neutral(), "sharpening and colour noise reduction are on by default");
+        let off = Detail { amount: 0.0, color: 0.0, ..DETAIL_DEFAULTS };
+        let mut e = Edit::default();
+        e.set_detail(off);
+        assert!(e.detail().is_neutral() && !e.is_default());
+        e.set_detail(DETAIL_DEFAULTS);
+        assert!(e.is_default());
+    }
+
+    #[test]
+    fn clean_detail_repairs_damage() {
+        let mut e = Edit { sharpen_amount: 900.0, sharpen_radius: -9.0, noise_color: f32::NAN, noise_luminance: -50.0, ..Default::default() };
+        e.clean_detail();
+        let d = e.detail();
+        assert_eq!((d.amount, d.radius, d.color, d.luminance), (150.0, 0.5, 25.0, 0.0));
     }
 
     #[test]

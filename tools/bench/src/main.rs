@@ -8,6 +8,7 @@
 //!                                        each photo's fitted view next to the benchmark
 
 mod crop;
+mod detail;
 mod lens;
 mod vignette;
 mod wb;
@@ -44,6 +45,10 @@ fn main() {
         "lens" => lens::bench_lens(&files),
         "crop" => crop::bench_crop(&files),
         "wb" => wb::bench_wb(&files),
+        "detail" => detail::bench_detail(&files),
+        "iso" => detail::bench_iso(rest),
+        "partb" => detail::bench_partb(&files),
+        "noisescale" => detail::bench_noisescale(&files),
         "lensscan" => lens::lens_scan(rest),
         "lenstags" => lens::lens_tags(&files),
         "vignette" => lens::bench_vignette(&files),
@@ -713,7 +718,7 @@ fn bench_export(args: &[String]) {
             let _ = std::fs::remove_file(&path);
             let start = Instant::now();
             let window = export::window(size, &edit);
-            let mut renderer = TileRenderer::new(&gpu, window).unwrap();
+            let mut renderer = TileRenderer::new(&gpu, window, &edit).unwrap();
             let (tx, rx) = sync_channel(1);
             let raw = f.clone();
             let target = path.clone();

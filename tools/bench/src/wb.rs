@@ -46,7 +46,7 @@ impl Rig {
     /// The whole photo as an export renders it: width, height and BGR bytes.
     fn export(&mut self, edit: &Edit) -> (u32, u32, Vec<u8>) {
         let window = export::window(self.size, edit);
-        let mut renderer = TileRenderer::new(&self.gpu, window).unwrap();
+        let mut renderer = TileRenderer::new(&self.gpu, window, edit).unwrap();
         let mut bgr = Vec::new();
         while !renderer.done() {
             if let Some(strip) = renderer.step(&mut self.gpu, self.image.as_ref().unwrap(), edit).unwrap() {

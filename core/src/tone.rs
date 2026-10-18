@@ -326,6 +326,27 @@ fn bilinear(v: &[f32], sw: usize, sh: usize, i: usize, j: usize, factor: usize) 
 /// image size.
 pub const BASE_EDGE: f32 = 128.0;
 
+/// Clarity's base is computed on a copy about this many pixels on its long edge (the tone model's
+/// is 128): fine enough to follow the shapes of a scene's light, with a guided filter of
+/// `CLARITY_RADIUS` of the long edge and `CLARITY_EPS` (stops²; small, so strong edges stay put and
+/// the local contrast has no halos).
+pub const CLARITY_EDGE: f32 = 512.0;
+pub const CLARITY_RADIUS: f32 = 0.06;
+pub const CLARITY_EPS: f32 = 0.8;
+
+/// Clarity: the change in stops for a pixel at `x` (after [`global`]) whose edge-preserving base is
+/// `base`, for `c` from −1 to 1. The pixel's distance from its base is scaled, softly limited at 1.5
+/// stops so one bright speck doesn't swing; weighted toward the mid-tones, fading out in the deep
+/// shadows and toward white so neither clips. The weight changes slowly and the distance's own
+/// slope is at most 1, so tones never swap places (not in the photo, not as Exposure moves).
+/// The GPU twin is `clarityShift` in develop.hlsl.
+pub fn clarity_shift(x: f32, base: f32, c: f32) -> f32 {
+    let d = x - MIDDLE;
+    let weight = smoothstep(-10.0, -4.0, d) * (1.0 - smoothstep(1.0, 5.5, d));
+    let deviation = 2.0 * ((x - base) / 2.0).tanh();
+    c * if c > 0.0 { 1.3 } else { 0.55 } * weight * deviation
+}
+
 /// Develops a scene-linear image (linear sRGB primaries, 1.0 = the sensor's clipping point) to
 /// display-linear sRGB with the tone model: the reference the GPU must match.
 pub fn render(m: &Model, linear: &[[f32; 3]], w: usize, h: usize, edit: &Edit, camera_offset: f32) -> Vec<[f32; 3]> {
@@ -342,6 +363,13 @@ pub fn render(m: &Model, linear: &[[f32; 3]], w: usize, h: usize, edit: &Edit, c
     // shadows, Shadows lifts them further, and the photo can end up brighter.
     let (small, sw, sh) = small_copy(&xg, w, h, factor);
     let base = base_from_small(&small, sw, sh, &xg, w, h, factor, radius, m.base_eps);
+    // Clarity's base: a bigger small copy and a wider, stricter filter.
+    let clarity_base = (edit.clarity != 0.0).then(|| {
+        let factor = ((edge / CLARITY_EDGE).ceil() as usize).max(1);
+        let radius = ((edge * CLARITY_RADIUS / factor as f32).round() as usize).max(1);
+        let (small, sw, sh) = small_copy(&xg, w, h, factor);
+        base_from_small(&small, sw, sh, &xg, w, h, factor, radius, CLARITY_EPS)
+    });
     let as_shot: Vec<f32> = x.iter().map(|v| v - edit.exposure).collect();
     let (mut sorted, _, _) = small_copy(&as_shot, w, h, factor);
     sorted.sort_by(f32::total_cmp);
@@ -356,7 +384,10 @@ pub fn render(m: &Model, linear: &[[f32; 3]], w: usize, h: usize, edit: &Edit, c
         .iter()
         .enumerate()
         .map(|(k, p)| {
-            let out = xg[k] + local(m, xg[k], base[k], &s, &stats);
+            let mut out = xg[k] + local(m, xg[k], base[k], &s, &stats);
+            if let Some(b) = &clarity_base {
+                out += clarity_shift(xg[k], b[k], edit.clarity / 100.0);
+            }
             let wide = apply(&to_wide, p.map(|v| v * gain * (out - x[k]).exp2()));
             apply(&color::REC2020_TO_SRGB, tone_rgb(wide)).map(|v| v.clamp(0.0, 1.0))
         })
@@ -391,6 +422,36 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn clarity_shift_properties() {
+        // Nothing at 0 or at the base; weighted to the mid-tones; limited; never swaps tones.
+        assert_eq!(clarity_shift(-3.0, -2.0, 0.0), 0.0);
+        assert_eq!(clarity_shift(-3.0, -3.0, 1.0), 0.0);
+        assert!(clarity_shift(MIDDLE, MIDDLE - 1.0, 1.0) > 0.8);
+        assert!(clarity_shift(MIDDLE, MIDDLE - 1.0, -1.0) < -0.4);
+        assert_eq!(clarity_shift(-15.0, -17.0, 1.0), 0.0, "true black is left alone");
+        assert_eq!(clarity_shift(2.0, -1.0, 1.0), 0.0, "and so are the clipped tones");
+        // The shadows and the bright tones take part, at reduced strength.
+        let mid = clarity_shift(MIDDLE, MIDDLE - 1.0, 1.0);
+        let (shadow, bright) = (clarity_shift(-10.0, -11.0, 1.0), clarity_shift(-0.5, -1.5, 1.0));
+        assert!(shadow > 0.2 * mid && shadow < 0.9 * mid, "shadows: {shadow} against {mid}");
+        assert!(bright > 0.3 * mid && bright < 0.9 * mid, "bright tones: {bright} against {mid}");
+        assert!(clarity_shift(MIDDLE, MIDDLE - 40.0, 1.0) < 3.1, "one bright speck doesn't swing");
+        // Output is increasing in x for any base within reach (the guided filter's slope a is in 0..1).
+        for c in [-1.0f32, 1.0] {
+            for a in [0.0f32, 0.3, 1.0] {
+                let mut last = f32::MIN;
+                for i in 0..400 {
+                    let x = -14.0 + i as f32 * 0.04;
+                    let base = a * x - 0.5 * a; // base = a x + b
+                    let y = x + clarity_shift(x, base, c);
+                    assert!(y > last - 1e-6, "c {c}, a {a}: tones swap at x {x}");
+                    last = y;
+                }
+            }
+        }
+    }
     /// Lowering Exposure must never brighten the photo, whatever the other sliders: the
     /// adaptive terms react to the image's own brightness, so they mustn't outrun it.
     #[test]
@@ -404,13 +465,13 @@ mod tests {
                 [v, v * 0.9, v * 1.1]
             })
             .collect();
-        for (shadows, whites, highlights) in [(0.0, 0.0, 0.0), (50.0, 0.0, 0.0), (100.0, 0.0, 0.0), (100.0, 100.0, -100.0), (100.0, 100.0, 100.0), (-100.0, -100.0, 100.0), (0.0, 100.0, 0.0)] {
+        for (clarity, shadows, whites, highlights) in [(0.0, 0.0, 0.0, 0.0), (0.0, 50.0, 0.0, 0.0), (0.0, 100.0, 0.0, 0.0), (0.0, 100.0, 100.0, -100.0), (0.0, 100.0, 100.0, 100.0), (0.0, -100.0, -100.0, 100.0), (0.0, 0.0, 100.0, 0.0), (100.0, 0.0, 0.0, 0.0), (-100.0, 0.0, 0.0, 0.0), (100.0, 100.0, 100.0, 100.0), (-100.0, 100.0, -100.0, 100.0), (100.0, -100.0, 100.0, -100.0)] {
             let mut last = f32::MAX;
             for step in 0..=80 {
-                let edit = Edit { exposure: 3.0 - step as f32 * 0.1, shadows, whites, highlights, ..Default::default() };
+                let edit = Edit { exposure: 3.0 - step as f32 * 0.1, shadows, whites, highlights, clarity, ..Default::default() };
                 let out = render(&MODEL, &img, w, h, &edit, 0.0);
                 let mean = out.iter().map(|p| luminance(*p)).sum::<f32>() / out.len() as f32;
-                assert!(mean <= last + 1e-4, "exposure {} brightened the photo (shadows {shadows}, whites {whites}): {last} → {mean}", edit.exposure);
+                assert!(mean <= last + 1e-4, "exposure {} brightened the photo (clarity {clarity}, shadows {shadows}, whites {whites}): {last} → {mean}", edit.exposure);
                 last = mean;
             }
         }

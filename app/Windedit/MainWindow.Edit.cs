@@ -15,6 +15,8 @@ public sealed partial class MainWindow
     sealed class Adjustment
     {
         public required string Name;
+        /// <summary>The slider's accessible name when it differs from the label (two sliders are both called Detail).</summary>
+        public string? AutomationName;
         public required double Min, Max, Step;
         /// <summary>What double-clicking resets it to.</summary>
         public double Default;
@@ -97,8 +99,27 @@ public sealed partial class MainWindow
         AddPercent("Blacks", e => e.Blacks, (e, v) => e with { Blacks = v });
 
         Header("Presence");
+        AddPercent("Texture", e => e.Texture, (e, v) => e with { Texture = v });
+        AddPercent("Clarity", e => e.Clarity, (e, v) => e with { Clarity = v });
         AddPercent("Vibrance", e => e.Vibrance, (e, v) => e with { Vibrance = v });
         AddPercent("Saturation", e => e.Saturation, (e, v) => e with { Saturation = v });
+
+        Header("Detail");
+        group.Children.Add(new TextBlock
+        {
+            Text = "Zoom to 100% (Z) to judge sharpening and noise reduction",
+            Opacity = 0.55, FontSize = 12, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(4, 0, 0, 4),
+        });
+        SubHeader("Sharpening");
+        Add(DetailSlider("Amount", 0, 150, 1, 40, e => e.SharpenAmount, (e, v) => e with { SharpenAmount = v }, "{0:0}"));
+        Add(DetailSlider("Radius", 0.5, 3.0, 0.1, 1.0, e => e.SharpenRadius, (e, v) => e with { SharpenRadius = v }, "{0:0.0}"));
+        Add(DetailSlider("Detail", 0, 100, 1, 25, e => e.SharpenDetail, (e, v) => e with { SharpenDetail = v }, "{0:0}"));
+        Add(DetailSlider("Masking", 0, 100, 1, 0, e => e.SharpenMasking, (e, v) => e with { SharpenMasking = v }, "{0:0}"));
+        SubHeader("Noise reduction");
+        Add(DetailSlider("Luminance", 0, 100, 1, 0, e => e.NoiseLuminance, (e, v) => e with { NoiseLuminance = v }, "{0:0}"));
+        Add(DetailSlider("Detail", 0, 100, 1, 50, e => e.NoiseLuminanceDetail, (e, v) => e with { NoiseLuminanceDetail = v }, "{0:0}", "Luminance detail"));
+        Add(DetailSlider("Color", 0, 100, 1, 25, e => e.NoiseColor, (e, v) => e with { NoiseColor = v }, "{0:0}"));
+        Add(DetailSlider("Detail", 0, 100, 1, 50, e => e.NoiseColorDetail, (e, v) => e with { NoiseColorDetail = v }, "{0:0}", "Color detail"));
 
         Header("Lens");
         Add(new Adjustment
@@ -220,6 +241,24 @@ public sealed partial class MainWindow
         Set(aberrationSwitch, info?.ChromaticAberration, "chromatic aberration", "Correct the colour fringing recorded in the raw");
     }
 
+    /// <summary>A small title inside a group, for the sliders under it.</summary>
+    void SubHeader(string text) => group.Children.Add(new TextBlock
+    {
+        Text = text, Opacity = 0.75, FontSize = 12, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+        Margin = new Thickness(4, 8, 0, 0),
+    });
+
+    /// <summary>A detail slider. The edit holds its value as an offset from <paramref name="def"/>, so
+    /// a zeroed edit is the default; the slider shows the value itself.</summary>
+    static Adjustment DetailSlider(string name, double min, double max, double step, double def,
+        Func<Engine.Edit, float> offset, Func<Engine.Edit, float, Engine.Edit> set, string format, string? automationName = null) => new()
+    {
+        Name = name, Min = min, Max = max, Step = step, Default = def, AutomationName = automationName,
+        Get = e => def + offset(e),
+        Set = (e, v) => set(e, (float)(v - def)),
+        Format = v => string.Format(System.Globalization.CultureInfo.InvariantCulture, format, v),
+    };
+
     void AddPercent(string name, Func<Engine.Edit, float> get, Func<Engine.Edit, float, Engine.Edit> set) => Add(new Adjustment
     {
         Name = name, Min = -100, Max = 100, Step = 1,
@@ -239,7 +278,7 @@ public sealed partial class MainWindow
             Minimum = a.Min, Maximum = a.Max, StepFrequency = a.Step, SmallChange = a.Step,
             LargeChange = (a.Max - a.Min) / 20, IsThumbToolTipEnabled = false,
         };
-        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(a.Slider, a.Name);
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(a.Slider, a.AutomationName ?? a.Name);
         a.Slider.ValueChanged += (_, e) => Slider_ValueChanged(a, e);
         a.Slider.DoubleTapped += (_, _) => Reset(a);
         // The end of a drag (or of a key press on the slider) commits what it changed.

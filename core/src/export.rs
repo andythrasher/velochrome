@@ -25,6 +25,15 @@ use crate::pipeline::{Edit, Image, Layer, Target, Zoom, render};
 /// that the target and the readback buffer are 16 MB each.
 pub const TILE: u32 = 2048;
 
+/// A straightened photo's tiles cover a turned square, so the detail pass would need a bigger region
+/// around each; they are smaller to keep that within the memory the pass has.
+const TURNED_TILE: u32 = 1024;
+
+/// The tile size for an edit.
+pub fn tile_size(edit: &Edit) -> u32 {
+    if edit.angle != 0.0 && !edit.detail().is_neutral() { TURNED_TILE } else { TILE }
+}
+
 pub const DEFAULT_QUALITY: u8 = 92;
 
 /// What to export, besides the adjustments (which carry the crop, rotation and angle) and the photo.
@@ -77,6 +86,7 @@ pub struct TileRenderer {
     readback: ID3D12Resource,
     footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     window: Window,
+    tile: u32,
     /// The next tile, in tiles from the window's top-left.
     col: u32,
     row: u32,
@@ -87,23 +97,24 @@ pub struct TileRenderer {
 }
 
 impl TileRenderer {
-    pub fn new(gpu: &Gpu, window: Window) -> Result<TileRenderer> {
-        let target = Target::new(gpu, TILE.min(window.width), TILE.min(window.height))?;
+    pub fn new(gpu: &Gpu, window: Window, edit: &Edit) -> Result<TileRenderer> {
+        let tile = tile_size(edit);
+        let target = Target::new(gpu, tile.min(window.width), tile.min(window.height))?;
         let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
         let mut total = 0u64;
         unsafe {
             gpu.device.GetCopyableFootprints(&target.texture.GetDesc(), 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total))
         };
         let readback = gpu.buffer(total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST)?;
-        Ok(TileRenderer { target, readback, footprint, window, col: 0, row: 0, strip: Vec::new(), render_ms: 0.0, readback_ms: 0.0 })
+        Ok(TileRenderer { target, readback, footprint, window, tile, col: 0, row: 0, strip: Vec::new(), render_ms: 0.0, readback_ms: 0.0 })
     }
 
     pub fn tiles(&self) -> u32 {
-        self.window.width.div_ceil(TILE) * self.window.height.div_ceil(TILE)
+        self.window.width.div_ceil(self.tile) * self.window.height.div_ceil(self.tile)
     }
 
     pub fn tiles_done(&self) -> u32 {
-        self.row * self.window.width.div_ceil(TILE) + self.col
+        self.row * self.window.width.div_ceil(self.tile) + self.col
     }
 
     pub fn done(&self) -> bool {
@@ -112,10 +123,13 @@ impl TileRenderer {
 
     /// Develops the next tile. Returns the band of rows it completed, if it was the band's last.
     pub fn step(&mut self, gpu: &mut Gpu, image: &Image, edit: &Edit) -> Result<Option<Strip>> {
+        if edit.detail().luminance > 0.0 || edit.detail().color > 0.0 {
+            image.ensure_noise(gpu)?;
+        }
         let w = self.window;
-        let (left, top) = (self.col * TILE, self.row * TILE);
-        let (tile_w, tile_h) = (TILE.min(w.width - left), TILE.min(w.height - top));
-        let band_rows = TILE.min(w.height - top);
+        let (tile, (left, top)) = (self.tile, (self.col * self.tile, self.row * self.tile));
+        let (tile_w, tile_h) = (tile.min(w.width - left), tile.min(w.height - top));
+        let band_rows = tile.min(w.height - top);
         if self.strip.is_empty() {
             self.strip = vec![0; w.width as usize * band_rows as usize * 3];
         }
@@ -150,7 +164,7 @@ impl TileRenderer {
         self.readback_ms += ts[c as usize] - ts[b as usize] + start.elapsed().as_secs_f64() * 1000.0;
 
         self.col += 1;
-        if self.col * TILE < w.width {
+        if self.col * tile < w.width {
             return Ok(None);
         }
         self.col = 0;

@@ -185,6 +185,7 @@ pub extern "C" fn we_set_edit(handle: *const Handle, index: i32, edit: *const Ed
         let mut edit = unsafe { *edit };
         crate::geometry::clean(&mut edit); // a zeroed Edit from a wrapper means no crop
         edit.clean_lens();
+        edit.clean_detail();
         if e.set_edit(index as usize, edit, commit != 0) { Ok(0) } else { Err(format!("there's no photo {index}")) }
     })
 }

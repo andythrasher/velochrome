@@ -27,12 +27,17 @@ pub struct Kernels {
     pub tone_small: Kernel,
     pub tone_guide: Kernel,
     pub tone_stats: Kernel,
+    pub atrous_blur: Kernel,
+    pub atrous_v: Kernel,
+    pub atrous_shrink: Kernel,
+    pub sharp_blur: Kernel,
+    pub sharpen: Kernel,
 }
 
 /// How many timestamps one submission can record.
 pub const MAX_TIMESTAMPS: u32 = 64;
 /// Size of the shader-visible descriptor heap.
-const DESCRIPTORS: u32 = 256;
+const DESCRIPTORS: u32 = 4096;
 
 pub struct Gpu {
     pub factory: IDXGIFactory6,
@@ -62,6 +67,12 @@ pub struct Gpu {
     /// What the tone pre-pass works in. Small and fixed in size whatever the photo, so they are
     /// made once here.
     pub tone: ToneResources,
+    /// The same for Clarity's base (a bigger copy, a wider filter), and the inputs it was last
+    /// computed from, so dragging Clarity itself or an unrelated slider doesn't redo it.
+    pub clarity: ToneResources,
+    pub clarity_key: std::cell::Cell<Option<(u64, [u32; 10])>>,
+    /// The detail pass (detail.rs): its memory and what its texture holds.
+    pub detail: std::cell::RefCell<crate::detail::DetailState>,
 }
 
 /// Room for the tone parameters.
@@ -86,8 +97,7 @@ pub struct ToneResources {
 }
 
 impl ToneResources {
-    fn new(device: &ID3D12Device) -> Result<ToneResources> {
-        let edge = BASE_EDGE as u32;
+    fn new(device: &ID3D12Device, edge: u32) -> Result<ToneResources> {
         let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         Ok(ToneResources {
             small: new_texture(device, edge, edge, 1, DXGI_FORMAT_R32_FLOAT, uav)?,
@@ -166,6 +176,11 @@ impl Gpu {
                 tone_small: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/tonesmall.dxil")))?,
                 tone_guide: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/toneguide.dxil")))?,
                 tone_stats: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/tonestats.dxil")))?,
+                atrous_blur: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/atrousblur.dxil")))?,
+                atrous_v: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/atrousv.dxil")))?,
+                atrous_shrink: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/atroushrink.dxil")))?,
+                sharp_blur: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/sharpblur.dxil")))?,
+                sharpen: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/sharpen.dxil")))?,
             };
 
             let query_readback =
@@ -173,7 +188,8 @@ impl Gpu {
             let params = new_buffer(&device, PARAMS_BYTES, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)?;
             let mut params_ptr = std::ptr::null_mut();
             params.Map(0, Some(&D3D12_RANGE::default()), Some(&mut params_ptr))?;
-            let tone = ToneResources::new(&device)?;
+            let tone = ToneResources::new(&device, BASE_EDGE as u32)?;
+            let clarity = ToneResources::new(&device, crate::tone::CLARITY_EDGE as u32)?;
             Ok(Gpu {
                 factory,
                 adapter_name,
@@ -195,6 +211,9 @@ impl Gpu {
                 params,
                 params_ptr: params_ptr as *mut u8,
                 tone,
+                clarity,
+                clarity_key: Default::default(),
+                detail: Default::default(),
             })
         }
     }
@@ -338,6 +357,29 @@ impl Gpu {
             },
         };
         unsafe { self.device.CreateShaderResourceView(&self.params, Some(&desc), self.cpu_handle(slot)) };
+    }
+
+    /// A descriptor that points at nothing, for a table slot a kernel declares but doesn't read.
+    pub fn srv_null(&self, slot: u32) {
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, ..Default::default() },
+            },
+        };
+        unsafe { self.device.CreateShaderResourceView(None, Some(&desc), self.cpu_handle(slot)) };
+    }
+
+    /// Like `srv_null`, for an output.
+    pub fn uav_null(&self, slot: u32) {
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: 0 } },
+        };
+        unsafe { self.device.CreateUnorderedAccessView(None, None, Some(&desc), self.cpu_handle(slot)) };
     }
 
     pub fn srv_buffer(&self, resource: &ID3D12Resource, format: DXGI_FORMAT, elements: u32, slot: u32) {

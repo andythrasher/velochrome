@@ -28,8 +28,9 @@ const SLOT_DEMOSAIC: u32 = 0; // raw data, then pyramid level 0
 const fn slot_downsample(level: u32) -> u32 {
     2 * level // level - 1, then level
 }
-const SLOT_DEVELOP: u32 = 100; // the whole pyramid, the tone parameters, the base coefficients, the statistics, then the output
+const SLOT_DEVELOP: u32 = 100; // the whole pyramid, the tone parameters, the base coefficients, the statistics, the detail texture, then the output
 const SLOT_TONE: u32 = 200; // the tone pre-pass: a pyramid level, the parameters, then six outputs
+const SLOT_CLARITY: u32 = 215; // the same for Clarity's base
 
 /// The GPU memory photos are opened into, kept between photos. Allocating it is slow (about
 /// 50 ms on a Lunar Lake laptop, and the GPU's first pass over fresh memory is slower still),
@@ -146,7 +147,14 @@ pub struct Image {
     pub lens: Option<LensCorrection>,
     /// How many stops this camera's raws are rendered brighter or darker (`tone::camera_offset`).
     pub camera_offset: f32,
+    /// Tells this photo's `Image` from the next one opened into the same memory (the detail
+    /// pass's cache key).
+    pub id: u64,
+    /// The photo's noise for the noise reduction, measured on first need (`ensure_noise`).
+    pub noise: std::cell::Cell<Option<crate::detail::Noise>>,
 }
+
+static NEXT_IMAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpenTimings {
@@ -185,7 +193,14 @@ struct DownsampleConstants {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct DevelopConstants {
-    rows: [[f32; 4]; 3],
+    /// Camera RGB → linear Rec.2020, a row each, with the detail texture's rectangle (left and
+    /// top, then width and height, 16 bits each) and level + 1 (0 for none) in the spare words.
+    row0: [f32; 3],
+    detail_origin: u32,
+    row1: [f32; 3],
+    detail_size: u32,
+    row2: [f32; 3],
+    detail_level: u32,
     lum: [f32; 4],
     origin: [f32; 2],
     step_x: [f32; 2],
@@ -241,6 +256,7 @@ struct GuideConstants {
     small: [u32; 2],
     radius: u32,
     pass: u32,
+    eps: f32,
 }
 
 impl Image {
@@ -351,6 +367,8 @@ impl Image {
             orientation: frame.orientation,
             lens: frame.lens,
             camera_offset: tone::camera_offset(&frame.make),
+            id: NEXT_IMAGE.fetch_add(1, Ordering::Relaxed),
+            noise: std::cell::Cell::new(None),
         };
         Ok((image, timings))
     }
@@ -386,8 +404,16 @@ pub fn warm_up(gpu: &mut Gpu) -> Result<f64> {
     let (image, _) = Image::open(gpu, &mut ImageMemory::new(), &frame)?;
     let target = Target::new(gpu, SIZE, SIZE)?;
     gpu.begin()?;
+    // Every detail kernel, on memory that is freed after (the real allocation is made when
+    // a view first needs it).
+    image.noise.set(Some([0.01; 3]));
     render_image(gpu, &image, &Edit::default(), Zoom::Fit, &target);
     gpu.submit()?;
+    {
+        let mut detail = gpu.detail.borrow_mut();
+        detail.release();
+        detail.runs = 0;
+    }
     Ok(start.elapsed().as_secs_f64() * 1000.0)
 }
 
@@ -481,7 +507,7 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
         near_white: tone::NEAR_WHITE,
     };
     gpu.set_params(&params);
-    let (rows, lum, mode, base) = match layer {
+    let (rows, lum, mode, base, clarity) = match layer {
         Layer::Raw(image) => {
             // White balance change, exposure, the camera's offset and the conversion to linear
             // Rec.2020 in one matrix: camera RGB (as-shot white balance) → scene-referred light.
@@ -494,16 +520,30 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
                 gain * wb[c] * (0.2126 * to_srgb[0][c] + 0.7152 * to_srgb[1][c] + 0.0722 * to_srgb[2][c])
             });
             let base = tone_prepass(gpu, image, [lum[0], lum[1], lum[2], 0.0], edit);
-            (rows, [lum[0], lum[1], lum[2], 0.0], MODE_DEVELOP, base)
+            let clarity = (edit.clarity != 0.0).then(|| clarity_prepass(gpu, image, [lum[0], lum[1], lum[2], 0.0], edit));
+            (rows, [lum[0], lum[1], lum[2], 0.0], MODE_DEVELOP, base, clarity)
         }
-        Layer::Preview(_) => ([[0.0; 4]; 3], [0.0; 4], MODE_PREVIEW, ([1.0; 2], [1.0; 2])),
+        Layer::Preview(_) => ([[0.0; 4]; 3], [0.0; 4], MODE_PREVIEW, ([1.0; 2], [1.0; 2]), None),
     };
     let frame = geometry::frame_size(photo_size, edit.rotation);
     let turns = geometry::turns(layer.orientation(), edit.rotation);
     let view = geometry::view_map(layer.texture_size(), turns, frame, edit.angle, edit.crop, zoom, (target.width, target.height));
+    // The detail pass (noise reduction, sharpening) writes a texture the develop pass samples in
+    // place of the pyramid; None leaves the pyramid.
+    let detail = match layer {
+        Layer::Raw(image) => crate::detail::prepare(gpu, image, edit, &view, (target.width, target.height), zoom),
+        Layer::Preview(_) => None,
+    };
+    let (detail_origin, detail_size, detail_level) = detail.as_ref().map_or((0, 0, 0), |d| d.constants());
     let constants = DevelopConstants {
-        rows,
-        lum,
+        row0: [rows[0][0], rows[0][1], rows[0][2]],
+        detail_origin,
+        row1: [rows[1][0], rows[1][1], rows[1][2]],
+        detail_size,
+        row2: [rows[2][0], rows[2][1], rows[2][2]],
+        detail_level,
+        // lum.w carries Clarity (−1..1; 0 skips it).
+        lum: [lum[0], lum[1], lum[2], if clarity.is_some() { edit.clarity / 100.0 } else { 0.0 }],
         origin: view.origin,
         step_x: view.step_x,
         step_y: view.step_y,
@@ -518,7 +558,12 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
         lens: lens_constants(layer, edit),
         clip: view.clip,
         canvas: canvas_color(),
-        vignette: vignette_constants(layer, edit),
+        // vignette.zw carries the scale from image coordinates to the Clarity base's pixels.
+        vignette: {
+            let v = vignette_constants(layer, edit);
+            let s = clarity.unwrap_or([0.0; 2]);
+            [v[0], v[1], s[0], s[1]]
+        },
     };
     match layer {
         Layer::Raw(image) => gpu.srv_texture(&image.linear, LINEAR_FORMAT, 0, image.levels, SLOT_DEVELOP),
@@ -527,8 +572,20 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
     gpu.srv_params::<ToneParams>(SLOT_DEVELOP + 1);
     gpu.srv_texture(&gpu.tone.coefficients, DXGI_FORMAT_R32G32_FLOAT, 0, 1, SLOT_DEVELOP + 2);
     gpu.srv_buffer(&gpu.tone.stats, DXGI_FORMAT_R32_FLOAT, 2, SLOT_DEVELOP + 3);
-    gpu.uav_texture(&target.texture, TARGET_FORMAT, 0, SLOT_DEVELOP + 4);
-    let reads = [&gpu.tone.coefficients, &gpu.tone.stats];
+    match &detail {
+        Some(d) => gpu.srv_texture(&d.texture, LINEAR_FORMAT, 0, 1, SLOT_DEVELOP + 4),
+        None => gpu.srv_null(SLOT_DEVELOP + 4),
+    }
+    if clarity.is_some() {
+        gpu.srv_texture(&gpu.clarity.coefficients, DXGI_FORMAT_R32G32_FLOAT, 0, 1, SLOT_DEVELOP + 5);
+    } else {
+        gpu.srv_null(SLOT_DEVELOP + 5);
+    }
+    gpu.uav_texture(&target.texture, TARGET_FORMAT, 0, SLOT_DEVELOP + 6);
+    let mut reads = vec![&gpu.tone.coefficients, &gpu.tone.stats];
+    if clarity.is_some() {
+        reads.push(&gpu.clarity.coefficients);
+    }
     let (uav, srv) = (D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     if mode == MODE_DEVELOP {
         reads.iter().for_each(|r| gpu.transition(r, 0, uav, srv));
@@ -539,33 +596,79 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
     }
 }
 
+/// What a guided-filter base is made of: the copy's long edge, the filter's radius (a fraction of
+/// the photo's long edge) and epsilon, and the descriptor slots it uses.
+struct GuidedBase {
+    edge: f32,
+    radius_fraction: f32,
+    eps: f32,
+    /// Also take the percentiles (the tone model's base does; Clarity's doesn't).
+    stats: bool,
+    slot: u32,
+}
+
 /// Reduces the photo to what the tone model needs of the whole image: a small copy of its tones,
 /// the guided filter's coefficients on it (the base layer behind Highlights and Shadows) and two
 /// percentiles. Reads a coarse pyramid level, never the full-resolution image; the copy is in
 /// the texture's own orientation, like the image. Returns what the develop pass needs to find
 /// the coefficients: image coordinates → small-copy pixels, and the small copy's size.
 fn tone_prepass(gpu: &Gpu, image: &Image, lum: [f32; 4], edit: &Edit) -> ([f32; 2], [f32; 2]) {
+    let g = GuidedBase { edge: tone::BASE_EDGE, radius_fraction: tone::MODEL.base_radius, eps: tone::MODEL.base_eps, stats: true, slot: SLOT_TONE };
+    guided_base(gpu, image, &gpu.tone, &g, lum, edit)
+}
+
+/// Clarity's base: the same steps at a 512-pixel copy with its own filter. Skipped when what it
+/// depends on (the photo, Exposure, Contrast, Blacks, the vignetting and the lens switches) hasn't
+/// changed since it was last made. Returns image coordinates → copy pixels, for the develop pass.
+fn clarity_prepass(gpu: &Gpu, image: &Image, lum: [f32; 4], edit: &Edit) -> [f32; 2] {
+    let edge = image.width.max(image.height) as f32;
+    let factor = (edge / tone::CLARITY_EDGE).ceil().max(1.0);
+    let scale = [image.width as f32 / factor, image.height as f32 / factor];
+    let key = (
+        image.id,
+        [
+            edit.exposure.to_bits(),
+            edit.contrast.to_bits(),
+            edit.blacks.to_bits(),
+            edit.vignette_amount.to_bits(),
+            edit.vignette_midpoint.to_bits(),
+            edit.no_distortion,
+            edit.no_chromatic_aberration,
+            edit.custom_white_balance,
+            edit.temperature.to_bits(),
+            edit.tint.to_bits(),
+        ],
+    );
+    if gpu.clarity_key.get() != Some(key) {
+        let g = GuidedBase { edge: tone::CLARITY_EDGE, radius_fraction: tone::CLARITY_RADIUS, eps: tone::CLARITY_EPS, stats: false, slot: SLOT_CLARITY };
+        guided_base(gpu, image, &gpu.clarity, &g, lum, edit);
+        gpu.clarity_key.set(Some(key));
+    }
+    scale
+}
+
+fn guided_base(gpu: &Gpu, image: &Image, t: &crate::gpu::ToneResources, g: &GuidedBase, lum: [f32; 4], edit: &Edit) -> ([f32; 2], [f32; 2]) {
     let (width, height) = (image.width, image.height);
     let edge = width.max(height);
-    // A small copy at most BASE_EDGE across, each pixel a block of `factor` photo pixels, and
-    // the pyramid level with the smallest long edge that is still 256 or more to read it from.
-    let factor = ((edge as f32 / tone::BASE_EDGE).ceil() as u32).max(1);
+    // A small copy at most `g.edge` across, each pixel a block of `factor` photo pixels, and the
+    // pyramid level with the smallest long edge that is still twice that to read it from.
+    let factor = ((edge as f32 / g.edge).ceil() as u32).max(1);
     let small = [width.div_ceil(factor), height.div_ceil(factor)];
-    let radius = ((edge as f32 * tone::MODEL.base_radius / factor as f32).round() as u32).max(1);
+    let radius = ((edge as f32 * g.radius_fraction / factor as f32).round() as u32).max(1);
     let mut level = 0;
-    while level + 1 < image.levels && edge >> (level + 1) >= 256 {
+    while level + 1 < image.levels && edge >> (level + 1) >= 2 * g.edge as u32 {
         level += 1;
     }
 
-    let t = &gpu.tone;
-    gpu.srv_texture(&image.linear, LINEAR_FORMAT, level, 1, SLOT_TONE);
-    gpu.srv_params::<ToneParams>(SLOT_TONE + 1);
-    gpu.uav_texture(&t.small, DXGI_FORMAT_R32_FLOAT, 0, SLOT_TONE + 2);
-    gpu.uav_texture(&t.scratch_a, DXGI_FORMAT_R32_FLOAT, 0, SLOT_TONE + 3);
-    gpu.uav_texture(&t.scratch_b, DXGI_FORMAT_R32_FLOAT, 0, SLOT_TONE + 4);
-    gpu.uav_texture(&t.coefficients, DXGI_FORMAT_R32G32_FLOAT, 0, SLOT_TONE + 5);
-    gpu.uav_buffer(&t.stats, DXGI_FORMAT_R32_FLOAT, 2, SLOT_TONE + 6);
-    gpu.uav_texture(&t.scene, DXGI_FORMAT_R32_FLOAT, 0, SLOT_TONE + 7);
+    let slot = g.slot;
+    gpu.srv_texture(&image.linear, LINEAR_FORMAT, level, 1, slot);
+    gpu.srv_params::<ToneParams>(slot + 1);
+    gpu.uav_texture(&t.small, DXGI_FORMAT_R32_FLOAT, 0, slot + 2);
+    gpu.uav_texture(&t.scratch_a, DXGI_FORMAT_R32_FLOAT, 0, slot + 3);
+    gpu.uav_texture(&t.scratch_b, DXGI_FORMAT_R32_FLOAT, 0, slot + 4);
+    gpu.uav_texture(&t.coefficients, DXGI_FORMAT_R32G32_FLOAT, 0, slot + 5);
+    gpu.uav_buffer(&t.stats, DXGI_FORMAT_R32_FLOAT, 2, slot + 6);
+    gpu.uav_texture(&t.scene, DXGI_FORMAT_R32_FLOAT, 0, slot + 7);
 
     let lens = lens_constants(Layer::Raw(image), edit);
     let constants = SmallCopyConstants {
@@ -578,14 +681,16 @@ fn tone_prepass(gpu: &Gpu, image: &Image, lum: [f32; 4], edit: &Edit) -> ([f32; 
         factor: factor as f32,
         exposure: edit.exposure,
     };
-    gpu.dispatch(&gpu.kernels.tone_small, &constants, SLOT_TONE, (small[0], small[1]));
+    gpu.dispatch(&gpu.kernels.tone_small, &constants, slot, (small[0], small[1]));
     gpu.uav_barrier();
     for pass in 0..4 {
-        gpu.dispatch(&gpu.kernels.tone_guide, &GuideConstants { small, radius, pass }, SLOT_TONE, (small[0], small[1]));
+        gpu.dispatch(&gpu.kernels.tone_guide, &GuideConstants { small, radius, pass, eps: g.eps }, slot, (small[0], small[1]));
         gpu.uav_barrier();
     }
-    gpu.dispatch_groups(&gpu.kernels.tone_stats, &small, SLOT_TONE, (1, 1));
-    gpu.uav_barrier();
+    if g.stats {
+        gpu.dispatch_groups(&gpu.kernels.tone_stats, &small, slot, (1, 1));
+        gpu.uav_barrier();
+    }
     ([width as f32 / factor as f32, height as f32 / factor as f32], [small[0] as f32, small[1] as f32])
 }
 
@@ -777,6 +882,62 @@ pub fn read_tone_maps(gpu: &mut Gpu, image: &Image) -> Result<ToneMaps> {
         out
     };
     Ok(ToneMaps { small, coefficients: coefficients.as_chunks::<2>().0.to_vec(), stats })
+}
+
+/// Half-precision float to single.
+pub fn f16_to_f32(h: u16) -> f32 {
+    let (sign, exp, frac) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as u32, (h & 0x3ff) as u32);
+    let bits = match (exp, frac) {
+        (0, 0) => sign << 31,
+        (0, f) => {
+            // Subnormal: normalise.
+            let shift = f.leading_zeros() - 21;
+            (sign << 31) | ((113 - shift) << 23) | (((f << shift) & 0x3ff) << 13)
+        }
+        (0x1f, f) => (sign << 31) | (0xff << 23) | (f << 13),
+        (e, f) => (sign << 31) | ((e + 112) << 23) | (f << 13),
+    };
+    f32::from_bits(bits)
+}
+
+/// A rectangle (x, y, width, height) of one mip level of the developed image, copied back as
+/// RGBA. For measuring the photo (the noise estimate, the benchmark): it waits for the GPU.
+pub fn read_rgba16f(gpu: &mut Gpu, texture: &ID3D12Resource, mip: u32, rect: (u32, u32, u32, u32)) -> Result<Vec<[f32; 4]>> {
+    let (x, y, w, h) = rect;
+    unsafe {
+        let pitch = (w * 8).div_ceil(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+        let readback = gpu.buffer(pitch as u64 * h as u64, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST)?;
+        let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 0,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: LINEAR_FORMAT, Width: w, Height: h, Depth: 1, RowPitch: pitch },
+        };
+        gpu.begin()?;
+        let (read, copy) = (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        gpu.transition(texture, mip, read, copy);
+        let dst = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(&readback),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+        };
+        let src = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(texture),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: mip },
+        };
+        let region = D3D12_BOX { left: x, top: y, front: 0, right: x + w, bottom: y + h, back: 1 };
+        gpu.list.CopyTextureRegion(&dst, 0, 0, 0, &src, Some(&region));
+        gpu.transition(texture, mip, copy, read);
+        gpu.submit()?;
+        let mut ptr = std::ptr::null_mut();
+        readback.Map(0, None, Some(&mut ptr))?;
+        let mut out = Vec::with_capacity((w * h) as usize);
+        for row in 0..h as usize {
+            let line = std::slice::from_raw_parts((ptr as *const u16).byte_add(row * pitch as usize), w as usize * 4);
+            out.extend(line.as_chunks::<4>().0.iter().map(|p| p.map(f16_to_f32)));
+        }
+        readback.Unmap(0, Some(&D3D12_RANGE::default()));
+        Ok(out)
+    }
 }
 
 /// The top-left `w` × `h` of a float texture with `channels` floats per pixel, tightly packed.

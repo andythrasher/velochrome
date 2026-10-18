@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SHADERS: &[&str] = &["demosaic", "downsample", "develop", "tonesmall", "toneguide", "tonestats"];
+const SHADERS: &[&str] = &["demosaic", "downsample", "develop", "tonesmall", "toneguide", "tonestats", "atrousblur", "atrousv", "atroushrink", "sharpblur", "sharpen"];
 
 fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -13,6 +13,7 @@ fn main() {
     println!("cargo:rerun-if-changed=shaders/common.hlsli");
     println!("cargo:rerun-if-changed=shaders/tone.hlsli");
     println!("cargo:rerun-if-changed=shaders/lens.hlsli");
+    println!("cargo:rerun-if-changed=shaders/detail.hlsli");
     for name in SHADERS {
         let src = format!("shaders/{name}.hlsl");
         println!("cargo:rerun-if-changed={src}");

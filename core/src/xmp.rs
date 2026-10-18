@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use crate::develop::Edit;
+use crate::develop::{DETAIL_DEFAULTS, Detail, Edit};
 use crate::geometry;
 
 pub const NS_RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
@@ -80,8 +80,18 @@ pub fn parse(text: &str) -> Option<Metadata> {
     // Written as 0 when off; anything else (or nothing) leaves the correction on.
     e.no_distortion = (number(ROTATION + 3) == Some(0.0)) as u32;
     e.no_chromatic_aberration = (number(ROTATION + 4) == Some(0.0)) as u32;
+    // The detail sliders are written as they read (Amount 40 by default and so on); missing is the default.
+    let mut detail = DETAIL_DEFAULTS;
+    for (i, field) in detail_fields_mut(&mut detail).into_iter().enumerate() {
+        if let Some(v) = number(DETAIL + i) {
+            *field = v;
+        }
+    }
+    e.set_detail(detail);
+    e.clarity = number(DETAIL + 9).unwrap_or(0.0);
     geometry::clean(e);
     e.clean_lens();
+    e.clean_detail();
     Some(meta)
 }
 
@@ -175,7 +185,7 @@ const PICK: usize = 2;
 /// (namespace, the prefix to declare if the file has none for it, local name)
 const FIRST_EDIT: usize = 3;
 /// (namespace, the prefix to declare if the file has none for it, local name)
-const PROPS: [(&str, &str, &str); 23] = [
+const PROPS: [(&str, &str, &str); 33] = [
     (NS_XMP, "xmp", "Rating"),
     (NS_XMP, "xmp", "Label"),
     (NS_WINDEDIT, "windedit", "Pick"),
@@ -199,6 +209,16 @@ const PROPS: [(&str, &str, &str); 23] = [
     (NS_WINDEDIT, "windedit", "VignetteMidpoint"),
     (NS_WINDEDIT, "windedit", "LensDistortion"),
     (NS_WINDEDIT, "windedit", "LensChromaticAberration"),
+    (NS_WINDEDIT, "windedit", "SharpenAmount"),
+    (NS_WINDEDIT, "windedit", "SharpenRadius"),
+    (NS_WINDEDIT, "windedit", "SharpenDetail"),
+    (NS_WINDEDIT, "windedit", "SharpenMasking"),
+    (NS_WINDEDIT, "windedit", "NoiseLuminance"),
+    (NS_WINDEDIT, "windedit", "NoiseLuminanceDetail"),
+    (NS_WINDEDIT, "windedit", "NoiseColor"),
+    (NS_WINDEDIT, "windedit", "NoiseColorDetail"),
+    (NS_WINDEDIT, "windedit", "Texture"),
+    (NS_WINDEDIT, "windedit", "Clarity"),
 ];
 
 /// The edit's fields, in PROPS order from FIRST_EDIT.
@@ -293,7 +313,32 @@ fn values(meta: &Metadata, keep_zero_rating: bool) -> Vec<Option<String>> {
     v.push((midpoint != "50").then_some(midpoint));
     v.push((e.no_distortion != 0).then(|| "0".to_string()));
     v.push((e.no_chromatic_aberration != 0).then(|| "0".to_string()));
+    let (mut now, mut default) = (e.detail(), DETAIL_DEFAULTS);
+    for (now, default) in detail_fields_mut(&mut now).into_iter().zip(detail_fields_mut(&mut default)) {
+        let text = number_text(*now, 2);
+        v.push((text.parse::<f32>().ok() != Some(*default)).then_some(text));
+    }
+    let clarity = number_text(e.clarity, 2);
+    v.push((clarity != "0").then_some(clarity));
     v
+}
+
+/// Where the detail sliders start in PROPS, after the lens fields.
+const DETAIL: usize = ROTATION + 5;
+
+/// The detail sliders, in PROPS order from DETAIL.
+fn detail_fields_mut(d: &mut Detail) -> [&mut f32; 9] {
+    [
+        &mut d.amount,
+        &mut d.radius,
+        &mut d.detail,
+        &mut d.masking,
+        &mut d.luminance,
+        &mut d.luminance_detail,
+        &mut d.color,
+        &mut d.color_detail,
+        &mut d.texture,
+    ]
 }
 
 /// A number as short as it can be: `decimals` at most (two for the sliders, five for crop edges),
@@ -707,6 +752,58 @@ mod tests {
         // Back to the defaults takes them out of the file.
         let back = update(&out, &Metadata::default()).unwrap();
         assert!(!back.contains("windedit:Vignette") && !back.contains("windedit:Lens"));
+    }
+
+    #[test]
+    fn detail_fields_round_trip_and_defaults_are_not_written() {
+        let mut edit = Edit { clarity: 60.0, ..Default::default() };
+        edit.set_detail(Detail {
+            amount: 85.0,
+            radius: 1.6,
+            detail: 60.0,
+            masking: 35.0,
+            luminance: 42.0,
+            luminance_detail: 20.0,
+            color: 0.0,
+            color_detail: 75.0,
+            texture: -35.0,
+        });
+        let meta = Metadata { edit, ..Default::default() };
+        let fresh = new_sidecar(&meta);
+        assert!(fresh.contains("windedit:SharpenAmount=\"85\"") && fresh.contains("windedit:NoiseColor=\"0\""), "{fresh}");
+        assert!(fresh.contains("windedit:SharpenRadius=\"1.6\""), "{fresh}");
+        assert!(fresh.contains("windedit:Texture=\"-35\"") && fresh.contains("windedit:Clarity=\"60\""), "{fresh}");
+        assert_eq!(parse(&fresh).unwrap().edit.clarity, 60.0);
+        assert_eq!(parse(&fresh).unwrap().edit.detail(), meta.edit.detail());
+        let out = update(LIGHTROOM, &meta).unwrap();
+        assert_eq!(parse(&out).unwrap().edit.detail(), meta.edit.detail());
+        // Each on its own, including a value on the far side of the default.
+        for (i, one) in [
+            Edit { sharpen_amount: -40.0, ..Default::default() },
+            Edit { sharpen_radius: 2.0, ..Default::default() },
+            Edit { noise_luminance_detail: -50.0, ..Default::default() },
+            Edit { noise_color: 75.0, ..Default::default() },
+            Edit { texture: 100.0, ..Default::default() },
+            Edit { clarity: -100.0, ..Default::default() },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let m = Metadata { edit: one, ..Default::default() };
+            assert_eq!(parse(&new_sidecar(&m)), Some(m), "case {i}");
+        }
+        // The defaults leave nothing in the file, and a file without them reads as the defaults.
+        let plain = new_sidecar(&Metadata { rating: 1, ..Default::default() });
+        assert!(!plain.contains("Sharpen") && !plain.contains("Noise") && !plain.contains("Texture") && !plain.contains("Clarity"), "{plain}");
+        let read = parse(&plain).unwrap().edit;
+        assert!(read.is_default() && read.detail() == DETAIL_DEFAULTS);
+        // Damage is put in range.
+        let bad = fresh.replace("SharpenAmount=\"85\"", "SharpenAmount=\"9000\"").replace("NoiseColorDetail=\"75\"", "NoiseColorDetail=\"x\"");
+        let d = parse(&bad).unwrap().edit.detail();
+        assert_eq!((d.amount, d.color_detail), (150.0, 50.0));
+        // Back to the defaults takes them out of the file.
+        let back = update(&out, &Metadata::default()).unwrap();
+        assert!(!back.contains("windedit:Sharpen") && !back.contains("windedit:Noise"));
     }
 
     #[test]

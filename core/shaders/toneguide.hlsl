@@ -12,6 +12,7 @@ cbuffer Constants : register(b0)
     uint2 size;
     uint radius;
     uint pass;
+    float eps;   // the guided filter's epsilon, in stops²: how big an edge it keeps
 };
 
 RWTexture2D<float> smallCopy : register(u0);
@@ -49,7 +50,7 @@ void store(uint2 at, float2 mean)
     {
         // mean = (mean of v, mean of v²): the filter's a and b.
         float variance = max(mean.y - mean.x * mean.x, 0.0);
-        float a = variance / (variance + params[0].m.baseEps);
+        float a = variance / (variance + eps);
         writePair(scratchB, at, float2(a, mean.x - a * mean.x));
     }
     else if (pass == 3)

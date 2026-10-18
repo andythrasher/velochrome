@@ -532,6 +532,13 @@ impl Viewer {
             }
         }
         let Some((kind, slot)) = chosen else { return Ok(()) };
+        // Noise reduction needs the photo's noise level, measured once per photo.
+        if slot.is_none() {
+            let d = self.edit.detail();
+            if (d.luminance > 0.0 || d.color > 0.0) && let Some((_, image)) = &self.image {
+                image.ensure_noise(&mut self.gpu)?;
+            }
+        }
 
         let layer = match slot {
             None => Layer::Raw(&self.image.as_ref().unwrap().1),
@@ -710,7 +717,7 @@ impl Viewer {
             }
             let image = &self.image.as_ref().unwrap().1;
             let window = export::window(image.oriented_size(), &a.job.edit);
-            let renderer = TileRenderer::new(&self.gpu, window).map_err(|e| e.to_string())?;
+            let renderer = TileRenderer::new(&self.gpu, window, &a.job.edit).map_err(|e| e.to_string())?;
             let (strips, bands) = sync_channel(1);
             let (id, quality, raw, path, commands) =
                 (a.job.id, a.job.request.quality, a.job.raw.clone(), a.job.path.clone(), self.commands.clone());

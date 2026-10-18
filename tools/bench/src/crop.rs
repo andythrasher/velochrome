@@ -138,7 +138,7 @@ pub fn bench_crop(files: &[PathBuf]) {
         let window = export::window((ow, oh), &edit4);
         let expected = ((hw * 2.0 * fsz.0).round() as i64, (hh * 2.0 * fsz.1).round() as i64);
         let size_ok = (window.width as i64 - expected.0).abs() <= 1 && (window.height as i64 - expected.1).abs() <= 1;
-        let mut renderer = TileRenderer::new(&gpu, window).unwrap();
+        let mut renderer = TileRenderer::new(&gpu, window, &edit).unwrap();
         let mut rgb = Vec::new();
         while !renderer.done() {
             if let Some(strip) = renderer.step(&mut gpu, &image, &edit4).unwrap() {
