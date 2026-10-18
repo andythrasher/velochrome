@@ -99,3 +99,40 @@ kept. This is the open question.
 - No Panasonic CA data is stored in `0x0119` (as in darktable).
 - `0x1011` is 0 on OM-5 II files that still carry parameters.
 - Untested: other makes, and older Olympus (`OLYMP\0`) maker notes, which aren't read.
+
+## Vignetting (shading)
+
+Looked for embedded shading data; none is usable, and for these photos none is needed.
+
+- **OM-5 II**: the camera's own switch is `Exif.OlympusCs.0x050c` (ShadingCompensation, in the
+  CameraSettings directory `0x2020`). It reads 0 on all 50 files sampled across the library, so the camera
+  corrected neither the raw nor its JPEG. ImageProcessing has two undocumented blocks, `0x1103` (49152
+  bytes, ORF only) and `0x1104` (4608 bytes); exiftool calls them UnknownBlock3?/4?. Neither is
+  a plain gain grid: as 16-bit words they run up to 55834 and jump between neighbours, and the same
+  file's 300 mm shot holds similar-sized values near 4096. Nothing public decodes them.
+- **Panasonic**: `0x011b` (64 bytes) sits next to the distortion tag. The one analysis found (an
+  exiftool forum thread) reads it as zone radii for chromatic aberration, not shading. Panasonic bodies
+  apply their shading compensation to the raw themselves, when it's on.
+- `bench vignette <raw>...` compares the lens-corrected render with the camera JPEG: sixteen spots
+  and, more reliably, a median profile by radius, after matching tone curves at r < 0.4. Render minus
+  JPEG at the outer ring, in stops: OM-5 II 12 mm +0.05, 39 mm +0.02, 300 mm 0.00; S1 24 mm 0.00,
+  60 mm −0.01; S9 24 mm −0.11, 50 mm −0.24 (the last two are the only gaps over 0.1 stop). So our render's falloff
+  already matches the camera JPEG's.
+
+### Outcome: no automatic correction
+
+Our lens-corrected render already matches the camera JPEG's falloff on the OM-5 II and the S1, and on the S9
+within about 0.1 stop (`bench vignette`, outer ring). A per-photo match was built and tested: at decode time
+it compared the raw's linear luminance with the embedded JPEG's on a 384-wide grid in the corrected frame,
+matched tone curves at r < 0.4, took the median shortfall per ring of radius, and fitted
+`g(r) = 1 + a·r² + b·r⁴` (at least 1 and rising), accepting it only with a corner gain of 0.05 stop or
+more, little scatter, enough usable rings, and the same falloff on all four sides. It corrected one of the
+seven test files (S9 24 mm, −0.11 → −0.05 stop), about 20% of 70 sampled files would have got 0.05–0.12 stop
+corrections near the noise floor, and decode took 35–60 ms longer. So it was left out of the engine in favour
+of a manual vignetting slider (Phase 2).
+
+The analysis remains as a diagnostic in `tools/bench/src/vignette.rs`. `bench vignette <raw>...` prints, per
+ring of radius, how much brighter the camera's JPEG is than the raw (stops), what the fit would apply (`a`, `b`, the
+gain at the corner, scatter) or why it would decline, and the lens-corrected render's falloff against the JPEG
+by ring. `bench lenstags <raw>` lists a file's tags (`TAG=0x1103` shows one tag's values; `SUB=2020` picks the Olympus
+CameraSettings directory).

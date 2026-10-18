@@ -9,6 +9,7 @@
 
 mod crop;
 mod lens;
+mod vignette;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -42,6 +43,8 @@ fn main() {
         "lens" => lens::bench_lens(&files),
         "crop" => crop::bench_crop(&files),
         "lensscan" => lens::lens_scan(rest),
+        "lenstags" => lens::lens_tags(&files),
+        "vignette" => lens::bench_vignette(&files),
         "cull" => bench_cull(&rest.iter().map(PathBuf::from).collect::<Vec<_>>()),
         _ => {
             eprintln!("unknown command {cmd}");

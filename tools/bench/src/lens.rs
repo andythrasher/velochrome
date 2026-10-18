@@ -407,3 +407,131 @@ fn ca_report(label: &str, img: &RgbaImage) {
     println!("  CA {label}: red−green radial px at TL TR BL BR ML MR: {}", radial(&r).join(" "));
     println!("  CA {label}: blue−green                               : {}", radial(&b).join(" "));
 }
+
+/// `bench lenstags <raw>`: the tags of a file, or all values of one (TAG=0x1103; SUB=2020 picks the
+/// Olympus CameraSettings directory).
+pub fn lens_tags(files: &[PathBuf]) {
+    for f in files {
+        let bytes = std::fs::read(f).unwrap();
+        let ext = f.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let tags = windedit_core::lens::dump_tags(&bytes, ext == "orf");
+        let want = std::env::var("TAG").ok().and_then(|t| u16::from_str_radix(t.trim_start_matches("0x"), 16).ok());
+        for (tag, kind, count, v) in tags {
+            match want {
+                Some(w) if w == tag => println!("{tag:04x} kind {kind} count {count}\n{v:?}"),
+                Some(_) => {}
+                None => println!("{tag:04x} kind {kind} count {count} {:?}", &v[..v.len().min(8)]),
+            }
+        }
+    }
+}
+
+fn srgb_to_linear(v: f32) -> f32 {
+    let c = v / 255.0;
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+
+/// `bench vignette <raw>...`: what the vignetting match (vignette.rs, a diagnostic only: the engine
+/// does not use it) would find for each photo,
+/// and the profile of how much darker the render is than the camera's
+/// JPEG at the centre, edges and corners (in stops, negative is darker).
+pub fn bench_vignette(files: &[PathBuf]) {
+    let mut gpu = Gpu::new().expect("no Direct3D 12 GPU");
+    warm_up(&mut gpu).unwrap();
+    let out_dir = std::env::var("LENS_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_exe().unwrap().parent().unwrap().join("renders").join("lens"));
+    std::fs::create_dir_all(&out_dir).unwrap();
+    for f in files {
+        let name = f.file_stem().unwrap().to_string_lossy().to_string();
+        let bytes = std::fs::read(f).unwrap();
+        let frame = decode::decode_file(f).unwrap();
+        let (ow, oh) = if frame.orientation.swaps_axes() { (frame.height, frame.width) } else { (frame.width, frame.height) };
+        let size = (width(), (width() as f32 * oh as f32 / ow as f32).round() as u32);
+        let Some(reference_img) = reference(&bytes, frame.orientation, size) else { continue };
+        println!("{name} ({} {}, {} mm), by radius 0.0..1.0, in stops:", frame.make, frame.model, decode_focal(&bytes));
+        let started = std::time::Instant::now();
+        let analysis = crate::vignette::analyse(&frame, &bytes);
+        let took = started.elapsed();
+        let rings: Vec<String> = analysis.rings.iter().map(|r| format!("{:+.2}", r.0)).collect();
+        println!("  camera JPEG brighter than the raw by ({:.0} ms): {}", took.as_secs_f64() * 1000.0, rings.join(" "));
+        match analysis.gain {
+            Some(g) => println!("  would apply gain 1 + {:.3}·r² + {:.3}·r⁴ ({:+.2} stops at the corner, scatter {:.3})", g[0], g[1], analysis.outer_stops, analysis.scatter),
+            None => println!("  would not correct: {} (fit {:+.2} stops at the corner, scatter {:.3})", analysis.why_not.unwrap_or("?"), analysis.outer_stops, analysis.scatter),
+        }
+        let img = render(&mut gpu, &frame, size);
+        let profile = vignette_profile(&img, &reference_img);
+        println!("  render minus camera JPEG: {}", profile.iter().map(|g| format!("{g:+.2}")).collect::<Vec<_>>().join(" "));
+        let (w, h) = (img.width(), img.height());
+        let mut sheet: RgbImage = ImageBuffer::new(w * 2, h);
+        for y in 0..h {
+            for x in 0..w {
+                let (a, b) = (img.get_pixel(x, y), reference_img.get_pixel(x, y));
+                sheet.put_pixel(x, y, Rgb([a[0], a[1], a[2]]));
+                sheet.put_pixel(x + w, y, Rgb([b[0], b[1], b[2]]));
+            }
+        }
+        sheet.save(out_dir.join(format!("{name}.vignette.png"))).unwrap();
+    }
+}
+
+/// The same comparison as a radial profile: the render's median brightness against the
+/// camera JPEG's (stops, negative is darker) in rings of radius, in half-diagonals. All angles
+/// together, so local differences in tone rendering average out; the tone curves are matched
+/// inside r < 0.4.
+fn vignette_profile(render_img: &RgbaImage, reference_img: &RgbaImage) -> Vec<f32> {
+    let (w, h) = (render_img.width() as usize, render_img.height() as usize);
+    let (lr, lj) = (luma(render_img), luma(reference_img));
+    let half_diag = 0.5 * (w as f32).hypot(h as f32);
+    let radius = |x: usize, y: usize| (x as f32 - w as f32 / 2.0).hypot(y as f32 - h as f32 / 2.0) / half_diag;
+    const BINS: usize = 40;
+    let bin_of = |l: f32| (((l.log2() + 10.0) / 10.0 * BINS as f32) as isize).clamp(0, BINS as isize - 1) as usize;
+    let mut tone: Vec<Vec<f32>> = vec![Vec::new(); BINS];
+    for y in 0..h {
+        for x in 0..w {
+            if radius(x, y) < 0.4 {
+                let (a, b) = (srgb_to_linear(lr.v[y * w + x]), srgb_to_linear(lj.v[y * w + x]));
+                if (0.004..0.97).contains(&a) && (0.004..0.97).contains(&b) {
+                    tone[bin_of(b)].push(a.log2());
+                }
+            }
+        }
+    }
+    let curve: Vec<Option<f32>> = tone
+        .iter_mut()
+        .map(|v| {
+            (v.len() > 40).then(|| {
+                v.sort_by(|a, b| a.total_cmp(b));
+                v[v.len() / 2]
+            })
+        })
+        .collect();
+    let mapped = |l: f32| -> Option<f32> {
+        let b = bin_of(l);
+        (0..BINS).filter_map(|d| curve.get(b.wrapping_sub(d)).copied().flatten().or_else(|| curve.get(b + d).copied().flatten())).next()
+    };
+    let mut rings: Vec<Vec<f32>> = vec![Vec::new(); 10];
+    for y in 0..h {
+        for x in 0..w {
+            let (a, b) = (srgb_to_linear(lr.v[y * w + x]), srgb_to_linear(lj.v[y * w + x]));
+            let ring = (radius(x, y) * 10.0) as usize;
+            if ring < 10
+                && (0.004..0.97).contains(&a)
+                && (0.004..0.97).contains(&b)
+                && let Some(m) = mapped(b)
+            {
+                rings[ring].push(a.log2() - m);
+            }
+        }
+    }
+    rings
+        .iter_mut()
+        .map(|v| {
+            if v.len() < 500 {
+                return f32::NAN;
+            }
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        })
+        .collect()
+}

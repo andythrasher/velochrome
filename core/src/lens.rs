@@ -268,6 +268,11 @@ impl LensCorrection {
 /// The ImageProcessing directory of an Olympus or OM System maker note: where its entries are,
 /// and the offset their values are counted from.
 fn olympus_image_processing(t: &Tiff, ifd0: usize) -> Option<(usize, usize)> {
+    olympus_directory(t, ifd0, 0x2040)
+}
+
+/// A sub-directory of the maker note (0x2040 ImageProcessing, 0x2020 CameraSettings, ...).
+fn olympus_directory(t: &Tiff, ifd0: usize, which: u16) -> Option<(usize, usize)> {
     let exif = t.first_u32(t.find(ifd0, 0, 0x8769)?)? as usize;
     let note = t.find(exif, 0, 0x927c)?;
     let head = t.bytes.get(note.value..note.value + 16)?;
@@ -279,7 +284,7 @@ fn olympus_image_processing(t: &Tiff, ifd0: usize) -> Option<(usize, usize)> {
         return None;
     };
     // Offsets inside the note count from its start.
-    let sub = t.find(ifd, note.value, 0x2040)?;
+    let sub = t.find(ifd, note.value, which)?;
     Some((note.value + t.u32_at(sub.value)? as usize, note.value))
 }
 
@@ -297,6 +302,20 @@ pub fn camera_model(bytes: &[u8]) -> Option<String> {
     let e = t.find(t.u32_at(4)? as usize, 0, 0x0110)?;
     let raw = t.bytes.get(e.value..e.value + e.count)?;
     Some(String::from_utf8_lossy(raw).trim_end_matches('\0').to_string())
+}
+
+/// Every entry of IFD0, or of an Olympus maker-note directory (0x2040 unless SUB=<hex> says
+/// otherwise), as (tag, kind, count, all values): for exploring files (`bench lenstags`).
+pub fn dump_tags(bytes: &[u8], olympus: bool) -> Vec<(u16, u16, usize, Vec<f32>)> {
+    let Some(t) = Tiff::new(bytes) else { return vec![] };
+    let Some(ifd0) = t.u32_at(4) else { return vec![] };
+    let (ifd, base) = if olympus {
+        let which = std::env::var("SUB").ok().and_then(|s| u16::from_str_radix(&s, 16).ok()).unwrap_or(0x2040);
+        match olympus_directory(&t, ifd0 as usize, which) { Some(x) => x, None => return vec![] }
+    } else {
+        (ifd0 as usize, 0)
+    };
+    t.entries(ifd, base).into_iter().map(|e| (e.tag, e.kind, e.count, t.floats(e))).collect()
 }
 
 #[cfg(test)]
