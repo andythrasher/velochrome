@@ -217,7 +217,7 @@
                                 CompositionScaleChanged="Panel_CompositionScaleChanged"
                                 PointerPressed="Panel_PointerPressed" />
                 <!-- Crop mode's overlay (MainWindow.Crop.cs): follows the panel's size, so it follows the window and the side panels. -->
-                <Canvas x:Name="CropCanvas" Visibility="Collapsed" Background="Transparent" />
+                <local:CursorCanvas x:Name="CropCanvas" Visibility="Collapsed" Background="Transparent" />
                 <!-- The white balance picker's layer (MainWindow.Picker.cs): takes the click, shows a crosshair. -->
                 <local:CursorGrid x:Name="PickLayer" Visibility="Collapsed" Background="Transparent"
                                   PointerPressed="PickLayer_PointerPressed" />

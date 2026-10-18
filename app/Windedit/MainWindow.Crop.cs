@@ -6,9 +6,16 @@ using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Shapes;
 using Windows.Foundation;
+using Microsoft.UI.Input;
 using Windows.System;
 
 namespace Windedit;
+
+/// <summary>A Canvas that can set its own mouse cursor (WinUI only lets a subclass do that).</summary>
+public sealed class CursorCanvas : Canvas
+{
+    public void SetCursor(Microsoft.UI.Input.InputCursor? cursor) => ProtectedCursor = cursor;
+}
 
 /// <summary>
 /// Crop mode (docs/crop.md). The engine shows the whole frame at Fit with the photo turned
@@ -22,6 +29,11 @@ public sealed partial class MainWindow
     const double HandleReach = 12;
 
     bool cropping;
+    /// <summary>The box as the user last set it (resizing, moving, an aspect, a turn). Straightening shows
+    /// this shrunk to fit, never the shrunk box itself, so turning back gives it back.</summary>
+    float[] intended = [0, 0, 1, 1];
+    /// <summary>A quarter turn is under way: the frame the engine last reported is the old one.</summary>
+    bool skipSync;
     /// <summary>The photo's edit when crop mode started, for Esc.</summary>
     Engine.Edit cropEntry;
     /// <summary>Changes committed since crop mode started, which Esc steps back.</summary>
@@ -46,6 +58,11 @@ public sealed partial class MainWindow
     readonly Rectangle cropBorder = new();
     readonly Rectangle[] handles = new Rectangle[8];
     readonly Line[] thirds = new Line[4];
+    // Shown instead of the thirds while turning: ten divisions each way, and the angle.
+    readonly Line[] fine = new Line[18];
+    readonly Border angleLabel = new();
+    readonly TextBlock angleText = new();
+    readonly Border turnGlyph = new();
 
     static readonly string[] AspectNames = ["Original", "As shot", "1:1", "4:5", "5:7", "2:3", "16:9", "Free"];
     // Landscape ratios of the presets that have one (index 2 on); they turn to suit the box.
@@ -178,6 +195,7 @@ public sealed partial class MainWindow
         cropping = true;
         cropCommits = 0;
         cropEntry = edit;
+        intended = CropOf(edit);
         entryAspect = CropAspect(edit);
         engine.SetCropMode(true);
         CropCanvas.Visibility = Visibility.Visible;
@@ -240,13 +258,34 @@ public sealed partial class MainWindow
         return h > 0 ? w / h : 1;
     }
 
-    /// <summary>A new angle, with the crop made smaller where the photo no longer reaches it.</summary>
+    /// <summary>A new angle, with the intended box made smaller where the photo no longer reaches it.</summary>
     Engine.Edit WithAngle(Engine.Edit e, float angle)
     {
         e = e with { Angle = angle };
         if (last.FrameWidth == 0)
             return e;
-        return WithCrop(e, Engine.ConstrainCrop(last.FrameWidth, last.FrameHeight, angle, Engine.Constrain.Shrink, CropOf(e), CropOf(e)));
+        return WithCrop(e, Engine.ConstrainCrop(last.FrameWidth, last.FrameHeight, angle, Engine.Constrain.Shrink, intended, intended));
+    }
+
+    /// <summary>Keeps <see cref="intended"/> in step with the edit: it stays while the edit's box is what
+    /// straightening makes of it (so undo and redo of an angle keep it), and follows the box when
+    /// the box was changed some other way (a resize, a move, an aspect, a turn, another photo).</summary>
+    void SyncIntended()
+    {
+        var c = CropOf(edit);
+        if (skipSync || last.FrameWidth == 0)
+        {
+            if (!skipSync)
+                intended = c;
+            return;
+        }
+        var shown = Engine.ConstrainCrop(last.FrameWidth, last.FrameHeight, edit.Angle, Engine.Constrain.Shrink, intended, intended);
+        for (var i = 0; i < 4; i++)
+            if (Math.Abs(shown[i] - c[i]) > 1e-4)
+            {
+                intended = c;
+                return;
+            }
     }
 
     /// <summary>Turns the photo a quarter turn; the crop turns with it.</summary>
@@ -254,13 +293,12 @@ public sealed partial class MainWindow
     {
         if (CurrentPhoto == null || gridMode)
             return;
-        Change(e =>
-        {
-            var c = CropOf(e);
-            float[] turned = direction > 0 ? [1 - c[3], c[0], 1 - c[1], c[2]] : [c[1], 1 - c[2], c[3], 1 - c[0]];
-            var rotation = (e.Rotation + (direction > 0 ? 1u : 3u)) % 4;
-            return WithCrop(e with { Rotation = rotation }, turned);
-        }, commit: true);
+        float[] Turned(float[] c) => direction > 0 ? [1 - c[3], c[0], 1 - c[1], c[2]] : [c[1], 1 - c[2], c[3], 1 - c[0]];
+        // The intended box turns with the frame, and the shown one follows from it.
+        intended = Turned(intended);
+        skipSync = true;
+        Change(e => WithCrop(e with { Rotation = (e.Rotation + (direction > 0 ? 1u : 3u)) % 4 }, Turned(CropOf(e))), commit: true);
+        skipSync = false;
         if (aspect is { } a)
             aspect = 1 / a;
     }
@@ -330,6 +368,30 @@ public sealed partial class MainWindow
             handles[i] = new Rectangle { Width = 9, Height = 9, Fill = white, Stroke = new SolidColorBrush(Colors.Black), StrokeThickness = 1, IsHitTestVisible = false };
             CropCanvas.Children.Add(handles[i]);
         }
+        var faint = new SolidColorBrush(Windows.UI.Color.FromArgb(0x70, 255, 255, 255));
+        for (var i = 0; i < fine.Length; i++)
+        {
+            fine[i] = new Line { Stroke = faint, StrokeThickness = 1, Visibility = Visibility.Collapsed, IsHitTestVisible = false };
+            CropCanvas.Children.Add(fine[i]);
+        }
+        angleText.FontSize = 13;
+        angleText.Foreground = white;
+        angleLabel.Child = angleText;
+        angleLabel.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0xC0, 0, 0, 0));
+        angleLabel.CornerRadius = new CornerRadius(4);
+        angleLabel.Padding = new Thickness(6, 2, 6, 2);
+        angleLabel.Visibility = Visibility.Collapsed;
+        angleLabel.IsHitTestVisible = false;
+        CropCanvas.Children.Add(angleLabel);
+        // Beside the pointer outside the box: turning is what a drag here does.
+        turnGlyph.Child = new FontIcon { Glyph = "", FontSize = 16, Foreground = white };
+        turnGlyph.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0xC0, 0, 0, 0));
+        turnGlyph.CornerRadius = new CornerRadius(12);
+        turnGlyph.Padding = new Thickness(4);
+        turnGlyph.Visibility = Visibility.Collapsed;
+        turnGlyph.IsHitTestVisible = false;
+        CropCanvas.Children.Add(turnGlyph);
+        CropCanvas.PointerExited += (_, _) => turnGlyph.Visibility = Visibility.Collapsed;
         CropCanvas.PointerPressed += CropPointerPressed;
         CropCanvas.PointerMoved += CropPointerMoved;
         CropCanvas.PointerReleased += CropPointerReleased;
@@ -390,6 +452,14 @@ public sealed partial class MainWindow
             (v.X1, v.X2, v.Y1, v.Y2) = (r.X + r.Width * (i + 1) / 3, r.X + r.Width * (i + 1) / 3, r.Y, r.Bottom);
             (h.X1, h.X2, h.Y1, h.Y2) = (r.X, r.Right, r.Y + r.Height * (i + 1) / 3, r.Y + r.Height * (i + 1) / 3);
         }
+        for (var i = 0; i < 9; i++)
+        {
+            var (v, h) = (fine[i], fine[i + 9]);
+            var x = r.X + r.Width * (i + 1) / 10;
+            var y = r.Y + r.Height * (i + 1) / 10;
+            (v.X1, v.X2, v.Y1, v.Y2) = (x, x, r.Y, r.Bottom);
+            (h.X1, h.X2, h.Y1, h.Y2) = (r.X, r.Right, y, y);
+        }
     }
 
     // ---- Dragging ----
@@ -425,16 +495,21 @@ public sealed partial class MainWindow
         dragKind = HitTest(p, CropRect(f, dragCrop));
         dragging = true;
         CropCanvas.CapturePointer(e.Pointer);
-        foreach (var t in thirds)
-            t.Visibility = Visibility.Visible;
+        SetGrid(dragKind == Turn);
+        UpdateCropOverlay();
         e.Handled = true;
     }
 
     void CropPointerMoved(object sender, PointerRoutedEventArgs e)
     {
-        if (!dragging || !FrameRect(out var f))
+        if (!FrameRect(out var f))
             return;
         var p = e.GetCurrentPoint(CropCanvas).Position;
+        if (!dragging)
+        {
+            ShowHover(p, f);
+            return;
+        }
         float fw = last.FrameWidth, fh = last.FrameHeight, angle = edit.Angle;
         var current = CropOf(edit);
         var s = dragCrop;
@@ -448,10 +523,16 @@ public sealed partial class MainWindow
             var turn = Math.Atan2(p.Y - c.Y, p.X - c.X) - Math.Atan2(dragStart.Y - c.Y, dragStart.X - c.X);
             var degrees = turn * 180 / Math.PI;
             degrees -= 360 * Math.Round(degrees / 360);
-            var a = (float)Math.Round(Math.Clamp(dragAngle + degrees, -45, 45), 2);
-            // From the box the drag started with, so turning back gives it back.
-            var box = Engine.ConstrainCrop(fw, fh, a, Engine.Constrain.Shrink, s, s);
+            var total = Math.Clamp(dragAngle + degrees, -45, 45);
+            var shiftNow = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift).HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
+            var a = (float)(shiftNow ? Math.Round(total) : Math.Round(total, 1));
+            // From the box as the user set it, so turning back gives it back.
+            var box = Engine.ConstrainCrop(fw, fh, a, Engine.Constrain.Shrink, intended, intended);
             Change(ed => WithCrop(ed with { Angle = a }, box), commit: false);
+            angleText.Text = $"{a:+0.0;-0.0;0.0}°";
+            angleLabel.Visibility = Visibility.Visible;
+            Canvas.SetLeft(angleLabel, p.X + 16);
+            Canvas.SetTop(angleLabel, p.Y - 34);
             return;
         }
 
@@ -529,6 +610,40 @@ public sealed partial class MainWindow
         return Engine.ConstrainCrop(fw, fh, angle, Engine.Constrain.Scale, current, want, ax, ay);
     }
 
+    /// <summary>The grid shown while dragging: dense while turning, thirds otherwise, none when null.</summary>
+    void SetGrid(bool? turning)
+    {
+        foreach (var t in thirds)
+            t.Visibility = turning == false ? Visibility.Visible : Visibility.Collapsed;
+        foreach (var t in fine)
+            t.Visibility = turning == true ? Visibility.Visible : Visibility.Collapsed;
+        if (turning != true)
+            angleLabel.Visibility = Visibility.Collapsed;
+    }
+
+    /// <summary>The cursor and the turn glyph for the pointer over the overlay.</summary>
+    void ShowHover(Point p, Rect f)
+    {
+        var kind = HitTest(p, CropRect(f, CropOf(edit)));
+        var shape = kind switch
+        {
+            Left | Top or Right | Bottom => InputSystemCursorShape.SizeNorthwestSoutheast,
+            Right | Top or Left | Bottom => InputSystemCursorShape.SizeNortheastSouthwest,
+            Left or Right => InputSystemCursorShape.SizeWestEast,
+            Top or Bottom => InputSystemCursorShape.SizeNorthSouth,
+            Move => InputSystemCursorShape.SizeAll,
+            _ => InputSystemCursorShape.Cross,
+        };
+        CropCanvas.SetCursor(InputSystemCursor.Create(shape));
+        var turning = kind == Turn;
+        turnGlyph.Visibility = turning && !dragging ? Visibility.Visible : Visibility.Collapsed;
+        if (turning)
+        {
+            Canvas.SetLeft(turnGlyph, p.X + 14);
+            Canvas.SetTop(turnGlyph, p.Y + 14);
+        }
+    }
+
     void CropPointerReleased(object sender, PointerRoutedEventArgs e)
     {
         CropCanvas.ReleasePointerCapture(e.Pointer);
@@ -540,8 +655,7 @@ public sealed partial class MainWindow
         if (!dragging)
             return;
         dragging = false;
-        foreach (var t in thirds)
-            t.Visibility = Visibility.Collapsed;
+        SetGrid(null);
         CommitEdit(); // one undo step for the whole drag
     }
 }

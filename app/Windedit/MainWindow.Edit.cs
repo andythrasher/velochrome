@@ -335,6 +335,7 @@ public sealed partial class MainWindow
     /// there's no custom one (once the raw is decoded and it's known).</summary>
     void ShowEdit()
     {
+        SyncIntended();
         updatingSliders = true;
         foreach (var a in adjustments)
         {

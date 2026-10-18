@@ -83,7 +83,7 @@ pub fn bench_crop(files: &[PathBuf]) {
         // applied per pixel, so interpolating before it (the GPU) and after it (here) differ at
         // sharp edges; blurred a little, that goes away and what is left is position.
         let angle = 10.0f32;
-        let tilted = render!(&Edit { angle, ..edit }, Zoom::Frame, a, b);
+        let tilted = render!(&Edit { angle, ..edit }, Zoom::Region { x: 0.0, y: 0.0, scale: s }, a, b);
         let blurred = |px: &[u8]| imageops::blur(&image::RgbaImage::from_raw(a, b, px.to_vec()).unwrap(), 2.0).into_raw();
         let (plain_blur, tilted_blur) = (blurred(&plain), blurred(&tilted));
         let (sin, cos) = (angle as f64).to_radians().sin_cos();

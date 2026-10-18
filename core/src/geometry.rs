@@ -12,6 +12,10 @@ use crate::pipeline::Zoom;
 
 pub const MAX_ANGLE: f32 = 45.0;
 
+/// In crop mode the frame is fitted with this fraction of the view free on every side, so there's room
+/// outside the box to grab and turn.
+pub const FRAME_MARGIN: f64 = 0.09;
+
 /// The smallest crop, as a fraction of the frame in either direction.
 const MIN_SIZE: f64 = 0.002;
 
@@ -87,7 +91,11 @@ pub fn view_map(
         _ => window(frame, crop),
     };
     let (scale, center) = match zoom {
-        Zoom::Fit | Zoom::Frame => ((out_w / ww).min(out_h / wh), (wx + ww / 2.0, wy + wh / 2.0)),
+        Zoom::Fit => ((out_w / ww).min(out_h / wh), (wx + ww / 2.0, wy + wh / 2.0)),
+        Zoom::Frame => {
+            let room = 1.0 - 2.0 * FRAME_MARGIN;
+            ((out_w * room / ww).min(out_h * room / wh), (wx + ww / 2.0, wy + wh / 2.0))
+        }
         Zoom::Actual { x, y } => (1.0, (wx + x.clamp(0.0, 1.0) as f64 * ww, wy + y.clamp(0.0, 1.0) as f64 * wh)),
         Zoom::Region { x, y, scale } => (scale as f64, (x as f64 + out_w / scale as f64 / 2.0, y as f64 + out_h / scale as f64 / 2.0)),
     };
@@ -301,6 +309,21 @@ mod tests {
     }
 
     #[test]
+    fn straightening_back_gives_the_box_back() {
+        // The app shrinks the box as the user last set it, never the shrunk one, so any
+        // walk of angles that ends at 0° ends at the original box.
+        let intended = [0.1, 0.2, 0.7, 0.8];
+        for angles in [[10.0, -5.0, 0.0], [30.0, 8.0, 0.0], [-44.0, 44.0, 0.0]] {
+            let mut shown = intended;
+            for angle in angles {
+                shown = constrain_crop(FRAME, angle, shown, intended, Constrain::Shrink);
+                assert!(fits(FRAME, angle, shown));
+            }
+            near(shown, intended);
+        }
+    }
+
+    #[test]
     fn square_frame_at_45_degrees() {
         // The biggest centred square in a square turned 45° has a side of 1/√2.
         let r = constrain_crop((1000.0, 1000.0), 45.0, FULL, FULL, Constrain::Shrink);
@@ -427,7 +450,9 @@ mod tests {
         assert_eq!(m.clip, [0.0, 0.0, 200.0, 200.0]);
         // In crop mode the whole frame is shown instead.
         let m = view_map((400, 200), 0, (400, 200), 0.0, crop, Zoom::Frame, (400, 200));
-        assert_eq!(texture_at(&m, 0.0, 0.0), [0.0, 0.0]);
+        assert_eq!(texture_at(&m, m.clip[0], m.clip[1]), [0.0, 0.0]);
+        // With a margin all round: the frame's box is inside the view, centred.
+        assert!(m.clip[0] > 0.0 && m.clip[1] > 0.0 && 400.0 - m.clip[2] - m.clip[0] < 1e-3 && 200.0 - m.clip[3] - m.clip[1] < 1e-3);
         // 100% centred on the crop's middle (0.5, 0.5 of the crop) is the frame's (0.75, 0.5).
         let m = view_map((400, 200), 0, (400, 200), 0.0, crop, Zoom::Actual { x: 0.5, y: 0.5 }, (100, 100));
         assert_eq!(texture_at(&m, 50.0, 50.0), [0.75, 0.5]);
@@ -438,7 +463,7 @@ mod tests {
         // At +90° (not allowed by the slider, but the maths holds) the picture's top edge ends
         // up on the right: the frame's right-middle shows the photo's top-middle.
         let m = view_map((200, 200), 0, (200, 200), 90.0, FULL_CROP, Zoom::Frame, (200, 200));
-        let [u, v] = texture_at(&m, 200.0, 100.0);
+        let [u, v] = texture_at(&m, m.clip[2], 100.0);
         assert!((u - 0.5).abs() < 1e-5 && v.abs() < 1e-5, "{u} {v}");
         // The centre stays put at any angle.
         for angle in [-17.0, 4.0, 33.0] {

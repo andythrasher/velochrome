@@ -91,3 +91,13 @@ space after that, so the crop works on the corrected photo.
 - **Esc** steps the commits made in crop mode back with undo (so the redo stack keeps them);
   quarter turns (Ctrl+[ and Ctrl+]) also work outside crop mode, in the loupe.
 - Crop edges are written to the sidecar with five decimals, the angle with two.
+- **Intended crop.** Straightening never shrinks the box for good. The app keeps the box as the user
+  last set it (resize, move, aspect, swap, reset, quarter turn) and every angle change shows that box
+  shrunk to fit (`Shrink` from the intended box, not from the shown one), so turning back to 0° gives it
+  back exactly. After any edit change the app (`SyncIntended`) keeps the intended box while the edit's box is
+  what straightening makes of it, so undo and redo of an angle step keep it. Commits still save the
+  shown box.
+- **Margin.** In crop mode the frame is fitted with `geometry::FRAME_MARGIN` (9%) free on every side,
+  leaving room outside the box to grab and turn. Pointer over the box shows resize, move and turn
+  cursors (a crosshair with a ↻ glyph beside it outside the box). Turning shows a ten-by-ten grid and the angle;
+  Shift snaps to whole degrees, otherwise 0.1° steps.
