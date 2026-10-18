@@ -64,9 +64,10 @@ public sealed partial class MainWindow
     /// <summary>A long path with its middle left out, so the ends (drive and folder) show.</summary>
     static string Shorten(string path) => path.Length <= 44 ? path : path[..10] + "…" + path[^33..];
     /// <summary>Where this folder's exports go by default: an Export folder inside it.</summary>
-    string DefaultExportFolder() => Path.Combine(folder ?? "", "Export");
+    // Never inside a card's folder: nothing is written to the card.
+    string DefaultExportFolder() => cardOpen ? DefaultChosenFolder() : Path.Combine(folder ?? "", "Export");
 
-    string ExportFolder() => exportToChosen && !string.IsNullOrEmpty(exportChosenFolder) ? exportChosenFolder : DefaultExportFolder();
+    string ExportFolder() => (exportToChosen || cardOpen) && !string.IsNullOrEmpty(exportChosenFolder) ? exportChosenFolder : DefaultExportFolder();
 
     void ShowExportFlyout()
     {

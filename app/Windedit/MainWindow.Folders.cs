@@ -52,6 +52,7 @@ public sealed partial class MainWindow
     };
 
     FolderEntry recentEntry = null!;
+    FolderEntry picturesEntry = null!;
     /// <summary>The folder highlighted as the open one (in Recent, unless it was opened from the tree).</summary>
     FolderEntry? openEntry;
     CancellationTokenSource? searchCancel;
@@ -60,6 +61,7 @@ public sealed partial class MainWindow
     {
         recentEntry = new FolderEntry("", "Recent", isGroup: true) { Loaded = true, IsExpanded = true };
         var pictures = new FolderEntry(PicturesPath, "Pictures", isGroup: true) { IsExpanded = true };
+        picturesEntry = pictures;
         var thisPc = new FolderEntry("", "This PC", isGroup: true);
         FolderTree.ItemsSource = new List<FolderEntry> { recentEntry, pictures, thisPc };
         LoadChildren(pictures);

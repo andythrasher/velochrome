@@ -78,8 +78,12 @@ public sealed unsafe partial class Engine : IDisposable
     [LibraryImport(Dll)] private static partial int we_set_order(IntPtr engine, int* order, int count);
     [LibraryImport(Dll)] private static partial int we_set_visible(IntPtr engine, int* visible, int count);
     [LibraryImport(Dll)] private static partial int we_thumbnail(IntPtr engine, int index, byte* buf, int capacity, out int width, out int height);
+    [LibraryImport(Dll, StringMarshalling = StringMarshalling.Utf16)] private static partial int we_import_scan(IntPtr engine, string card, string destRoot, out int total, out int newPhotos);
+    [LibraryImport(Dll)] private static partial int we_import_open_card(IntPtr engine);
+    [LibraryImport(Dll, StringMarshalling = StringMarshalling.Utf16)] private static partial int we_import_start(IntPtr engine, string? backupRoot, int verify);
+    [LibraryImport(Dll)] private static partial int we_import_cancel(IntPtr engine);
 
-    public const uint FrameEvent = 1, ThumbnailEvent = 2, ExportEvent = 3;
+    public const uint FrameEvent = 1, ThumbnailEvent = 2, ExportEvent = 3, ImportEvent = 4;
 
     /// <summary>
     /// A photo's stars (0–5), pick flag (1 picked, -1 rejected, 0 neither) and color label
@@ -233,6 +237,14 @@ public sealed unsafe partial class Engine : IDisposable
     /// </summary>
     public event Action<ExportUpdate>? ExportChanged;
 
+    /// <summary>A card import's progress or end. <see cref="State"/> is 0 while copying (<see cref="Text"/> is the
+    /// file being copied), 1 when done and 2 when stopped (<see cref="Text"/> is then the summary: a headline,
+    /// then <c>!name: reason</c> for each failure and <c>&gt;folder</c> for each folder that gained photos).</summary>
+    public readonly record struct ImportUpdate(uint State, int FilesDone, int FilesTotal, int Failed, long BytesDone, long BytesTotal, double Seconds, string Text);
+
+    /// <summary>Raised on the engine's thread when the card import (<see cref="ImportStart"/>) reports.</summary>
+    public event Action<ImportUpdate>? ImportChanged;
+
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     static void OnFrame(IntPtr user, Frame* frame)
     {
@@ -244,6 +256,15 @@ public sealed unsafe partial class Engine : IDisposable
             var text = frame->Text == IntPtr.Zero ? null : Marshal.PtrToStringUni(frame->Text);
             engine.ExportChanged?.Invoke(new ExportUpdate((int)frame->ExportId, frame->Photo, (int)frame->ExportState,
                 frame->Progress, text, frame->GpuMs, frame->CpuMs, frame->OpenMs, frame->SinceShowMs));
+            return;
+        }
+        if (frame->Kind == ImportEvent)
+        {
+            var text = frame->Text == IntPtr.Zero ? "" : Marshal.PtrToStringUni(frame->Text) ?? "";
+            // Frame's fields are reused here (viewer.rs EVENT_IMPORT): files done in Photo, files in all
+            // in Width, files failed in Height, the state in Layer, the bytes in GpuMs and CpuMs.
+            engine.ImportChanged?.Invoke(new ImportUpdate(frame->Layer, frame->Photo, (int)frame->Width, (int)frame->Height,
+                (long)frame->GpuMs, (long)frame->CpuMs, frame->SinceShowMs / 1000, text));
             return;
         }
         engine.FrameDrawn?.Invoke(*frame);
@@ -327,6 +348,27 @@ public sealed unsafe partial class Engine : IDisposable
     /// Returns the job's id, which <see cref="ExportChanged"/> carries.
     /// </summary>
     public int Export(int index, string path, int quality) => Check(we_export(handle, index, path, quality));
+
+    /// <summary>
+    /// Looks at a camera card (its root, holding DCIM) and plans filing it under
+    /// <paramref name="destRoot"/>: how many photos it has and how many aren't there yet. Reads every
+    /// photo's date from the card, so call it off the UI thread. Writes nothing.
+    /// </summary>
+    public (int Total, int New) ImportScan(string card, string destRoot)
+    {
+        Check(we_import_scan(handle, card, destRoot, out var total, out var fresh));
+        return (total, fresh);
+    }
+
+    /// <summary>Opens the scanned card like a folder (in the order shot); returns its photo count. Stars and
+    /// flags given to its photos are saved in the library folders they'll be copied to, never on the card.</summary>
+    public int ImportOpenCard() => Check(we_import_open_card(handle));
+
+    /// <summary>Starts copying the scanned card's new photos; <see cref="ImportChanged"/> reports. A backup
+    /// root gets every file too, and verify reads each copy back.</summary>
+    public void ImportStart(string? backupRoot, bool verify) => Check(we_import_start(handle, backupRoot, verify ? 1 : 0));
+
+    public void ImportCancel() => Check(we_import_cancel(handle));
 
     public void SetEditMode(bool on) => Check(we_set_edit_mode(handle, on ? 1 : 0));
 

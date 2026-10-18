@@ -21,8 +21,22 @@ public partial class App : Application
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
         // A photo or folder named on the command line opens straight away.
-        var path = Environment.GetCommandLineArgs().Skip(1).FirstOrDefault(p => File.Exists(p) || Directory.Exists(p));
-        window = new MainWindow(path);
+        // --fake-card <folder> makes a folder holding DCIM act as an inserted card, and --fake-dest
+        // <folder> files its photos there (for testing; neither is remembered).
+        var argv = Environment.GetCommandLineArgs().Skip(1).ToList();
+        string? Option(string name)
+        {
+            var at = argv.FindIndex(a => a.Equals(name, StringComparison.OrdinalIgnoreCase));
+            if (at < 0 || at + 1 >= argv.Count)
+                return null;
+            var value = argv[at + 1];
+            argv.RemoveRange(at, 2);
+            return value;
+        }
+        var fakeCard = Option("--fake-card") ?? Environment.GetEnvironmentVariable("WINDEDIT_FAKE_CARD");
+        var fakeDest = Option("--fake-dest");
+        var path = argv.FirstOrDefault(p => File.Exists(p) || Directory.Exists(p));
+        window = new MainWindow(path, fakeCard, fakeDest);
         window.Activate();
     }
 

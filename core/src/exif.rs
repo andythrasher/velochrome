@@ -268,6 +268,119 @@ fn from_tiff(raw: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     out.buf.extend(data);
     (out.buf.len() + HEADER.len() + 2 <= u16::MAX as usize).then_some(out.buf)
 }
+/// When a photo was taken, as the camera's clock showed it (no time zone), from EXIF
+/// DateTimeOriginal. Field order makes the derived ordering chronological.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Stamp {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+}
+
+impl Stamp {
+    /// "2026-06-06", the name of a day's folder.
+    pub fn day_name(&self) -> String {
+        format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
+    }
+
+    /// Reads EXIF's "2026:06:06 14:03:09". Zeros (a camera whose clock was never set) are no date.
+    fn parse(text: &[u8]) -> Option<Stamp> {
+        let text = std::str::from_utf8(text).ok()?.trim_end_matches('\0').trim();
+        let field = |from: usize, to: usize| text.get(from..to)?.parse::<u32>().ok();
+        let stamp = Stamp {
+            year: field(0, 4)? as u16,
+            month: field(5, 7)? as u8,
+            day: field(8, 10)? as u8,
+            hour: field(11, 13).unwrap_or(0) as u8,
+            minute: field(14, 16).unwrap_or(0) as u8,
+            second: field(17, 19).unwrap_or(0) as u8,
+        };
+        ((1..=12).contains(&stamp.month) && (1..=31).contains(&stamp.day) && stamp.year >= 1990).then_some(stamp)
+    }
+}
+
+/// DateTimeOriginal (else DateTime) from a TIFF structure: a raw file, or what a JPEG's Exif
+/// segment holds.
+fn stamp_in_tiff(tiff: &[u8]) -> Option<Stamp> {
+    let little = match tiff.get(0..2)? {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let t = Tiff { buf: tiff.to_vec(), little };
+    let ifd0 = t.u32_at(4)? as usize;
+    let tags0 = t.tags(ifd0);
+    let ascii = |tags: &[Tag], id: u16| tags.iter().find(|x| x.tag == id && x.ty == 2).and_then(|x| Stamp::parse(&x.data));
+    if let Some(exif) = tags0.iter().find(|x| x.tag == 0x8769).and_then(|x| t.u32_of(&x.data)) {
+        let tags = t.tags(exif as usize);
+        if let Some(stamp) = ascii(&tags, 0x9003).or_else(|| ascii(&tags, 0x9004)) {
+            return Some(stamp);
+        }
+    }
+    ascii(&tags0, 0x0132)
+}
+
+/// When the photo in this file (a raw or a JPEG) was taken, from its EXIF. Olympus raws carry
+/// the date in their own directories near the start; Panasonic keeps it only in the embedded
+/// JPEG, which sits further in, so that's read only if the first look finds nothing.
+pub fn capture_time(path: &Path) -> Option<Stamp> {
+    use std::io::Read;
+    let read = |limit: u64| -> Option<Vec<u8>> {
+        let mut head = Vec::new();
+        std::fs::File::open(path).ok()?.take(limit).read_to_end(&mut head).ok()?;
+        Some(head)
+    };
+    let in_jpeg = |bytes: &[u8]| find_exif(bytes).and_then(stamp_in_tiff);
+    let head = read(64 << 10)?;
+    if head.starts_with(&SOI) {
+        return in_jpeg(&head);
+    }
+    if let Some(stamp) = stamp_in_tiff(&head) {
+        return Some(stamp);
+    }
+    let head = read(1 << 20)?;
+    decode::embedded_jpegs(&head).iter().find_map(|j| in_jpeg(&head[j.offset..]))
+}
+
+/// A raw-like file for tests: a TIFF whose Exif directory holds `date` as DateTimeOriginal.
+#[cfg(test)]
+pub fn test_tiff(date: &str) -> Vec<u8> {
+    let mut t = b"IIRO".to_vec();
+    t.extend(8u32.to_le_bytes());
+    // IFD0 at 8 holds the Exif pointer (2 + 12 + 4 = 18 bytes), so the Exif IFD is at 26; it holds
+    // one entry and ends at 44, where the 20 bytes of text go.
+    t.extend(1u16.to_le_bytes());
+    t.extend(0x8769u16.to_le_bytes());
+    t.extend(4u16.to_le_bytes());
+    t.extend(1u32.to_le_bytes());
+    t.extend(26u32.to_le_bytes());
+    t.extend(0u32.to_le_bytes());
+    t.extend(1u16.to_le_bytes());
+    t.extend(0x9003u16.to_le_bytes());
+    t.extend(2u16.to_le_bytes());
+    t.extend(20u32.to_le_bytes());
+    t.extend(44u32.to_le_bytes());
+    t.extend(0u32.to_le_bytes());
+    t.extend(date.as_bytes());
+    t.push(0);
+    t
+}
+
+/// A JPEG for tests whose Exif segment is `test_tiff(date)`.
+#[cfg(test)]
+pub fn test_jpeg(date: &str) -> Vec<u8> {
+    let mut block = HEADER.to_vec();
+    block.extend(test_tiff(date));
+    let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+    jpeg.extend(((block.len() + 2) as u16).to_be_bytes());
+    jpeg.extend(block);
+    jpeg.extend([0xFF, 0xD9]);
+    jpeg
+}
+
 /// `jpeg` with the EXIF block right after its start marker, where readers look for it.
 pub fn insert(jpeg: &[u8], exif: &[u8]) -> Vec<u8> {
     debug_assert!(jpeg.starts_with(&SOI));
@@ -389,6 +502,24 @@ mod tests {
         assert_eq!(o.u16_at(o.find(exif, 0xA003).unwrap() + 8), Some(5184));
         assert_eq!(o.u32_at(o.entries(ifd0).unwrap().1), Some(0));
     }
+    #[test]
+    fn reads_the_capture_time_from_a_raw_and_a_jpeg() {
+        let dir = std::env::temp_dir().join(format!("windedit-exif-time-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.ORF"), test_tiff("2026:06:06 14:03:09")).unwrap();
+        std::fs::write(dir.join("b.jpg"), test_jpeg("2025:12:31 23:59:58")).unwrap();
+        std::fs::write(dir.join("c.RW2"), test_tiff("0000:00:00 00:00:00")).unwrap();
+        std::fs::write(dir.join("d.jpg"), b"not a photo").unwrap();
+        let at = |name: &str| capture_time(&dir.join(name));
+        let (a, b) = (at("a.ORF").unwrap(), at("b.jpg").unwrap());
+        assert_eq!((a.day_name(), a.hour, a.minute, a.second), ("2026-06-06".to_string(), 14, 3, 9));
+        assert_eq!(b.day_name(), "2025-12-31");
+        assert!(a > b);
+        assert_eq!(at("c.RW2"), None, "an unset clock is no date");
+        assert_eq!(at("d.jpg"), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn exif_goes_right_after_the_start_marker() {
         let out = insert(&[0xFF, 0xD8, 0xFF, 0xDB, 0, 2], b"Exif\0\0xyz");

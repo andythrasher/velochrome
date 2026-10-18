@@ -51,7 +51,7 @@ public sealed partial class MainWindow : Window
     readonly Dictionary<int, int> realized = [];
     bool visibleUpdatePending, bringIntoViewPending;
 
-    public MainWindow(string? startPath)
+    public MainWindow(string? startPath, string? fakeCard = null, string? fakeDest = null)
     {
         InitializeComponent();
         AppWindow.Resize(new Windows.Graphics.SizeInt32(1700, 1100));
@@ -74,6 +74,7 @@ public sealed partial class MainWindow : Window
         InitExport();
         InitAppearance();
         BuildFolderTree();
+        InitImport(fakeCard, fakeDest);
         SetFoldersPanel(layout.GetValueOrDefault("folders", true));
         EmptyText.Text = $"Open a folder of photos (Ctrl+O).\n\n{engine.AdapterName}";
         TimingText.Text = $"GPU warm-up {engine.WarmUpMs:F1} ms";
@@ -112,7 +113,14 @@ public sealed partial class MainWindow : Window
             EmptyText.Text = $"Couldn't open {path}: {ex.Message}";
             return;
         }
+        ShowOpened(count, path, photoPath, isCard: false);
+    }
+
+    /// <summary>Shows the photos the engine has just opened: a folder, or a camera card (which is not remembered, and whose photos can't be edited until they're copied).</summary>
+    void ShowOpened(int count, string path, string? photoPath, bool isCard)
+    {
         folder = path;
+        SetCardOpen(isCard);
         ExitCrop(cancel: false);
         SetPicking(false);
         realized.Clear();
@@ -120,8 +128,9 @@ public sealed partial class MainWindow : Window
         all = new PhotoItem[count];
         for (var i = 0; i < count; i++)
             all[i] = new PhotoItem(i, engine.PhotoName(i)) { Metadata = metadata[i] };
-        RememberRecent(path);
-        Title = $"{Path.GetFileName(path)} – Windedit";
+        if (!isCard)
+            RememberRecent(path);
+        Title = $"{(isCard ? cardLabel : Path.GetFileName(path))} – Windedit";
         position = -1;
         ApplyFilters(photoPath != null ? engine.FindPhoto(photoPath) : -1);
     }
@@ -465,6 +474,11 @@ public sealed partial class MainWindow : Window
     /// <summary>Opening the Edit panel is what shows the developed raw.</summary>
     void SetEditMode(bool on)
     {
+        if (on && cardOpen)
+        {
+            EditToggle.IsChecked = false; // the raws are still on the card: copy them first
+            return;
+        }
         if (!on)
         {
             ExitCrop(cancel: false);
