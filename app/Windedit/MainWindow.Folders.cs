@@ -1,28 +1,38 @@
+using System.Collections.ObjectModel;
+using System.ComponentModel;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 
 namespace Windedit;
 
 /// <summary>A node in the Folders panel: a folder, or one of the headings above them.</summary>
-public sealed class FolderEntry(string path, string name, bool isGroup = false)
+public sealed class FolderEntry(string path, string name, bool isGroup = false) : INotifyPropertyChanged
 {
     public string Path { get; } = path;
     public string Name { get; } = name;
     public bool IsGroup { get; } = isGroup;
+    public ObservableCollection<FolderEntry> Children { get; } = [];
+    /// <summary>Whether its subfolders have been read (or are being).</summary>
+    public bool Loaded { get; set; }
+    /// <summary>Shows an expander before its children are read.</summary>
+    public bool HasUnrealized => !Loaded;
+    public string? Tip => Path == "" ? null : Path;
+    public string Glyph => IsGroup ? "" : ((char)0xE8B7).ToString();
+    public Windows.UI.Text.FontWeight Weight => IsGroup ? Microsoft.UI.Text.FontWeights.SemiBold : Microsoft.UI.Text.FontWeights.Normal;
 
-    /// <summary>What the tree shows for it (the tree can't bind to this class), carrying the entry in its Tag.</summary>
-    public UIElement Visual()
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    bool isExpanded;
+    public bool IsExpanded
     {
-        var text = new TextBlock { Text = Name, TextTrimming = TextTrimming.CharacterEllipsis };
-        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Tag = this };
-        if (IsGroup)
-            text.FontWeight = Microsoft.UI.Text.FontWeights.SemiBold;
-        else
-            row.Children.Add(new FontIcon { Glyph = ((char)0xE8B7).ToString(), FontSize = 14, Opacity = 0.8 });
-        row.Children.Add(text);
-        if (Path != "")
-            ToolTipService.SetToolTip(row, Path);
-        return row;
+        get => isExpanded;
+        set
+        {
+            if (isExpanded == value)
+                return;
+            isExpanded = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsExpanded)));
+        }
     }
 }
 
@@ -41,54 +51,38 @@ public sealed partial class MainWindow
         AttributesToSkip = FileAttributes.Hidden | FileAttributes.System,
     };
 
-    TreeViewNode recentNode = null!;
-    /// <summary>The node highlighted for the open folder (in Recent, unless it was opened from the tree).</summary>
-    TreeViewNode? openNode;
+    FolderEntry recentEntry = null!;
+    /// <summary>The folder highlighted as the open one (in Recent, unless it was opened from the tree).</summary>
+    FolderEntry? openEntry;
     CancellationTokenSource? searchCancel;
-
-    /// <summary>A folder in a search result, with the matching folders and parents below it.</summary>
-    sealed class Hit(string path, string name)
-    {
-        public string Path = path, Name = name;
-        public readonly List<Hit> Children = [];
-    }
 
     void BuildFolderTree()
     {
-        recentNode = Node(new FolderEntry("", "Recent", isGroup: true), expanded: true);
-        var pictures = Node(new FolderEntry(PicturesPath, "Pictures", isGroup: true), expanded: true);
-        var thisPc = Node(new FolderEntry("", "This PC", isGroup: true));
-        pictures.HasUnrealizedChildren = thisPc.HasUnrealizedChildren = true;
-        FolderTree.RootNodes.Add(recentNode);
-        FolderTree.RootNodes.Add(pictures);
-        FolderTree.RootNodes.Add(thisPc);
+        recentEntry = new FolderEntry("", "Recent", isGroup: true) { Loaded = true, IsExpanded = true };
+        var pictures = new FolderEntry(PicturesPath, "Pictures", isGroup: true) { IsExpanded = true };
+        var thisPc = new FolderEntry("", "This PC", isGroup: true);
+        FolderTree.ItemsSource = new List<FolderEntry> { recentEntry, pictures, thisPc };
         LoadChildren(pictures);
         _ = RefreshRecent();
     }
-
-    static TreeViewNode Node(FolderEntry entry, bool expanded = false) =>
-        new() { Content = entry.Visual(), IsExpanded = expanded };
-
-    static FolderEntry? Entry(TreeViewNode? node) => (node?.Content as FrameworkElement)?.Tag as FolderEntry;
 
     // ---- Opening branches ----
 
     void FolderTree_Expanding(TreeView sender, TreeViewExpandingEventArgs args)
     {
-        if (args.Node.HasUnrealizedChildren)
-            LoadChildren(args.Node);
+        if (args.Item is FolderEntry { Loaded: false } entry)
+            LoadChildren(entry);
     }
 
-    void LoadChildren(TreeViewNode node)
+    void LoadChildren(FolderEntry entry)
     {
-        node.HasUnrealizedChildren = false;
-        var entry = Entry(node)!;
+        entry.Loaded = true;
         var isDrives = entry.IsGroup && entry.Path == "";
         Task.Run(() => isDrives ? ReadDrives() : ReadFolders(entry.Path)).ContinueWith(t =>
             ui.TryEnqueue(() =>
             {
                 foreach (var child in t.Result)
-                    node.Children.Add(new TreeViewNode { Content = child.Visual(), HasUnrealizedChildren = true });
+                    entry.Children.Add(child);
             }));
     }
 
@@ -124,18 +118,19 @@ public sealed partial class MainWindow
 
     void FolderTree_ItemInvoked(TreeView sender, TreeViewItemInvokedEventArgs args)
     {
-        if (args.InvokedItem is not TreeViewNode node || Entry(node) is not { } entry)
+        if (args.InvokedItem is not FolderEntry entry)
             return;
         if (entry.IsGroup)
         {
             // A heading opens and closes; the highlight stays on the open folder.
-            node.IsExpanded = !node.IsExpanded;
-            sender.SelectedNode = sender == FolderTree && openNode is { Parent: not null } ? openNode : null;
+            entry.IsExpanded = !entry.IsExpanded;
+            // After the tree has moved the selection onto the heading.
+            ui.TryEnqueue(() => sender.SelectedItem = sender == FolderTree ? openEntry : null);
         }
         else
         {
             if (sender == FolderTree)
-                openNode = node;
+                openEntry = entry;
             OpenFolder(entry.Path, null);
         }
         FocusKeys();
@@ -147,10 +142,11 @@ public sealed partial class MainWindow
     async Task RefreshRecent()
     {
         var found = await Task.Run(() => ReadLines(RecentFile).Where(Directory.Exists).ToList());
-        recentNode.Children.Clear();
+        if (openEntry != null && recentEntry.Children.Contains(openEntry))
+            openEntry = null;
+        recentEntry.Children.Clear();
         foreach (var path in found)
-            recentNode.Children.Add(Node(new FolderEntry(path, Path.GetFileName(path.TrimEnd('\\')))));
-        recentNode.IsExpanded = true;
+            recentEntry.Children.Add(new FolderEntry(path, Path.GetFileName(path.TrimEnd('\\'))));
         HighlightOpenFolder();
     }
 
@@ -160,11 +156,10 @@ public sealed partial class MainWindow
     {
         if (folder == null)
             return;
-        bool Open(TreeViewNode? n) => n is { Parent: not null }
-            && string.Equals(Entry(n)?.Path, folder, StringComparison.OrdinalIgnoreCase);
-        if (!Open(openNode))
-            openNode = recentNode.Children.FirstOrDefault(Open);
-        FolderTree.SelectedNode = openNode;
+        bool Open(FolderEntry? e) => e != null && string.Equals(e.Path, folder, StringComparison.OrdinalIgnoreCase);
+        if (!Open(openEntry))
+            openEntry = recentEntry.Children.FirstOrDefault(Open);
+        FolderTree.SelectedItem = openEntry;
     }
 
     // ---- Search ----
@@ -183,7 +178,7 @@ public sealed partial class MainWindow
         var cancel = searchCancel = new CancellationTokenSource();
         FolderTree.Visibility = SearchTree.Visibility = Visibility.Collapsed;
         SearchStatus.Text = "Searching…";
-        List<Hit> found;
+        List<FolderEntry> found;
         try
         {
             // A short wait, so typing doesn't start a search per letter.
@@ -195,9 +190,7 @@ public sealed partial class MainWindow
         {
             return;
         }
-        SearchTree.RootNodes.Clear();
-        foreach (var group in found)
-            SearchTree.RootNodes.Add(ToNode(group, isGroup: true));
+        SearchTree.ItemsSource = found;
         SearchTree.Visibility = Visibility.Visible;
         FolderTree.Visibility = Visibility.Collapsed;
         SearchStatus.Text = found.Count == 0 ? "No folders match." : "";
@@ -205,19 +198,21 @@ public sealed partial class MainWindow
 
     /// <summary>The Recent and Pictures folders whose names contain <paramref name="text"/>, each
     /// under the folders that lead to it. Only branches with a match are returned.</summary>
-    static List<Hit> Search(string text, List<string> recent, CancellationToken cancel)
+    static List<FolderEntry> Search(string text, List<string> recent, CancellationToken cancel)
     {
         bool Matches(string name) => name.Contains(text, StringComparison.OrdinalIgnoreCase);
-        var groups = new List<Hit>();
+        FolderEntry Result(string path, string name, bool isGroup = false) =>
+            new(path, name, isGroup) { Loaded = true, IsExpanded = true };
+        var groups = new List<FolderEntry>();
 
-        var recentGroup = new Hit("", "Recent");
+        var recentGroup = Result("", "Recent", isGroup: true);
         foreach (var path in recent.Where(p => Matches(Path.GetFileName(p.TrimEnd('\\')))))
-            recentGroup.Children.Add(new Hit(path, Path.GetFileName(path.TrimEnd('\\'))));
+            recentGroup.Children.Add(Result(path, Path.GetFileName(path.TrimEnd('\\'))));
         if (recentGroup.Children.Count > 0)
             groups.Add(recentGroup);
 
-        var root = new Hit(PicturesPath, "Pictures");
-        var byPath = new Dictionary<string, Hit>(StringComparer.OrdinalIgnoreCase) { [PicturesPath] = root };
+        var root = Result(PicturesPath, "Pictures", isGroup: true);
+        var byPath = new Dictionary<string, FolderEntry>(StringComparer.OrdinalIgnoreCase) { [PicturesPath] = root };
         var count = 0;
         try
         {
@@ -239,9 +234,9 @@ public sealed partial class MainWindow
                 while (chain.Count > 0)
                 {
                     var p = chain.Pop();
-                    var hit = new Hit(p, Path.GetFileName(p));
-                    byPath[Path.GetDirectoryName(p)!].Children.Add(hit);
-                    byPath[p] = hit;
+                    var entry = Result(p, Path.GetFileName(p));
+                    byPath[Path.GetDirectoryName(p)!].Children.Add(entry);
+                    byPath[p] = entry;
                 }
                 if (++count >= MaxSearchResults)
                     break;
@@ -251,13 +246,5 @@ public sealed partial class MainWindow
         if (root.Children.Count > 0)
             groups.Add(root);
         return groups;
-    }
-
-    static TreeViewNode ToNode(Hit hit, bool isGroup = false)
-    {
-        var node = Node(new FolderEntry(hit.Path, hit.Name, isGroup), expanded: true);
-        foreach (var child in hit.Children.OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase))
-            node.Children.Add(ToNode(child));
-        return node;
     }
 }

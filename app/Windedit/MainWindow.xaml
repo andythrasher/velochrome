@@ -40,9 +40,15 @@
                 </Border>
             </DataTemplate>
 
-            <!-- A folder in the Folders panel: the tree hands the template its node. -->
-            <DataTemplate x:Key="FolderTemplate" x:DataType="TreeViewNode">
-                <ContentPresenter Content="{x:Bind Content}" />
+            <!-- A folder in the Folders panel (the trees are in ItemsSource mode, so the template gets the folder). -->
+            <DataTemplate x:Key="FolderTemplate" x:DataType="local:FolderEntry">
+                <TreeViewItem ItemsSource="{x:Bind Children}" HasUnrealizedChildren="{x:Bind HasUnrealized}"
+                              IsExpanded="{x:Bind IsExpanded, Mode=TwoWay}" ToolTipService.ToolTip="{x:Bind Tip}">
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <FontIcon Glyph="{x:Bind Glyph}" FontSize="14" Opacity="0.8" />
+                        <TextBlock Text="{x:Bind Name}" FontWeight="{x:Bind Weight}" TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
+                </TreeViewItem>
             </DataTemplate>
         </Grid.Resources>
 
