@@ -12,13 +12,13 @@ use rayon::prelude::*;
 
 use crate::library::Photo;
 use crate::develop::Edit;
-use crate::masks::Masks;
+use crate::masks::{Masks, Stroke, StrokeMap, Strokes};
 use crate::xmp::{self, Metadata};
 
 /// What undo steps through: the adjustments and the masks together, so one step covers whichever
 /// changed. The masks are shared, so a snapshot costs a pointer (and none at all for a photo
 /// without masks).
-pub type State = (Edit, Option<Arc<Masks>>);
+pub type State = (Edit, Option<Arc<Masks>>, Option<Strokes>);
 
 /// One photo's undo history. `committed` is what's saved; a drag in progress may show
 /// something else until it's let go.
@@ -127,7 +127,29 @@ impl Ratings {
 
     /// Like [`set_edit`](Self::set_edit), for the photo's masks.
     pub fn set_masks(&self, index: usize, masks: Masks, commit: bool) -> bool {
-        self.set_state(index, commit, |state| state.1 = (!masks.is_empty()).then(|| Arc::new(masks)))
+        self.set_state(index, commit, |state| {
+            state.1 = (!masks.is_empty()).then(|| Arc::new(masks));
+            // The strokes of a brush component that is gone go with it (undo has them in its snapshots).
+            if let Some(left) = state.2.as_ref().and_then(|s| crate::masks::pruned(s, &masks)) {
+                state.2 = (!left.is_empty()).then(|| Arc::new(left));
+            }
+        })
+    }
+
+    /// Adds a finished stroke to brush `id`: one undo step, and saved.
+    pub fn add_stroke(&self, index: usize, id: u32, stroke: Stroke) -> bool {
+        self.set_state(index, true, |state| {
+            let mut map: StrokeMap = state.2.as_deref().cloned().unwrap_or_default();
+            let mut list: Vec<Stroke> = map.get(&id).map(|l| l.to_vec()).unwrap_or_default();
+            list.push(stroke);
+            map.insert(id, Arc::new(list));
+            state.2 = Some(Arc::new(map));
+        })
+    }
+
+    /// A photo's brush strokes, by brush id (none for a photo without).
+    pub fn strokes(&self, index: usize) -> Option<Strokes> {
+        self.values.lock().unwrap().get(index).map(|m| m.strokes.clone().unwrap_or_default())
     }
 
     fn set_state(&self, index: usize, commit: bool, change: impl FnOnce(&mut State)) -> bool {
@@ -135,10 +157,10 @@ impl Ratings {
             let mut values = self.values.lock().unwrap();
             let Some(meta) = values.get_mut(index) else { return false };
             let mut history = self.history.lock().unwrap();
-            let h = history.entry(index).or_insert_with(|| History::new((meta.edit, meta.masks.clone())));
-            let mut state = (meta.edit, meta.masks.clone());
+            let h = history.entry(index).or_insert_with(|| History::new((meta.edit, meta.masks.clone(), meta.strokes.clone())));
+            let mut state = (meta.edit, meta.masks.clone(), meta.strokes.clone());
             change(&mut state);
-            (meta.edit, meta.masks) = state.clone();
+            (meta.edit, meta.masks, meta.strokes) = state.clone();
             if !commit || state == h.committed {
                 return true;
             }
@@ -151,20 +173,20 @@ impl Ratings {
 
     /// Steps a photo's adjustments and masks back (or forward, for redo). Returns what is now in
     /// effect, or None if there was nothing to undo (or redo).
-    pub fn undo(&self, index: usize, redo: bool) -> Option<(Edit, Masks)> {
+    pub fn undo(&self, index: usize, redo: bool) -> Option<(Edit, Masks, Strokes)> {
         let state = {
             let mut values = self.values.lock().unwrap();
             let meta = values.get_mut(index)?;
             let mut history = self.history.lock().unwrap();
-            let h = history.entry(index).or_insert_with(|| History::new((meta.edit, meta.masks.clone())));
+            let h = history.entry(index).or_insert_with(|| History::new((meta.edit, meta.masks.clone(), meta.strokes.clone())));
             let (from, to) = if redo { (&mut h.future, &mut h.past) } else { (&mut h.past, &mut h.future) };
             let state = from.pop()?;
             to.push(std::mem::replace(&mut h.committed, state.clone()));
-            (meta.edit, meta.masks) = state.clone();
+            (meta.edit, meta.masks, meta.strokes) = state.clone();
             state
         };
         self.save(index);
-        Some((state.0, state.1.as_deref().copied().unwrap_or_default()))
+        Some((state.0, state.1.as_deref().copied().unwrap_or_default(), state.2.unwrap_or_default()))
     }
 
     fn save(&self, index: usize) {
@@ -275,11 +297,11 @@ mod tests {
         r.set_masks(0, with_mask(2.0), true);
         assert_eq!(r.masks(0).unwrap().masks[0].sliders[2], 2.0);
 
-        let (e, m) = r.undo(0, false).unwrap();
+        let (e, m, _) = r.undo(0, false).unwrap();
         assert_eq!((e.exposure, m.masks[0].sliders[2]), (1.0, 1.0));
-        let (e, m) = r.undo(0, false).unwrap();
+        let (e, m, _) = r.undo(0, false).unwrap();
         assert_eq!((e.exposure, m.masks[0].sliders[2]), (0.0, 1.0), "the edit alone was one step");
-        let (e, m) = r.undo(0, false).unwrap();
+        let (e, m, _) = r.undo(0, false).unwrap();
         assert!(e.is_default() && m.is_empty(), "and the first mask change one more");
         assert!(r.undo(0, false).is_none());
         assert_eq!(r.undo(0, true).unwrap().1.masks[0].sliders[2], 1.0);
@@ -295,6 +317,49 @@ mod tests {
         let saved = xmp::read(&xmp::sidecar_path(&dir, "P1"));
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(saved.masks.as_deref().unwrap().masks[0].sliders[2], 3.0, "the masks are saved with the edit");
+    }
+
+    #[test]
+    fn brush_strokes_are_undo_steps_pruned_with_their_component_and_saved() {
+        use crate::masks::{Component, KIND_BRUSH, Mask};
+        let dir = std::env::temp_dir().join(format!("windedit-ratings-brush-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let photos = vec![Photo { name: "P1".into(), raw: None, jpeg: None }];
+        let r = Ratings::new();
+        r.load(&dir, &photos);
+        let mut masks = Masks::default();
+        masks.masks[0] = Mask::new();
+        masks.masks[0].components[0] = Component { kind: KIND_BRUSH, p: [4.0, 0.3, 0.3, 0.0, 0.0, 0.0, 0.0, 0.0], ..Default::default() };
+        masks.masks[0].count = 1;
+        masks.count = 1;
+        let stroke = |x: f32| {
+            let mut s = Stroke::new(false, 0.05, 0.5, 0.5, 1.0);
+            s.points = vec![Stroke::quantise([x, 0.3]), Stroke::quantise([x + 0.1, 0.35])];
+            s
+        };
+        r.set_masks(0, masks, false);
+        assert!(r.add_stroke(0, 4, stroke(0.3)));
+        assert!(r.add_stroke(0, 4, stroke(0.5)));
+        assert_eq!(r.strokes(0).unwrap()[&4].len(), 2);
+        // Each stroke is a step; the first also carried the component made with it (a drag, not a step of its own).
+        let (_, m, s) = r.undo(0, false).unwrap();
+        assert_eq!((m.count, s[&4].len()), (1, 1));
+        let (_, m, s) = r.undo(0, false).unwrap();
+        assert!(m.is_empty() && s.is_empty());
+        let (_, _, s) = r.undo(0, true).unwrap();
+        assert_eq!(s[&4].len(), 1);
+        let (_, _, s) = r.undo(0, true).unwrap();
+        assert_eq!(s[&4].len(), 2);
+        // Deleting the component takes its strokes; undoing brings both back.
+        r.set_masks(0, Masks::default(), true);
+        assert!(r.strokes(0).unwrap().is_empty());
+        let (_, m, s) = r.undo(0, false).unwrap();
+        assert_eq!((m.count, s[&4].len()), (1, 2));
+        r.finish();
+        let saved = xmp::read(&xmp::sidecar_path(&dir, "P1"));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(saved.strokes.as_deref().unwrap()[&4].len(), 2, "the strokes are saved with the masks");
+        assert_eq!(saved.strokes.as_deref().unwrap()[&4][0], stroke(0.3));
     }
 
     #[test]

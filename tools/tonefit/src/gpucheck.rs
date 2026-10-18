@@ -114,7 +114,7 @@ pub fn run(raw: &Path, out_dir: &Path) -> Result<()> {
         let cpu_codes: Vec<[u8; 3]> = cpu.iter().map(|p| p.map(|v| (linear_to_srgb(v) * 255.0).round() as u8)).collect();
 
         gpu.begin()?;
-        render_image_masked(&gpu, &image, &edit, &MaskInput { masks: &mask_set, overlay: None }, Zoom::Fit, &target);
+        render_image_masked(&gpu, &image, &edit, &MaskInput { masks: &mask_set, overlay: None, brush: None }, Zoom::Fit, &target);
         gpu.submit()?;
         let rgba = read_target(&mut gpu, &target)?;
         if std::env::var_os("GPUCHECK_DEBUG").is_some() {

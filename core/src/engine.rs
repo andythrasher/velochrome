@@ -12,7 +12,7 @@ use crate::jobs::{self, Focus, Jobs};
 use crate::library::{self, Photo};
 use crate::ratings::Ratings;
 use crate::develop::{self, Edit};
-use crate::masks::Masks;
+use crate::masks::{DabWalker, Masks, Stroke};
 use crate::pipeline::Zoom;
 use crate::export::Request;
 use crate::import::{self, Import, Plan};
@@ -30,6 +30,26 @@ pub struct Engine {
     events: Arc<Mutex<EventSink>>,
     import_plan: Mutex<Option<Arc<Plan>>>,
     import: Mutex<Option<Import>>,
+    /// The brush stroke being painted, if any.
+    live: Mutex<Option<LiveStroke>>,
+}
+
+/// A brush stroke under way: what it has so far, and the walker that spaces its dabs.
+struct LiveStroke {
+    index: usize,
+    id: u32,
+    stroke: Stroke,
+    walker: DabWalker,
+}
+
+/// The settings a stroke is painted with (`Stroke::new`).
+#[derive(Debug, Clone, Copy)]
+pub struct Brush {
+    pub erase: bool,
+    pub radius: f32,
+    pub feather: f32,
+    pub flow: f32,
+    pub density: f32,
 }
 
 /// What decides which decodes are wanted.
@@ -71,6 +91,7 @@ impl Engine {
             events,
             import_plan: Mutex::new(None),
             import: Mutex::new(None),
+            live: Mutex::new(None),
             view: Mutex::new(ViewState {
                 index: None,
                 direction: 1,
@@ -154,6 +175,7 @@ impl Engine {
         // Its adjustments first, so the first frame of it already has them.
         let _ = self.viewer.send(Command::SetEdit(self.ratings.edit(index).unwrap_or_default()));
         let _ = self.viewer.send(Command::SetMasks(Box::new(self.ratings.masks(index).unwrap_or_default())));
+        let _ = self.viewer.send(Command::SetStrokes(self.ratings.strokes(index).unwrap_or_default()));
         let _ = self.viewer.send(Command::Show(index));
     }
 
@@ -210,6 +232,47 @@ impl Engine {
         let ok = self.ratings.set_masks(index, masks, commit);
         if ok && self.view.lock().unwrap().index == Some(index) {
             let _ = self.viewer.send(Command::SetMasks(Box::new(masks)));
+            // A brush component that is gone takes its strokes with it.
+            let _ = self.viewer.send(Command::SetStrokes(self.ratings.strokes(index).unwrap_or_default()));
+        }
+        ok
+    }
+
+    /// Paints with the brush: adds the pointer positions `points` (frame units, as masks are) to the
+    /// stroke under way in brush `id` of photo `index`, or starts one (`first`) with `brush`'s settings.
+    /// The dabs they make show at once; `brush_end` finishes the stroke.
+    pub fn brush_paint(&self, index: usize, id: u32, brush: Brush, first: bool, points: &[[f32; 2]]) -> bool {
+        let mut live = self.live.lock().unwrap();
+        if first || live.as_ref().is_none_or(|l| l.index != index || l.id != id) {
+            if !first {
+                return false;
+            }
+            *live = Some(LiveStroke { index, id, stroke: Stroke::new(brush.erase, brush.radius, brush.feather, brush.flow, brush.density), walker: DabWalker::new() });
+        }
+        let l = live.as_mut().unwrap();
+        let mut dabs = Vec::new();
+        for p in points {
+            // The stroke keeps the pointer's positions to the sidecar's precision, and is painted from those.
+            let q = Stroke::quantise(*p);
+            if l.stroke.points.last() == Some(&q) {
+                continue;
+            }
+            l.stroke.points.push(q);
+            l.walker.feed(l.stroke.radius, q.map(|v| v as f32 * crate::masks::POINT_UNIT), &mut dabs);
+        }
+        let _ = self.viewer.send(Command::BrushDabs { id, stroke: Box::new(Stroke { points: Vec::new(), ..l.stroke.clone() }), dabs });
+        true
+    }
+
+    /// Finishes the stroke under way: it joins its brush's strokes as one step for undo, and is saved.
+    pub fn brush_end(&self, index: usize) -> bool {
+        let Some(l) = self.live.lock().unwrap().take() else { return false };
+        if l.index != index {
+            return false;
+        }
+        let ok = self.ratings.add_stroke(index, l.id, l.stroke);
+        if ok && self.view.lock().unwrap().index == Some(index) {
+            let _ = self.viewer.send(Command::SetStrokes(self.ratings.strokes(index).unwrap_or_default()));
         }
         ok
     }
@@ -221,10 +284,11 @@ impl Engine {
 
     /// Undoes (or redoes) a photo's last committed change; returns its adjustments and masks now.
     pub fn undo(&self, index: usize, redo: bool) -> Option<(Edit, Masks)> {
-        let (edit, masks) = self.ratings.undo(index, redo)?;
+        let (edit, masks, strokes) = self.ratings.undo(index, redo)?;
         if self.view.lock().unwrap().index == Some(index) {
             let _ = self.viewer.send(Command::SetEdit(edit));
             let _ = self.viewer.send(Command::SetMasks(Box::new(masks)));
+            let _ = self.viewer.send(Command::SetStrokes(strokes));
         }
         Some((edit, masks))
     }
@@ -237,8 +301,9 @@ impl Engine {
         let raw = photo.raw.clone().ok_or(format!("{} has no raw file to export", photo.name))?;
         let edit = self.ratings.edit(index).unwrap_or_default();
         let masks = self.ratings.masks(index).unwrap_or_default();
+        let strokes = self.ratings.strokes(index).unwrap_or_default();
         let id = self.next_export.fetch_add(1, Ordering::Relaxed);
-        let _ = self.viewer.send(Command::Export(ExportJob { id, index, raw, path, edit, masks: Box::new(masks), request }));
+        let _ = self.viewer.send(Command::Export(ExportJob { id, index, raw, path, edit, masks: Box::new(masks), strokes, request }));
         Ok(id)
     }
 

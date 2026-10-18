@@ -36,7 +36,30 @@ public sealed partial class MainWindow
     bool creatingNewMask;
 
     // A drag in progress.
-    enum Grab { None, Move, Rotate, LinearFull, LinearGone, RadiusX, RadiusY, Create }
+    enum Grab { None, Move, Rotate, LinearFull, LinearGone, RadiusX, RadiusY, Create, Paint }
+
+    // The brush (docs/phase2d-masks.md, part B). The settings are the app's, kept while it runs; each
+    // stroke carries the ones it was painted with.
+    double brushSize = 25, brushFeather = 50, brushFlow = 50, brushDensity = 100;
+    bool brushErase;
+    /// <summary>The brush stroke being painted: the next positions go to the engine, the first one starting it.</summary>
+    bool paintFirst;
+    uint paintId;
+    /// <summary>The pointer over the photo while a brush is the tool (for its cursor), in canvas units.</summary>
+    Point? brushHover;
+    StackPanel brushBox = null!;
+    ToggleSwitch eraseSwitch = null!;
+
+    /// <summary>The brush's radius in units of the photo's long edge: Size 100 is a fifth of it.</summary>
+    double BrushRadius => brushSize / 100 * 0.2;
+
+    /// <summary>Whether the tool in hand is a brush: one is being made, or the selected shape is one.</summary>
+    bool BrushActive =>
+        masking && (creatingShape == Engine.BrushShape
+            || (creatingShape == 0 && selMask >= 0 && selComp >= 0 && selMask < masks.Count && selComp < masks.Items[selMask].Count
+                && masks.Items[selMask].Components[selComp].Kind == Engine.BrushShape));
+
+    static bool AltDown() => InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Menu).HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
     Grab mkGrab;
     Point mkStart;
     (double X, double Y) mkStartFrame;
@@ -68,16 +91,16 @@ public sealed partial class MainWindow
 
     void BuildMaskPanel()
     {
-        MaskControls.Children.Add(new TextBlock { Text = "Masks", Style = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"], Margin = new Thickness(4, 0, 0, 6) });
-        var create = new Button { Content = "+ New mask", HorizontalAlignment = HorizontalAlignment.Stretch };
-        create.Flyout = ShapeMenu(shape => StartCreating(shape, 0, newMask: true), ("Linear gradient  (M)", Engine.LinearShape), ("Radial gradient  (Shift+M)", Engine.RadialShape));
+
+        var create = new Button { Content = "+ New mask", HorizontalAlignment = HorizontalAlignment.Stretch, Padding = new Thickness(8, 3, 8, 3), MinHeight = 0 };
+        create.Flyout = ShapeMenu(shape => StartCreating(shape, 0, newMask: true), ("Linear gradient  (M)", Engine.LinearShape), ("Radial gradient  (Shift+M)", Engine.RadialShape), ("Brush  (K)", Engine.BrushShape));
         MaskControls.Children.Add(create);
-        maskListBox = new StackPanel { Spacing = 2, Margin = new Thickness(0, 6, 0, 0) };
+        maskListBox = new StackPanel { Spacing = 0, Margin = new Thickness(0, 4, 0, 0) };
         MaskControls.Children.Add(maskListBox);
-        maskHint = new TextBlock { Opacity = 0.6, FontSize = 12, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(4, 6, 0, 0) };
+        maskHint = new TextBlock { Opacity = 0.6, FontSize = 12, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(4, 4, 0, 0), Visibility = Visibility.Collapsed };
         MaskControls.Children.Add(maskHint);
 
-        overlaySwitch = new ToggleSwitch { OnContent = "", OffContent = "", MinWidth = 0 };
+        overlaySwitch = new ToggleSwitch { OnContent = "", OffContent = "", MinWidth = 0, MinHeight = 0, Margin = new Thickness(0, -4, 0, -4) };
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(overlaySwitch, "Show overlay");
         overlaySwitch.Toggled += (_, _) =>
         {
@@ -85,7 +108,7 @@ public sealed partial class MainWindow
                 SetOverlay(overlaySwitch.IsOn);
             FocusKeys();
         };
-        var overlayRow = new Grid { Margin = new Thickness(0, 8, 0, 0) };
+        var overlayRow = new Grid { Margin = new Thickness(0, 2, 0, 0) };
         overlayRow.Children.Add(new TextBlock { Text = "Show overlay  (O)", FontSize = 13, VerticalAlignment = VerticalAlignment.Center });
         overlaySwitch.HorizontalAlignment = HorizontalAlignment.Right;
         overlayRow.Children.Add(overlaySwitch);
@@ -111,7 +134,7 @@ public sealed partial class MainWindow
         };
         featherSlider.DoubleTapped += (_, _) => ChangeMasks((ref Engine.Masks m) => m.Items[selMask].Components[selComp].P[5] = 50, commit: true);
         WireMaskCommit(featherSlider);
-        invertSwitch = new ToggleSwitch { OnContent = "", OffContent = "", MinWidth = 0 };
+        invertSwitch = new ToggleSwitch { OnContent = "Invert", OffContent = "Invert", MinWidth = 0, FontSize = 13, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 0, 0) };
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(invertSwitch, "Invert");
         invertSwitch.Toggled += (_, _) =>
         {
@@ -119,14 +142,20 @@ public sealed partial class MainWindow
                 ChangeMasks((ref Engine.Masks m) => m.Items[selMask].Components[selComp].P[6] = invertSwitch.IsOn ? 1 : 0, commit: true);
             FocusKeys();
         };
-        var invertRow = new Grid { Margin = new Thickness(0, 4, 0, 0) };
-        invertRow.Children.Add(new TextBlock { Text = "Invert", FontSize = 13, VerticalAlignment = VerticalAlignment.Center });
-        invertSwitch.HorizontalAlignment = HorizontalAlignment.Right;
-        invertRow.Children.Add(invertSwitch);
-        radialBox.Children.Add(featherLabel);
-        radialBox.Children.Add(featherSlider);
-        radialBox.Children.Add(invertRow);
+        // Feather and its slider on the left, Invert beside them, so a radial shape costs one row of the panel.
+        var featherColumn = new StackPanel { Spacing = 2 };
+        featherColumn.Children.Add(featherLabel);
+        featherColumn.Children.Add(featherSlider);
+        var radialRow = new Grid { ColumnSpacing = 4 };
+        radialRow.ColumnDefinitions.Add(new ColumnDefinition());
+        radialRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        radialRow.Children.Add(featherColumn);
+        Grid.SetColumn(invertSwitch, 1);
+        radialRow.Children.Add(invertSwitch);
+        radialBox.Children.Add(radialRow);
+        BuildBrushBox();
         // The shape's settings come before the mask's sliders, as the shape is what was just made.
+
         MaskControls.Children.Add(radialBox);
         MaskControls.Children.Add(maskSliderBox);
 
@@ -155,6 +184,72 @@ public sealed partial class MainWindow
             Text = "Drag on the photo to make a shape. Delete removes the selected shape. Double-click a slider to reset it.",
             Opacity = 0.55, FontSize = 12, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 0),
         });
+    }
+
+    /// <summary>
+    /// The brush's tool strip, a floating bar over the top of the photo (<c>BrushStrip</c> in the XAML, which
+    /// gives it the theme's card look): Size, Feather, Flow and Density, Erase, and a hint. It is above the
+    /// mask canvas, so nothing done on it paints.
+    /// </summary>
+    void BuildBrushBox()
+    {
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, VerticalAlignment = VerticalAlignment.Center };
+        void Setting(string name, double min, double max, Func<double> get, Action<double> set, string tip)
+        {
+            var label = new TextBlock { FontSize = 12, VerticalAlignment = VerticalAlignment.Center, Width = 68 };
+            var slider = new Slider { Minimum = min, Maximum = max, StepFrequency = 1, SmallChange = 1, LargeChange = 10, IsThumbToolTipEnabled = false, MinWidth = 0, Width = 58, Value = get(), VerticalAlignment = VerticalAlignment.Center };
+            label.Text = $"{name} {slider.Value:0}";
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(slider, "Brush " + name);
+            ToolTipService.SetToolTip(slider, tip);
+            slider.ValueChanged += (_, e) =>
+            {
+                label.Text = $"{name} {e.NewValue:0}";
+                set(e.NewValue);
+            };
+            slider.PointerReleased += (_, _) => FocusKeys();
+            brushRefresh.Add(() =>
+            {
+                slider.Value = get();
+                label.Text = $"{name} {slider.Value:0}";
+            });
+            var pair = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2 };
+            pair.Children.Add(label);
+            pair.Children.Add(slider);
+            row.Children.Add(pair);
+        }
+        Setting("Size", 1, 100, () => brushSize, v => brushSize = v, "How big the brush is: [ and ] change it");
+        Setting("Feather", 0, 100, () => brushFeather, v => brushFeather = v, "How much of the brush, from its edge in, is soft");
+        Setting("Flow", 1, 100, () => brushFlow, v => brushFlow = v, "How much each dab adds: low flow builds up as you paint over a spot");
+        Setting("Density", 1, 100, () => brushDensity, v => brushDensity = v, "The most a stroke can add");
+        eraseSwitch = new ToggleSwitch { OnContent = "Erase", OffContent = "Erase", MinWidth = 0, VerticalAlignment = VerticalAlignment.Center, FontSize = 12 };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(eraseSwitch, "Erase");
+        eraseSwitch.Toggled += (_, _) =>
+        {
+            brushErase = eraseSwitch.IsOn;
+            FocusKeys();
+        };
+        // Second line: the hint on the left, Erase on the right.
+        var hint = new TextBlock { Text = "Alt: erase · [ ]: size", FontSize = 11, Opacity = 0.6, VerticalAlignment = VerticalAlignment.Center };
+        eraseSwitch.HorizontalAlignment = HorizontalAlignment.Right;
+        var second = new Grid { Margin = new Thickness(0, -4, 0, 0) };
+        second.Children.Add(hint);
+        second.Children.Add(eraseSwitch);
+        var column = new StackPanel { Spacing = 0 };
+        column.Children.Add(row);
+        column.Children.Add(second);
+        BrushStrip.Child = column;
+        brushBox = column;
+    }
+
+    readonly List<Action> brushRefresh = [];
+
+    /// <summary>[ and ] make the brush smaller and bigger.</summary>
+    void NudgeBrushSize(int direction)
+    {
+        brushSize = Math.Clamp(brushSize + direction * (brushSize < 20 ? 2 : 5), 1, 100);
+        foreach (var refresh in brushRefresh)
+            refresh();
+        UpdateMaskOverlay();
     }
 
     /// <summary>A menu of shapes; choosing one calls <paramref name="chosen"/>.</summary>
@@ -253,10 +348,10 @@ public sealed partial class MainWindow
                 crow.ColumnDefinitions.Add(new ColumnDefinition());
                 crow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                 crow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-                var shape = c.Kind == Engine.LinearShape ? "Linear gradient" : "Radial gradient";
+                var shape = c.Kind == Engine.LinearShape ? "Linear gradient" : c.Kind == Engine.BrushShape ? "Brush" : "Radial gradient";
                 var pick = RowButton(shape, j == selComp, bold: false);
                 pick.Click += (_, _) => SelectMask(index, comp);
-                var mode = new Button { Content = c.Mode == Engine.SubtractMode ? "Subtract" : "Add", MinWidth = 0, Padding = new Thickness(8, 3, 8, 3), FontSize = 12 };
+                var mode = new Button { Content = c.Mode == Engine.SubtractMode ? "Subtract" : "Add", MinWidth = 0, MinHeight = 0, Padding = new Thickness(8, 2, 8, 2), FontSize = 12 };
                 ToolTipService.SetToolTip(mode, "Switch between adding to and subtracting from the mask");
                 mode.Click += (_, _) => ChangeMasks((ref Engine.Masks m) => m.Items[index].Components[comp].Mode ^= 1, commit: true);
                 var remove = IconButton("\uE74D", "Delete the shape (Delete)");
@@ -268,24 +363,27 @@ public sealed partial class MainWindow
                 crow.Children.Add(remove);
                 maskListBox.Children.Add(crow);
             }
-            var adds = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, Margin = new Thickness(14, 2, 0, 4) };
+            var adds = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, Margin = new Thickness(14, 2, 0, 2) };
             foreach (var (text, subtract) in new[] { ("Add", false), ("Subtract", true) })
             {
-                var button2 = new Button { Content = text + " ▾", FontSize = 12, Padding = new Thickness(10, 3, 10, 3) };
+                var button2 = new Button { Content = text + " ▾", FontSize = 12, MinHeight = 0, Padding = new Thickness(10, 2, 10, 2) };
                 button2.IsEnabled = masks.Items[i].Count < Engine.MaxComponents;
                 button2.Flyout = ShapeMenu(shape => StartCreating(shape, subtract ? Engine.SubtractMode : 0, newMask: false),
-                    ("Linear gradient", Engine.LinearShape), ("Radial gradient", Engine.RadialShape));
+                    ("Linear gradient", Engine.LinearShape), ("Radial gradient", Engine.RadialShape), ("Brush", Engine.BrushShape));
                 adds.Children.Add(button2);
             }
             maskListBox.Children.Add(adds);
         }
         maskHint.Text = creatingShape != 0 ? "Drag on the photo to make the shape · Esc cancels"
-            : masks.Count == 0 ? "No masks. Choose + New mask, or press M (linear) or Shift+M (radial)." : "";
+            : masks.Count == 0 ? "No masks. Choose + New mask, or press M (linear), Shift+M (radial) or K (brush)." : "";
+        maskHint.Visibility = maskHint.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
 
         var has = selMask >= 0 && selMask < masks.Count;
         maskSliderBox.Visibility = has ? Visibility.Visible : Visibility.Collapsed;
         var radial = has && selComp >= 0 && selComp < masks.Items[selMask].Count && masks.Items[selMask].Components[selComp].Kind == Engine.RadialShape;
         radialBox.Visibility = radial ? Visibility.Visible : Visibility.Collapsed;
+        BrushStrip.Visibility = BrushActive ? Visibility.Visible : Visibility.Collapsed;
+        eraseSwitch.IsOn = brushErase;
         if (radial)
         {
             var c = masks.Items[selMask].Components[selComp];
@@ -309,7 +407,7 @@ public sealed partial class MainWindow
         var b = new Button
         {
             Content = text, HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Left,
-            Padding = new Thickness(8, 4, 8, 4), FontWeight = bold ? Microsoft.UI.Text.FontWeights.SemiBold : Microsoft.UI.Text.FontWeights.Normal,
+            Padding = new Thickness(8, 2, 8, 2), MinHeight = 0, FontWeight = bold ? Microsoft.UI.Text.FontWeights.SemiBold : Microsoft.UI.Text.FontWeights.Normal,
             BorderThickness = new Thickness(selected ? 1.5 : 0),
         };
         if (selected)
@@ -321,7 +419,7 @@ public sealed partial class MainWindow
 
     static Button IconButton(string glyph, string tip)
     {
-        var b = new Button { Content = new FontIcon { Glyph = glyph, FontSize = 12 }, Padding = new Thickness(7, 5, 7, 5), MinWidth = 0, MinHeight = 0, Background = new SolidColorBrush(Colors.Transparent), BorderThickness = new Thickness(0) };
+        var b = new Button { Content = new FontIcon { Glyph = glyph, FontSize = 12 }, Padding = new Thickness(7, 3, 7, 3), MinWidth = 0, MinHeight = 0, Background = new SolidColorBrush(Colors.Transparent), BorderThickness = new Thickness(0) };
         ToolTipService.SetToolTip(b, tip);
         return b;
     }
@@ -377,6 +475,7 @@ public sealed partial class MainWindow
         MaskControls.Visibility = Visibility.Collapsed;
         EditControls.Visibility = Visibility.Visible;
         MaskCanvas.Visibility = Visibility.Collapsed;
+        BrushStrip.Visibility = Visibility.Collapsed;
         MaskCanvas.Children.Clear();
         engine.SetMaskOverlay(-1);
     }
@@ -428,6 +527,17 @@ public sealed partial class MainWindow
                 EnterMasks();
                 if (masking)
                     StartCreating(shift ? Engine.RadialShape : Engine.LinearShape, 0, newMask: true);
+                return true;
+            case VirtualKey.K:
+                EnterMasks();
+                if (masking)
+                    StartCreating(Engine.BrushShape, 0, newMask: !(shift && selMask >= 0));
+                return true;
+            case (VirtualKey)219 when masking && BrushActive:
+                NudgeBrushSize(-1);
+                return true;
+            case (VirtualKey)221 when masking && BrushActive:
+                NudgeBrushSize(1);
                 return true;
             case VirtualKey.O when masking:
                 SetOverlay(!overlayOn);
@@ -622,6 +732,14 @@ public sealed partial class MainWindow
         MaskCanvas.PointerMoved += MaskPointerMoved;
         MaskCanvas.PointerReleased += MaskPointerReleased;
         MaskCanvas.PointerCaptureLost += (_, _) => EndMaskDrag();
+        MaskCanvas.PointerExited += (_, _) =>
+        {
+            if (mkGrab == Grab.None && brushHover != null)
+            {
+                brushHover = null;
+                UpdateMaskOverlay();
+            }
+        };
         MaskCanvas.SizeChanged += (_, _) => UpdateMaskOverlay();
     }
 
@@ -636,6 +754,23 @@ public sealed partial class MainWindow
         if (!ready)
             return;
         MaskCanvas.Clip = new RectangleGeometry { Rect = picture };
+        if (BrushActive && brushHover is { } hover && picture.Contains(hover))
+        {
+            // Two circles: the brush's size, and where its feather starts.
+            var here = CanvasToFrame(hover);
+            var edge = FrameToCanvas(here.X + BrushRadius, here.Y);
+            var other = FrameToCanvas(here.X, here.Y + BrushRadius);
+            var radius = Math.Max(Math.Max(Dist(hover, edge), Dist(hover, other)), 2);
+            foreach (var (scale, width, dash) in new[] { (1.0, 1.5, false), (Math.Max(1 - brushFeather / 100, 0.02), 1.0, true) })
+            {
+                var d = 2 * radius * scale;
+                AddShape(new Ellipse { Width = d + 3, Height = d + 3, Stroke = HandleShadow, StrokeThickness = width + 2 }, hover.X - d / 2 - 1.5, hover.Y - d / 2 - 1.5);
+                var ring = new Ellipse { Width = d, Height = d, Stroke = HandleWhite, StrokeThickness = width };
+                if (dash)
+                    ring.StrokeDashArray = new DoubleCollection { 4, 4 };
+                AddShape(ring, hover.X - d / 2, hover.Y - d / 2);
+            }
+        }
         for (var i = 0; i < masks.Count; i++)
             for (var j = 0; j < masks.Items[i].Count; j++)
             {
@@ -668,10 +803,14 @@ public sealed partial class MainWindow
 
     /// <summary>Where a shape's pin sits, in frame coordinates: a gradient's middle, an ellipse's centre.</summary>
     static (double X, double Y) PinOf(Engine.MaskComponent c) =>
-        c.Kind == Engine.LinearShape ? ((c.P[0] + c.P[2]) / 2, (c.P[1] + c.P[3]) / 2) : (c.P[0], c.P[1]);
+        c.Kind == Engine.LinearShape ? ((c.P[0] + c.P[2]) / 2, (c.P[1] + c.P[3]) / 2)
+        : c.Kind == Engine.BrushShape ? (c.P[1], c.P[2])
+        : (c.P[0], c.P[1]);
 
     void DrawHandles(Engine.MaskComponent c, Rect picture)
     {
+        if (c.Kind == Engine.BrushShape)
+            return;
         if (c.Kind == Engine.LinearShape)
         {
             var a = FrameToCanvas(c.P[0], c.P[1]);
@@ -735,6 +874,8 @@ public sealed partial class MainWindow
         if (selMask >= 0 && selComp >= 0 && selMask < masks.Count && selComp < masks.Items[selMask].Count)
         {
             var c = masks.Items[selMask].Components[selComp];
+            if (c.Kind == Engine.BrushShape)
+                return (Grab.Paint, selMask, selComp);
             if (Dist(p, FrameToCanvas(PinOf(c))) <= PinReach)
                 return (Grab.Move, selMask, selComp);
             if (c.Kind == Engine.LinearShape)
@@ -792,13 +933,19 @@ public sealed partial class MainWindow
         {
             // The selected shape's own pin and handles win over a neighbour's pin.
             var hit = HitTest(p);
-            if (PinAt(p) is { } pin && !OnOwnPin(p) && hit.Grab is Grab.None or Grab.Rotate or Grab.Move)
+            if (PinAt(p) is { } pin && !OnOwnPin(p) && hit.Grab is Grab.None or Grab.Rotate or Grab.Move or Grab.Paint)
             {
                 SelectMask(pin.Mask, pin.Comp);
                 return;
             }
             if (hit.Grab == Grab.None)
                 return;
+            if (hit.Grab == Grab.Paint)
+            {
+                MaskCanvas.CapturePointer(e.Pointer);
+                BeginPaint(hit.Mask, hit.Comp, masks.Items[hit.Mask].Components[hit.Comp].P[0], e.GetCurrentPoint(MaskCanvas).Position);
+                return;
+            }
             mkGrab = hit.Grab;
             mkDragMask = hit.Mask;
             mkDragComp = hit.Comp;
@@ -822,7 +969,14 @@ public sealed partial class MainWindow
         var mode = creatingMode;
         var frame = CanvasToFrame(p);
         var comp = new Engine.MaskComponent { Kind = shape, Mode = mode };
-        if (shape == Engine.LinearShape)
+        if (shape == Engine.BrushShape)
+        {
+            // Its strokes are named by an id no brush of this photo has; P[1] and P[2] are where its pin sits.
+            comp.P[0] = NextBrushId();
+            comp.P[1] = (float)frame.X;
+            comp.P[2] = (float)frame.Y;
+        }
+        else if (shape == Engine.LinearShape)
         {
             (comp.P[0], comp.P[1], comp.P[2], comp.P[3]) = ((float)frame.X, (float)frame.Y, (float)frame.X, (float)frame.Y);
         }
@@ -858,12 +1012,63 @@ public sealed partial class MainWindow
         }, commit: false);
         selMask = mask;
         selComp = index;
+        creatingShape = 0;
+        if (shape == Engine.BrushShape)
+        {
+            // The first dab goes down where the pointer is; the drag paints on.
+            BeginPaint(mask, index, comp.P[0], p);
+            return;
+        }
         mkGrab = Grab.Create;
         mkDragMask = mask;
         mkDragComp = index;
         mkOrig = comp;
-        creatingShape = 0;
         UpdateMaskOverlay();
+    }
+
+    uint NextBrushId()
+    {
+        uint next = 1;
+        for (var i = 0; i < masks.Count; i++)
+            for (var j = 0; j < masks.Items[i].Count; j++)
+                if (masks.Items[i].Components[j].Kind == Engine.BrushShape)
+                    next = Math.Max(next, (uint)masks.Items[i].Components[j].P[0] + 1);
+        return next;
+    }
+
+    // ---- Painting ----
+
+    void BeginPaint(int mask, int comp, float id, Point p)
+    {
+        mkGrab = Grab.Paint;
+        mkDragMask = mask;
+        mkDragComp = comp;
+        paintId = (uint)id;
+        paintFirst = true;
+        mkStart = p;
+        mkMoved = false;
+        brushHover = p;
+        PaintTo([p]);
+        SyncMaskOverlay();
+    }
+
+    /// <summary>Sends pointer positions of the stroke under way to the engine, which paints them.</summary>
+    void PaintTo(IEnumerable<Point> points)
+    {
+        if (CurrentPhoto is not { } photo)
+            return;
+        var flat = new List<float>();
+        foreach (var point in points)
+        {
+            var f = CanvasToFrame(point);
+            flat.Add((float)f.X);
+            flat.Add((float)f.Y);
+        }
+        if (flat.Count == 0)
+            return;
+        engine.BrushPaint(photo.Index, paintId, (float)BrushRadius, (float)(brushFeather / 100), (float)(brushFlow / 100), (float)(brushDensity / 100),
+            brushErase || AltDown(), paintFirst, flat.ToArray());
+        paintFirst = false;
     }
 
     void MaskPointerMoved(object sender, PointerRoutedEventArgs e)
@@ -874,6 +1079,15 @@ public sealed partial class MainWindow
         if (mkGrab == Grab.None)
         {
             ShowMaskHover(p);
+            return;
+        }
+        if (mkGrab == Grab.Paint)
+        {
+            brushHover = p;
+            // Every position the pointer passed through since the last event, oldest first.
+            PaintTo(e.GetIntermediatePoints(MaskCanvas).Reverse().Select(q => q.Position));
+            if (Dist(p, mkStart) > 3)
+                mkMoved = true;
             return;
         }
         if (Dist(p, mkStart) > 3)
@@ -985,6 +1199,20 @@ public sealed partial class MainWindow
             return;
         var grab = mkGrab;
         mkGrab = Grab.None;
+        if (grab == Grab.Paint)
+        {
+            // The stroke is one step for undo, together with the mask it made if it made one.
+            if (CurrentPhoto is { } photo)
+            {
+                engine.BrushEnd(photo.Index);
+                masksPending = false;
+                AfterCommit(photo);
+            }
+            RebuildMaskPanel();
+            SyncMaskOverlay();
+            UpdateMaskOverlay();
+            return;
+        }
         if (grab == Grab.Create && !mkMoved && masking)
         {
             // A click without a drag makes a shape of a usual size, as big as the view allows.
@@ -1014,7 +1242,14 @@ public sealed partial class MainWindow
     void ShowMaskHover(Point p)
     {
         InputSystemCursorShape shape;
-        if (creatingShape != 0)
+        if (BrushActive)
+        {
+            // The brush draws its own cursor: two circles, for its size and its feather.
+            brushHover = p;
+            UpdateMaskOverlay();
+            shape = PinAt(p) != null ? InputSystemCursorShape.Hand : InputSystemCursorShape.Cross;
+        }
+        else if (creatingShape != 0)
             shape = InputSystemCursorShape.Cross;
         else if (PinAt(p) != null && !OnOwnPin(p))
             shape = InputSystemCursorShape.Hand;

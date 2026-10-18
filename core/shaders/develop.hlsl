@@ -13,7 +13,7 @@
 // filter's coefficients, the statistics, the detail texture, Clarity's coefficients and the masks.
 #define DEVELOP_ROOT_SIGNATURE \
     "RootConstants(num32BitConstants=62, b0)," \
-    "DescriptorTable(SRV(t0, numDescriptors=7), UAV(u0))," \
+    "DescriptorTable(SRV(t0, numDescriptors=8), UAV(u0))," \
     "StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR," \
     " addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)"
 
@@ -53,6 +53,8 @@ Texture2D<float2> baseCoefficients : register(t2);
 Texture2D<float2> clarityCoefficients : register(t5); // Clarity's base, when lum.w != 0 or maskFlags bit 0
 Buffer<float> stats : register(t3); // the 99.5th and 25th percentiles of the tones
 
+SamplerState linearClamp : register(s0);
+
 // ---- Masks (core/src/masks.rs is the reference; docs/phase2d-masks.md) ----
 
 // Must match GpuComponent and GpuMask in masks.rs, word for word.
@@ -82,6 +84,8 @@ struct MaskData
 // The buffer holds the eight masks (masks.rs `GpuMaskSet::masks`); maskCount says how many are in use.
 #ifdef MASKS
 StructuredBuffer<MaskData> maskSet : register(t6);
+// The brush components' layers (brushgpu.rs), a slice each, over the whole frame: sampled at uv_in.
+Texture2DArray<float> brushLayers : register(t7);
 
 // The masks' sliders weighted at one pixel and summed (masks.rs `Local`).
 struct MaskLocal
@@ -91,7 +95,7 @@ struct MaskLocal
     float contrast, highlights, shadows, whites, blacks, clarity, saturation;
 };
 
-float componentWeight(MaskComponent c, float2 p)
+float componentWeight(MaskComponent c, float2 p, float2 uvIn)
 {
     float w = 0.0;
     if (c.kind == 1)
@@ -112,18 +116,21 @@ float componentWeight(MaskComponent c, float2 p)
         }
         w = (c.flags & 2) != 0 ? 1.0 - w : w;
     }
-    // kind 3 (the brush, part B) will read its raster layer here.
+    else if (c.kind == 3 && c.offset >= 0.0)
+    {
+        w = brushLayers.SampleLevel(linearClamp, float3(uvIn, c.offset), 0);
+    }
     return w;
 }
 
-float maskWeight(uint m, float2 p)
+float maskWeight(uint m, float2 p, float2 uvIn)
 {
     float add = 1.0, sub = 1.0;
     uint n = maskSet[m].count;
     [loop] for (uint i = 0; i < n; i++)
     {
         MaskComponent c = maskSet[m].components[i];
-        float w = componentWeight(c, p);
+        float w = componentWeight(c, p, uvIn);
         if ((c.flags & 1) != 0)
             sub *= 1.0 - w;
         else
@@ -132,13 +139,13 @@ float maskWeight(uint m, float2 p)
     return (1.0 - add) * sub * maskSet[m].opacity;
 }
 
-MaskLocal evalMasks(float2 p)
+MaskLocal evalMasks(float2 p, float2 uvIn)
 {
     MaskLocal l = (MaskLocal)0;
     uint n = min(maskCount, 8u);
     [loop] for (uint m = 0; m < n; m++)
     {
-        float w = maskWeight(m, p);
+        float w = maskWeight(m, p, uvIn);
         if (w <= 0.0)
             continue;
         MaskData d = maskSet[m];
@@ -155,7 +162,6 @@ MaskLocal evalMasks(float2 p)
     return l;
 }
 #endif
-SamplerState linearClamp : register(s0);
 RWTexture2D<unorm float4> output : register(u0);
 
 static const float3x3 REC2020_TO_SRGB = float3x3(
@@ -392,7 +398,7 @@ void main(uint3 id : SV_DispatchThreadID)
     if (maskCount != 0)
     {
         float2 pm = uv_in * dims / max(dims.x, dims.y);
-        MaskLocal ml = evalMasks(pm);
+        MaskLocal ml = evalMasks(pm, uv_in);
         cam *= exp2(ml.exposure + ml.wbLog2);
         sl.contrast = clamp(sl.contrast + ml.contrast, -1.0, 1.0);
         sl.highlights = clamp(sl.highlights + ml.highlights, -1.0, 1.0);
@@ -402,7 +408,7 @@ void main(uint3 id : SV_DispatchThreadID)
         clarityNow = clamp(clarityNow + ml.clarity, -1.0, 1.0);
         satNow = clamp(satNow + ml.saturation, -1.0, 1.0);
         if ((maskFlags & 2) != 0)
-            overlay = maskWeight(maskFlags >> 8, pm);
+            overlay = maskWeight(maskFlags >> 8, pm, uv_in);
     }
 #endif
     float3 wide = float3(dot(row0, cam), dot(row1, cam), dot(row2, cam));

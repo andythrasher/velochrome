@@ -45,6 +45,9 @@ pub struct Metadata {
     /// The local adjustments (docs/phase2d-masks.md), `windedit:Masks` as one line of text
     /// (`masks::to_text`). None when there are none; never Some of an empty set.
     pub masks: Option<Arc<crate::masks::Masks>>,
+    /// The brush strokes of the masks brush components, `windedit:Strokes` (`masks::strokes_to_text`).
+    /// None when there are none.
+    pub strokes: Option<crate::masks::Strokes>,
 }
 
 /// The sidecar for a photo whose files are named `stem` in `dir`.
@@ -100,6 +103,7 @@ pub fn parse(text: &str) -> Option<Metadata> {
     e.clean_lens();
     e.clean_detail();
     e.clean_mixer();
+    meta.strokes = scan.props[STROKES].as_ref().map(|p| crate::masks::strokes_from_text(&p.value)).filter(|m| !m.is_empty()).map(Arc::new);
     meta.masks = scan.props[MASKS].as_ref().map(|p| crate::masks::from_text(&p.value)).filter(|m| !m.is_empty()).map(Arc::new);
     Some(meta)
 }
@@ -194,7 +198,7 @@ const PICK: usize = 2;
 /// (namespace, the prefix to declare if the file has none for it, local name)
 const FIRST_EDIT: usize = 3;
 /// (namespace, the prefix to declare if the file has none for it, local name)
-const PROPS: [(&str, &str, &str); 34 + MIXER_FIELDS] = [
+const PROPS: [(&str, &str, &str); 35 + MIXER_FIELDS] = [
     (NS_XMP, "xmp", "Rating"),
     (NS_XMP, "xmp", "Label"),
     (NS_WINDEDIT, "windedit", "Pick"),
@@ -253,6 +257,7 @@ const PROPS: [(&str, &str, &str); 34 + MIXER_FIELDS] = [
     (NS_WINDEDIT, "windedit", "LuminancePurple"),
     (NS_WINDEDIT, "windedit", "LuminanceMagenta"),
     (NS_WINDEDIT, "windedit", "Masks"),
+    (NS_WINDEDIT, "windedit", "Strokes"),
 ];
 
 /// The edit's fields, in PROPS order from FIRST_EDIT.
@@ -359,6 +364,7 @@ fn values(meta: &Metadata, keep_zero_rating: bool) -> Vec<Option<String>> {
         v.push((text != "0").then_some(text));
     }
     v.push(meta.masks.as_deref().filter(|m| !m.is_empty()).map(crate::masks::to_text));
+    v.push(meta.strokes.as_deref().filter(|m| !m.is_empty()).map(crate::masks::strokes_to_text));
     v
 }
 
@@ -371,6 +377,9 @@ const MIXER: usize = DETAIL + 10;
 
 /// Where the masks' text sits in PROPS: the last.
 const MASKS: usize = MIXER + MIXER_FIELDS;
+
+/// Where the brush strokes sit in PROPS: after the masks.
+const STROKES: usize = MASKS + 1;
 
 /// The detail sliders, in PROPS order from DETAIL.
 fn detail_fields_mut(d: &mut Detail) -> [&mut f32; 9] {

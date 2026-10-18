@@ -22,7 +22,8 @@ use crate::export::{self, Encoded, Request, Strip, TileRenderer};
 use crate::geometry;
 use crate::gpu::Gpu;
 use crate::jobs::{Jobs, Kind};
-use crate::masks::Masks;
+use crate::brushgpu::BrushGpu;
+use crate::masks::{Masks, Stroke, Strokes};
 use crate::pipeline::{Edit, Image, ImageMemory, Layer, MaskInput, PreviewTexture, Slot, Target, Zoom, render_masked, warm_up};
 use crate::present::Presenter;
 use crate::preview::Preview;
@@ -35,6 +36,11 @@ pub enum Command {
     SetEdit(Edit),
     /// The masks of the photo in view.
     SetMasks(Box<Masks>),
+    /// The brush strokes of the photo in view, by brush id.
+    SetStrokes(Strokes),
+    /// Dabs of a brush stroke under way (spaced already), with the stroke's settings: painted into
+    /// brush `id`'s layer.
+    BrushDabs { id: u32, stroke: Box<Stroke>, dabs: Vec<[f32; 2]> },
     /// The mask to show as a red overlay, if any (the Masks panel's selection).
     MaskOverlay(Option<usize>),
     /// Edit mode shows the developed raw; Cull mode shows camera JPEGs.
@@ -79,6 +85,7 @@ pub struct ExportJob {
     pub path: PathBuf,
     pub edit: Edit,
     pub masks: Box<Masks>,
+    pub strokes: Strokes,
     pub request: Request,
 }
 
@@ -275,6 +282,9 @@ struct Viewer {
     zoom: Zoom,
     edit: Edit,
     masks: Masks,
+    strokes: Strokes,
+    /// The brush components' layers for the photo in view.
+    brush: BrushGpu,
     mask_overlay: Option<usize>,
     edit_mode: bool,
     crop_mode: bool,
@@ -311,6 +321,8 @@ impl Viewer {
             zoom: Zoom::Fit,
             edit: Edit::default(),
             masks: Masks::default(),
+            strokes: Strokes::default(),
+            brush: BrushGpu::new(),
             mask_overlay: None,
             edit_mode: false,
             crop_mode: false,
@@ -402,6 +414,19 @@ impl Viewer {
             Command::SetMasks(masks) => {
                 if *masks != self.masks {
                     self.masks = *masks;
+                    self.dirty = true;
+                }
+            }
+            Command::SetStrokes(strokes) => {
+                if !Arc::ptr_eq(&strokes, &self.strokes) {
+                    self.strokes = strokes;
+                    self.dirty = true;
+                }
+            }
+            Command::BrushDabs { id, stroke, dabs } => {
+                // The component may have just been made: its layer first.
+                if self.ensure_brush().is_ok() {
+                    self.brush.paint(id, &stroke, &dabs);
                     self.dirty = true;
                 }
             }
@@ -585,7 +610,10 @@ impl Viewer {
         let (raw_width, raw_height) = self.jobs.raw(index).map_or((0, 0), |r| (r.width, r.height));
         let edit = self.edit;
         let masks = self.masks;
-        let mask_input = MaskInput { masks: &masks, overlay: self.mask_overlay };
+        if let Err(e) = self.ensure_brush() {
+            eprintln!("windedit: brush layers failed: {e}");
+        }
+        let mask_input = MaskInput { masks: &masks, overlay: self.mask_overlay, brush: Some(&self.brush) };
         let zoom = self.view_zoom();
         // What the view shows: the crop, or in crop mode the whole frame, and where on the view.
         let frame = geometry::frame_size(photo_size, edit.rotation);
@@ -611,6 +639,10 @@ impl Viewer {
                 crate::present::FrameTimings { develop_ms: gpu_ms, gpu_ms, cpu_ms: start.elapsed().as_secs_f64() * 1000.0 }
             }
         };
+        // Changes that didn't fit in this frame's upload memory go in the next.
+        if self.brush.has_dirty() {
+            self.dirty = true;
+        }
         (self.events)(&FrameEvent {
             kind: EVENT_FRAME,
             photo: index as i32,
@@ -705,6 +737,8 @@ struct ActiveExport {
 /// Rendering is under way: the tiles, and the way to the encoder thread.
 struct ExportRun {
     renderer: TileRenderer,
+    /// The layers of the photo's brush components.
+    brush: BrushGpu,
     strips: SyncSender<Strip>,
     /// A finished band the encoder had no room for yet.
     pending: Option<Strip>,
@@ -763,6 +797,9 @@ impl Viewer {
             let image = &self.image.as_ref().unwrap().1;
             let window = export::window(image.oriented_size(), &a.job.edit);
             let renderer = TileRenderer::new(&self.gpu, window, &a.job.edit).map_err(|e| e.to_string())?;
+            let brush = BrushGpu::new();
+            brush.sync(&self.gpu, (image.width, image.height), &a.job.masks, &a.job.strokes).map_err(|e| e.to_string())?;
+            brush.upload_now(&mut self.gpu).map_err(|e| e.to_string())?;
             let (strips, bands) = sync_channel(1);
             let (id, quality, raw, path, commands) =
                 (a.job.id, a.job.request.quality, a.job.raw.clone(), a.job.path.clone(), self.commands.clone());
@@ -773,7 +810,7 @@ impl Viewer {
                     let _ = commands.send(Command::ExportFinished(id, result));
                 })
                 .map_err(|e| e.to_string())?;
-            a.run = Some(ExportRun { renderer, strips, pending: None });
+            a.run = Some(ExportRun { renderer, brush, strips, pending: None });
             return Ok(Next::Again);
         }
 
@@ -800,7 +837,7 @@ impl Viewer {
         }
         let run = a.run.as_mut().unwrap();
         let image = &self.image.as_ref().unwrap().1;
-        run.pending = run.renderer.step_masked(&mut self.gpu, image, &a.job.edit, &a.job.masks).map_err(|e| e.to_string())?;
+        run.pending = run.renderer.step_masked(&mut self.gpu, image, &a.job.edit, &a.job.masks, Some(&run.brush)).map_err(|e| e.to_string())?;
         let progress = run.renderer.tiles_done() as f32 / run.renderer.tiles() as f32;
         self.emit_export(a.job.id, a.job.index, EXPORT_PROGRESS, progress, None);
         Ok(Next::Again)
@@ -889,6 +926,13 @@ impl Viewer {
 }
 
 impl Viewer {
+    /// Makes the brush layers the photo in view needs: from its masks and strokes, at its frame's size.
+    fn ensure_brush(&self) -> windows::core::Result<()> {
+        let Some(index) = self.focus else { return Ok(()) };
+        let Some(raw) = self.jobs.raw(index) else { return Ok(()) };
+        self.brush.sync(&self.gpu, (raw.width, raw.height), &self.masks, &self.strokes)
+    }
+
     /// How the view is drawn: the user's zoom, or in crop mode the whole frame.
     fn view_zoom(&self) -> Zoom {
         if self.crop_mode { Zoom::Frame { x: self.crop_center.0, y: self.crop_center.1 } } else { self.zoom }

@@ -17,6 +17,7 @@ use crate::decode::{Orientation, RawFrame};
 use crate::develop;
 use crate::geometry;
 use crate::lens::{LensCorrection, LensModel};
+use crate::brushgpu::BrushGpu;
 use crate::masks::{GpuMask, GpuMaskSet, MAX_MASKS, Masks};
 use crate::gpu::{Gpu, new_buffer, new_texture};
 use crate::tone;
@@ -422,7 +423,7 @@ pub fn warm_up(gpu: &mut Gpu) -> Result<f64> {
     masks.masks[0].count = 1;
     masks.masks[0].sliders[crate::masks::slider::CLARITY] = 10.0;
     masks.count = 1;
-    render_image_masked(gpu, &image, &Edit::default(), &MaskInput { masks: &masks, overlay: Some(0) }, Zoom::Fit, &target);
+    render_image_masked(gpu, &image, &Edit::default(), &MaskInput { masks: &masks, overlay: Some(0), brush: None }, Zoom::Fit, &target);
     gpu.submit()?;
     {
         let mut detail = gpu.detail.borrow_mut();
@@ -522,11 +523,13 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
 pub struct MaskInput<'a> {
     pub masks: &'a Masks,
     pub overlay: Option<usize>,
+    /// The brush layers of the masks' brush components (brushgpu.rs), if any.
+    pub brush: Option<&'a BrushGpu>,
 }
 
 impl MaskInput<'static> {
     /// No masks: the pass is what it was before masks existed.
-    pub const NONE: MaskInput<'static> = MaskInput { masks: &Masks::NONE, overlay: None };
+    pub const NONE: MaskInput<'static> = MaskInput { masks: &Masks::NONE, overlay: None, brush: None };
 }
 
 /// Like [`render`], with local adjustments.
@@ -573,7 +576,11 @@ pub fn render_masked(gpu: &Gpu, layer: Layer, edit: &Edit, mask_input: &MaskInpu
         Layer::Preview(_) => None,
     };
     if let (true, Layer::Raw(image)) = (masks_on, layer) {
-        gpu.set_masks(&GpuMaskSet::new(masks, &image.xyz_to_cam).masks);
+        let set = match mask_input.brush {
+            Some(b) => GpuMaskSet::with_layers(masks, &image.xyz_to_cam, &|id| b.slice_of(id)),
+            None => GpuMaskSet::new(masks, &image.xyz_to_cam),
+        };
+        gpu.set_masks(&set.masks);
     }
     let (detail_origin, detail_size, detail_level) = detail.as_ref().map_or((0, 0, 0), |d| d.constants());
     let constants = DevelopConstants {
@@ -631,7 +638,14 @@ pub fn render_masked(gpu: &Gpu, layer: Layer, edit: &Edit, mask_input: &MaskInpu
         gpu.srv_null(SLOT_DEVELOP + 5);
     }
     gpu.srv_masks::<GpuMask>(MAX_MASKS as u32, SLOT_DEVELOP + 6);
-    gpu.uav_texture(&target.texture, TARGET_FORMAT, 0, SLOT_DEVELOP + 7);
+    match mask_input.brush.filter(|_| masks_on) {
+        Some(b) => {
+            b.record_uploads(gpu);
+            b.srv(gpu, SLOT_DEVELOP + 7);
+        }
+        None => gpu.srv_texture_array(None, DXGI_FORMAT_R16_UNORM, 1, SLOT_DEVELOP + 7),
+    }
+    gpu.uav_texture(&target.texture, TARGET_FORMAT, 0, SLOT_DEVELOP + 8);
     let mut reads = vec![&gpu.tone.coefficients, &gpu.tone.stats];
     if clarity.is_some() {
         reads.push(&gpu.clarity.coefficients);

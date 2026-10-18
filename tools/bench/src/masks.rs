@@ -45,7 +45,7 @@ pub fn time_4k(gpu: &mut Gpu, image: &Image, cases: &[(&str, Edit, Masks)], roun
             let edit = Edit { exposure: edit.exposure + (round as f32 / rounds as f32) * 0.5, ..*edit };
             gpu.begin().unwrap();
             let a = gpu.timestamp();
-            render_image_masked(gpu, image, &edit, &MaskInput { masks, overlay: None }, Zoom::Fit, &target);
+            render_image_masked(gpu, image, &edit, &MaskInput { masks, overlay: None, brush: None }, Zoom::Fit, &target);
             let b = gpu.timestamp();
             let ts = gpu.submit().unwrap();
             times[k].push(ts[b as usize] - ts[a as usize]);
@@ -134,7 +134,7 @@ fn synthetic_frame(wb: [f32; 3]) -> RawFrame {
 
 fn render(gpu: &mut Gpu, image: &Image, edit: &Edit, masks: &Masks, overlay: Option<usize>, zoom: Zoom, target: &Target) -> Vec<u8> {
     gpu.begin().unwrap();
-    render_image_masked(gpu, image, edit, &MaskInput { masks, overlay }, zoom, target);
+    render_image_masked(gpu, image, edit, &MaskInput { masks, overlay, brush: None }, zoom, target);
     gpu.submit().unwrap();
     read_target(gpu, target).unwrap()
 }
@@ -321,6 +321,7 @@ pub fn bench_masks(files: &[PathBuf]) {
         export_check(&mut gpu, &image, &Masks::default(), &format!("{name} (no masks)"));
         export_check(&mut gpu, &image, &both, &name);
     }
+    bench_brush(&mut gpu, files);
 }
 
 /// The export's tiles (2048 pixels, `TileRenderer::step_masked`) against the same window drawn in
@@ -333,14 +334,14 @@ fn export_check(gpu: &mut Gpu, image: &Image, masks: &Masks, name: &str) {
     let mut renderer = export::TileRenderer::new(gpu, window, &edit).unwrap();
     let mut tiled = Vec::new();
     while !renderer.done() {
-        if let Some(strip) = renderer.step_masked(gpu, image, &edit, masks).unwrap() {
+        if let Some(strip) = renderer.step_masked(gpu, image, &edit, masks, None).unwrap() {
             tiled.extend_from_slice(&strip.bgr);
         }
     }
     let whole = Target::new(gpu, window.width, window.height).unwrap();
     gpu.begin().unwrap();
     let zoom = Zoom::Region { x: window.x as f32, y: window.y as f32, scale: 1.0 };
-    render_masked(gpu, Layer::Raw(image), &edit, &MaskInput { masks, overlay: None }, zoom, image.oriented_size(), &whole);
+    render_masked(gpu, Layer::Raw(image), &edit, &MaskInput { masks, overlay: None, brush: None }, zoom, image.oriented_size(), &whole);
     gpu.submit().unwrap();
     let px = read_target(gpu, &whole).unwrap();
     let (mut differ, mut worst) = (0usize, 0i32);
@@ -351,4 +352,168 @@ fn export_check(gpu: &mut Gpu, image: &Image, masks: &Masks, name: &str) {
         worst = worst.max(d);
     }
     println!("  {name} export: {}x{} in {} tiles against one piece: {differ} of {} pixels differ, by at most {worst} levels", window.width, window.height, renderer.tiles(), tiled.len() / 3);
+}
+
+// ---- The brush ----
+
+use std::sync::Arc;
+use std::time::Instant;
+use windedit_core::brushgpu::BrushGpu;
+use windedit_core::masks::{DabWalker, KIND_BRUSH, Raster, Stroke, StrokeMap, layer_dims};
+
+/// A brush component whose strokes are `id`.
+fn brush_component(id: u32, mode: u32) -> Component {
+    Component { kind: KIND_BRUSH, mode, p: [id as f32, 0.5, 0.4, 0.0, 0.0, 0.0, 0.0, 0.0] }
+}
+
+/// A wavy stroke across the frame (points in frame units; `aspect` is short edge over long).
+fn wave(y0: f32, amplitude: f32, radius: f32, erase: bool, aspect: f32) -> Stroke {
+    let mut s = Stroke::new(erase, radius, 0.5, 0.7, 1.0);
+    for i in 0..=120 {
+        let t = i as f32 / 120.0;
+        s.points.push(Stroke::quantise([0.05 + 0.9 * t, aspect * (y0 + amplitude * (t * 9.0).sin())]));
+    }
+    s
+}
+
+fn render_brush(gpu: &mut Gpu, image: &Image, edit: &Edit, masks: &Masks, brush: &BrushGpu, target: &Target) -> Vec<u8> {
+    gpu.begin().unwrap();
+    render_image_masked(gpu, image, edit, &MaskInput { masks, overlay: None, brush: Some(brush) }, Zoom::Fit, target);
+    gpu.submit().unwrap();
+    read_target(gpu, target).unwrap()
+}
+
+pub fn bench_brush(gpu: &mut Gpu, files: &[PathBuf]) {
+    println!("\n5. The brush");
+    // ---- GPU against CPU on the synthetic photo ----
+    let as_shot = temperature_to_multipliers(&[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], 5500.0, 0.0);
+    let frame = synthetic_frame(as_shot);
+    let (image, _) = Image::open(gpu, &mut ImageMemory::new(), &frame).unwrap();
+    let target = Target::new(gpu, W as u32, H as u32).unwrap();
+    let aspect = H as f32 / W as f32;
+    let scene: Vec<[f32; 3]> = (0..W * H).map(|k| scene_at(k % W, k / W)).collect();
+    let mut plain = Edit::default();
+    plain.set_detail(develop::Detail { amount: 0.0, color: 0.0, ..develop::DETAIL_DEFAULTS });
+    use slider::*;
+    let mut strokes = StrokeMap::new();
+    strokes.insert(1, Arc::new(vec![wave(0.3, 0.05, 0.06, false, aspect), wave(0.5, 0.08, 0.03, false, aspect), wave(0.4, 0.05, 0.05, true, aspect)]));
+    strokes.insert(2, Arc::new(vec![wave(0.7, 0.04, 0.08, false, aspect)]));
+    let masks = masks_of(&[
+        mask_of(&[brush_component(1, ADD), radial([0.5, 0.35], [0.1, 0.1], 0.0, 100.0, SUBTRACT)], &[(EXPOSURE, 1.0), (CONTRAST, 40.0), (SHADOWS, 50.0)], 100.0),
+        mask_of(&[brush_component(2, ADD), linear([0.2, 0.0], [0.2, 1.0], ADD)], &[(EXPOSURE, -0.8), (TEMPERATURE, 40.0), (CLARITY, 50.0)], 70.0),
+    ]);
+    let brush = BrushGpu::new();
+    brush.sync(gpu, (W as u32, H as u32), &masks, &strokes).unwrap();
+    let set = GpuMaskSet::with_layers(&masks, &[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], &|id| brush.slice_of(id));
+    let sampler = |slice: u32, uv: [f32; 2]| brush.sample(slice, uv);
+    let locals: Vec<Local> = (0..W * H)
+        .map(|k| {
+            let uv = [((k % W) as f32 + 0.5) / W as f32, ((k / W) as f32 + 0.5) / H as f32];
+            set.local_with(masks::to_frame(uv, (W as u32, H as u32)), uv, &sampler)
+        })
+        .collect();
+    let cpu = tone::render_masked(&MODEL, &scene, W, H, &plain, tone::camera_offset(""), Some(&locals));
+    let cpu8: Vec<u8> = cpu.iter().flat_map(|p| [p[0], p[1], p[2], 1.0].map(|v| (srgb_encode(v) * 255.0).round() as u8)).collect();
+    let gpu8 = render_brush(gpu, &image, &plain, &masks, &brush, &target);
+    let (mean, p99, max) = compare(&cpu8, &gpu8);
+    println!("  GPU against the CPU reference, two brush masks (one with a subtracted ellipse, one with a gradient): mean {mean:.2}  p99 {p99:.1}  max {max:.0} levels");
+    let bare = render_brush(gpu, &image, &plain, &Masks::default(), &BrushGpu::new(), &target);
+    let changed = (0..W * H).filter(|&i| (0..3).any(|c| (gpu8[i * 4 + c] as i32 - bare[i * 4 + c] as i32).abs() > 3)).count();
+    println!("  the strokes changed {:.1}% of the picture's pixels", 100.0 * changed as f32 / (W * H) as f32);
+    save(&std::env::current_exe().unwrap().parent().unwrap().join("renders").join("masks").join("brush-synthetic.png"), &side_by_side(&bare, &gpu8, W, H).1, 2 * W + 6, H);
+    // A layer painted as dabs arrive is the layer of its stroke.
+    let (mut live, mut walker, mut dabs) = (Raster::new(layer_dims((W as u32, H as u32))), DabWalker::new(), Vec::new());
+    let s = &strokes[&1][0];
+    for i in 0..s.points.len() {
+        dabs.clear();
+        walker.feed(s.radius, s.point(i), &mut dabs);
+        for d in &dabs {
+            live.stamp(*d, s.radius, s.feather, s.flow, s.density, s.erase);
+        }
+    }
+    println!("  painted live, dab by dab, equals rasterizing the stroke: {}", live.data == Raster::rasterize((W as u32, H as u32), &strokes[&1][..1]).data);
+
+    // ---- Time per dab, and what painting costs a frame ----
+    println!("\n  one dab on a 2048 x 1536 layer (CPU), by radius in long-edge units:");
+    let mut raster = Raster::new(layer_dims((5184, 3888)));
+    for radius in [0.01f32, 0.025, 0.05, 0.1, 0.2] {
+        let n = 400;
+        let t = Instant::now();
+        for i in 0..n {
+            raster.stamp([0.3 + (i % 20) as f32 * 0.01, 0.3 + (i % 7) as f32 * 0.01], radius, 0.5, 0.5, 1.0, false);
+        }
+        println!("    {radius:5.3} ({:4.0} px across): {:7.1} us per dab", radius * 2.0 * 2048.0, t.elapsed().as_secs_f64() * 1e6 / n as f64);
+    }
+    let subjects: Vec<(String, Image, (u32, u32))> = if files.is_empty() {
+        vec![("synthetic".into(), Image::open(gpu, &mut ImageMemory::new(), &frame).unwrap().0, (W as u32, H as u32))]
+    } else {
+        let f = &files[0];
+        let raw = decode::decode_file(f).unwrap();
+        let dims = (raw.width, raw.height);
+        vec![(f.file_stem().unwrap().to_string_lossy().to_string(), Image::open(gpu, &mut ImageMemory::new(), &raw).unwrap().0, dims)]
+    };
+    for (name, image, dims) in &subjects {
+        let aspect = dims.1 as f32 / dims.0 as f32;
+        let target = Target::new(gpu, 3840, 2160).unwrap();
+        let busy_edit = busy();
+        let layers = |n: usize| -> (Masks, StrokeMap) {
+            let mut strokes = StrokeMap::new();
+            let list: Vec<Mask> = (0..n)
+                .map(|i| {
+                    strokes.insert(i as u32 + 1, Arc::new(vec![wave(0.2 + 0.08 * i as f32, 0.04, 0.05, false, aspect), wave(0.25 + 0.08 * i as f32, 0.03, 0.03, true, aspect)]));
+                    mask_of(&[brush_component(i as u32 + 1, ADD)], &[(EXPOSURE, 0.3), (CONTRAST, 20.0), (HIGHLIGHTS, -20.0), (SHADOWS, 30.0), (SATURATION, 15.0), (TEMPERATURE, 10.0)], 100.0)
+                })
+                .collect();
+            (masks_of(&list), strokes)
+        };
+        println!("\n  {name}: develop pass at 4K (Fit), median of 60, with brush layers all uploaded");
+        let mut baseline = 0.0;
+        for n in [0usize, 1, 2, 8] {
+            let (m, s) = layers(n);
+            let b = BrushGpu::new();
+            b.sync(gpu, *dims, &m, &s).unwrap();
+            b.upload_now(gpu).unwrap();
+            let mut times = Vec::new();
+            for round in 0..60 {
+                let edit = Edit { exposure: busy_edit.exposure + round as f32 / 120.0, ..busy_edit };
+                gpu.begin().unwrap();
+                let a = gpu.timestamp();
+                render_image_masked(gpu, image, &edit, &MaskInput { masks: &m, overlay: None, brush: Some(&b) }, Zoom::Fit, &target);
+                let c = gpu.timestamp();
+                let ts = gpu.submit().unwrap();
+                times.push(ts[c as usize] - ts[a as usize]);
+            }
+            let ms = median(times);
+            if n == 0 {
+                baseline = ms;
+            }
+            let (cpu_bytes, gpu_bytes) = b.memory();
+            println!("    {n} brush mask(s): {ms:.3} ms ({:+.3}); layers {:.1} MB CPU + {:.1} MB GPU", ms - baseline, cpu_bytes as f64 / 1e6, gpu_bytes as f64 / 1e6);
+        }
+        // Painting: each frame adds 4 dabs of radius 0.05 (a fast drag), uploads their rectangle and draws.
+        let (m, s) = layers(1);
+        let b = BrushGpu::new();
+        b.sync(gpu, *dims, &m, &s).unwrap();
+        b.upload_now(gpu).unwrap();
+        let (mut stamp_us, mut frame_ms, mut total_ms) = (Vec::new(), Vec::new(), Vec::new());
+        let stroke = Stroke::new(false, 0.05, 0.5, 0.5, 1.0);
+        for frame_no in 0..120 {
+            let t = Instant::now();
+            let dabs: Vec<[f32; 2]> = (0..4).map(|k| [0.1 + ((frame_no * 4 + k) as f32 * 0.005) % 0.8, aspect * (0.5 + 0.2 * ((frame_no * 4 + k) as f32 * 0.05).sin())]).collect();
+            b.paint(1, &stroke, &dabs);
+            stamp_us.push(t.elapsed().as_secs_f64() * 1e6);
+            let edit = Edit { exposure: busy_edit.exposure + frame_no as f32 / 240.0, ..busy_edit };
+            let wall = Instant::now();
+            gpu.begin().unwrap();
+            let a = gpu.timestamp();
+            render_image_masked(gpu, image, &edit, &MaskInput { masks: &m, overlay: None, brush: Some(&b) }, Zoom::Fit, &target);
+            let c = gpu.timestamp();
+            let ts = gpu.submit().unwrap();
+            frame_ms.push(ts[c as usize] - ts[a as usize]);
+            total_ms.push(wall.elapsed().as_secs_f64() * 1000.0);
+        }
+        println!("    painting, 4 dabs a frame: stamping {:.0} us, frame GPU {:.3} ms, frame wall (record, upload, draw, wait) {:.2} ms", median(stamp_us), median(frame_ms), median(total_ms));
+    }
+    println!("\n  memory: one layer of a 24 MP photo is 2048 x 1536 x 2 bytes = 6.3 MB on the CPU and the same on the GPU;");
+    println!("  the texture array has a slice per brush mask rounded up to a power of two: 1 mask 6.3 MB, 2 masks 12.6 MB, 8 masks 50 MB, the worst case (64 brush components) 403 MB, and 403 MB again for the CPU rasters");
 }

@@ -19,6 +19,7 @@ use crate::exif;
 use crate::geometry;
 use crate::gpu::Gpu;
 use crate::jpeg;
+use crate::brushgpu::BrushGpu;
 use crate::masks::Masks;
 use crate::pipeline::{Edit, Image, Layer, MaskInput, Target, Zoom, render_masked};
 
@@ -124,11 +125,11 @@ impl TileRenderer {
 
     /// Develops the next tile. Returns the band of rows it completed, if it was the band's last.
     pub fn step(&mut self, gpu: &mut Gpu, image: &Image, edit: &Edit) -> Result<Option<Strip>> {
-        self.step_masked(gpu, image, edit, &Masks::NONE)
+        self.step_masked(gpu, image, edit, &Masks::NONE, None)
     }
 
-    /// Like [`step`](Self::step), with the photo's masks.
-    pub fn step_masked(&mut self, gpu: &mut Gpu, image: &Image, edit: &Edit, masks: &Masks) -> Result<Option<Strip>> {
+    /// Like [`step`](Self::step), with the photo's masks (and the layers of their brushes).
+    pub fn step_masked(&mut self, gpu: &mut Gpu, image: &Image, edit: &Edit, masks: &Masks, brush: Option<&BrushGpu>) -> Result<Option<Strip>> {
         if edit.detail().luminance > 0.0 || edit.detail().color > 0.0 {
             image.ensure_noise(gpu)?;
         }
@@ -147,7 +148,7 @@ impl TileRenderer {
         gpu.begin()?;
         let a = gpu.timestamp();
         // Masks are in frame coordinates, so a tile needs nothing of them but the same set.
-        render_masked(gpu, Layer::Raw(image), edit, &MaskInput { masks, overlay: None }, zoom, image.oriented_size(), &view);
+        render_masked(gpu, Layer::Raw(image), edit, &MaskInput { masks, overlay: None, brush }, zoom, image.oriented_size(), &view);
         let b = gpu.timestamp();
         self.copy_to_readback(gpu, tile_w, tile_h);
         let c = gpu.timestamp();

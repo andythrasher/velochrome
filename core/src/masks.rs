@@ -40,7 +40,7 @@ pub mod slider {
 pub const KIND_NONE: u32 = 0;
 pub const KIND_LINEAR: u32 = 1;
 pub const KIND_RADIAL: u32 = 2;
-/// Part B. Reserved so the layout and the shader's switch already have a place for it: a brush
+
 /// component's `p[0]` will name its raster layer. Until then it has no weight.
 pub const KIND_BRUSH: u32 = 3;
 
@@ -135,11 +135,18 @@ impl Masks {
             let mut kept = 0;
             for i in 0..mask.count as usize {
                 let mut c = mask.components[i];
-                if c.kind != KIND_LINEAR && c.kind != KIND_RADIAL {
+                if c.kind != KIND_LINEAR && c.kind != KIND_RADIAL && c.kind != KIND_BRUSH {
                     continue;
                 }
                 c.mode = (c.mode != 0) as u32;
-                if c.kind == KIND_LINEAR {
+                if c.kind == KIND_BRUSH {
+                    // p[0] names the strokes (a whole number); p[1], p[2] are where its pin sits.
+                    c.p[0] = fix(c.p[0], 0.0, 1e6).floor();
+                    for v in &mut c.p[1..3] {
+                        *v = fix(*v, -4.0, 4.0);
+                    }
+                    c.p[3..].fill(0.0);
+                } else if c.kind == KIND_LINEAR {
                     for v in &mut c.p[..4] {
                         *v = fix(*v, -4.0, 4.0);
                     }
@@ -256,7 +263,8 @@ pub fn white_balance_log2(xyz_to_cam: &Mat3, temperature: f32, tint: f32) -> [f3
 }
 
 impl GpuComponent {
-    fn new(c: &Component) -> GpuComponent {
+    /// `slice` is the brush layer of a brush component, if it has one.
+    fn new(c: &Component, slice: Option<u32>) -> GpuComponent {
         let mut g = GpuComponent { kind: c.kind, flags: (c.mode != 0) as u32, ..Default::default() };
         match c.kind {
             KIND_LINEAR => {
@@ -276,6 +284,7 @@ impl GpuComponent {
                 g.inner = 1.0 - (c.p[5] / 100.0).clamp(0.005, 1.0);
                 g.flags |= ((c.p[6] != 0.0) as u32) << 1;
             }
+            KIND_BRUSH => g.offset = slice.map_or(-1.0, |s| s as f32),
             _ => g.kind = KIND_NONE,
         }
         g
@@ -286,6 +295,12 @@ impl GpuMaskSet {
     /// The masks worked out for the shader. `xyz_to_cam` is the photo's colour matrix, which the
     /// local white balance needs.
     pub fn new(masks: &Masks, xyz_to_cam: &Mat3) -> GpuMaskSet {
+        Self::with_layers(masks, xyz_to_cam, &|_| None)
+    }
+
+    /// Like [`new`](Self::new), with the slice of the brush layer holding each brush component's
+    /// strokes (by the strokes' id, `Component::p[0]`).
+    pub fn with_layers(masks: &Masks, xyz_to_cam: &Mat3, slice_of: &dyn Fn(u32) -> Option<u32>) -> GpuMaskSet {
         let mut set = GpuMaskSet { count: masks.count.min(MAX_MASKS as u32), ..Default::default() };
         for (g, m) in set.masks.iter_mut().zip(masks.masks()) {
             let s = &m.sliders;
@@ -304,7 +319,7 @@ impl GpuMaskSet {
                 ..Default::default()
             };
             for (gc, c) in g.components.iter_mut().zip(m.components()) {
-                *gc = GpuComponent::new(c);
+                *gc = GpuComponent::new(c, slice_of(c.p[0] as u32));
             }
         }
         set
@@ -318,6 +333,12 @@ fn smoothstep01(t: f32) -> f32 {
 
 /// A shape's weight at frame position `p`, 0–1 (develop.hlsl `componentWeight`).
 pub fn component_weight(c: &GpuComponent, p: [f32; 2]) -> f32 {
+    component_weight_with(c, p, [0.0; 2], &|_, _| 0.0)
+}
+
+/// Like [`component_weight`], for a position that is also `uv` (fractions of the frame), with
+/// `layer(slice, uv)` giving a brush layer's value there.
+pub fn component_weight_with(c: &GpuComponent, p: [f32; 2], uv: [f32; 2], layer: &dyn Fn(u32, [f32; 2]) -> f32) -> f32 {
     match c.kind {
         KIND_LINEAR => 1.0 - smoothstep01(p[0] * c.axis_x[0] + p[1] * c.axis_x[1] + c.offset),
         KIND_RADIAL => {
@@ -327,7 +348,7 @@ pub fn component_weight(c: &GpuComponent, p: [f32; 2]) -> f32 {
             let w = 1.0 - smoothstep01((r - c.inner) / (1.0 - c.inner));
             if c.flags & 2 != 0 { 1.0 - w } else { w }
         }
-        // Part B: the brush layer's value.
+        KIND_BRUSH if c.offset >= 0.0 => layer(c.offset as u32, uv),
         _ => 0.0,
     }
 }
@@ -335,9 +356,13 @@ pub fn component_weight(c: &GpuComponent, p: [f32; 2]) -> f32 {
 /// A mask's weight at `p`: the soft union of its added shapes times what its subtracted shapes
 /// leave, times its Amount (develop.hlsl `maskWeight`).
 pub fn mask_weight(m: &GpuMask, p: [f32; 2]) -> f32 {
+    mask_weight_with(m, p, [0.0; 2], &|_, _| 0.0)
+}
+
+pub fn mask_weight_with(m: &GpuMask, p: [f32; 2], uv: [f32; 2], layer: &dyn Fn(u32, [f32; 2]) -> f32) -> f32 {
     let (mut add, mut sub) = (1.0f32, 1.0f32);
     for c in &m.components[..m.count as usize] {
-        let w = component_weight(c, p);
+        let w = component_weight_with(c, p, uv, layer);
         if c.flags & 1 != 0 {
             sub *= 1.0 - w;
         } else {
@@ -364,9 +389,14 @@ pub struct Local {
 
 impl GpuMaskSet {
     pub fn local(&self, p: [f32; 2]) -> Local {
+        self.local_with(p, [0.0; 2], &|_, _| 0.0)
+    }
+
+    /// Like [`local`](Self::local), with brush layers (see [`component_weight_with`]).
+    pub fn local_with(&self, p: [f32; 2], uv: [f32; 2], layer: &dyn Fn(u32, [f32; 2]) -> f32) -> Local {
         let mut l = Local::default();
         for m in &self.masks[..self.count as usize] {
-            let w = mask_weight(m, p);
+            let w = mask_weight_with(m, p, uv, layer);
             if w <= 0.0 {
                 continue;
             }
@@ -416,6 +446,7 @@ pub fn to_text(masks: &Masks) -> String {
             let (letter, n) = match c.kind {
                 KIND_LINEAR => ('L', 4),
                 KIND_RADIAL => ('R', 7),
+                KIND_BRUSH => ('B', 3),
                 _ => continue,
             };
             let sign = if c.mode != 0 { '-' } else { '+' };
@@ -452,11 +483,12 @@ pub fn from_text(text: &str) -> Masks {
             let kind = match tag.get(..1) {
                 Some("L") => KIND_LINEAR,
                 Some("R") => KIND_RADIAL,
+                Some("B") => KIND_BRUSH,
                 _ => continue,
             };
             let mode = if tag.ends_with('-') { SUBTRACT } else { ADD };
             let nums: Vec<f32> = words.filter_map(|w| w.parse().ok()).collect();
-            let want = if kind == KIND_LINEAR { 4 } else { 7 };
+            let want = match kind { KIND_LINEAR => 4, KIND_BRUSH => 3, _ => 7 };
             if nums.len() != want || m.count as usize >= MAX_COMPONENTS {
                 continue;
             }
@@ -470,6 +502,310 @@ pub fn from_text(text: &str) -> Masks {
     }
     masks.clean();
     masks
+}
+
+// ---- The brush ----
+
+/// One brush stroke: where the pointer went, and the settings it was made with. A brush
+/// component's strokes are kept beside the masks (`p[0]` of the component is their id), painted
+/// in order into a raster layer (`Raster`) that the develop pass samples as the component's weight.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stroke {
+    /// Paints toward 0 (rubs out) instead of toward `density`.
+    pub erase: bool,
+    /// The brush's radius, in units of the frame's long edge.
+    pub radius: f32,
+    /// 0–1: how much of the radius, from the edge in, is soft.
+    pub feather: f32,
+    /// 0–1: how far each dab moves a pixel toward `density` (or 0).
+    pub flow: f32,
+    /// 0–1: the most a stroke paints.
+    pub density: f32,
+    /// The pointer's positions in `POINT_UNIT`s of the long edge.
+    pub points: Vec<[i32; 2]>,
+}
+
+/// A photo's strokes by brush id; the vectors are shared so snapshots (undo) are cheap.
+pub type StrokeMap = std::collections::BTreeMap<u32, std::sync::Arc<Vec<Stroke>>>;
+pub type Strokes = std::sync::Arc<StrokeMap>;
+
+/// Stored points are whole numbers of this, a little under a pixel of a big sensor.
+pub const POINT_UNIT: f32 = 1.0 / 10000.0;
+
+/// Dabs are this fraction of the radius apart along a stroke.
+pub const DAB_SPACING: f32 = 0.2;
+
+fn round5(v: f32) -> f32 {
+    (v * 1e5).round() / 1e5
+}
+
+impl Stroke {
+    /// A stroke with no points yet. The settings are put in range and rounded to what the sidecar
+    /// keeps, so a stroke read back is the stroke that was made.
+    pub fn new(erase: bool, radius: f32, feather: f32, flow: f32, density: f32) -> Stroke {
+        let unit = |v: f32| round5(if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 });
+        let radius = round5(if radius.is_finite() { radius.clamp(1e-4, 1.0) } else { 0.05 });
+        Stroke { erase, radius, feather: unit(feather), flow: unit(flow), density: unit(density), points: Vec::new() }
+    }
+
+    pub fn quantise(p: [f32; 2]) -> [i32; 2] {
+        p.map(|v| (v / POINT_UNIT).round().clamp(-1e6, 1e6) as i32)
+    }
+
+    pub fn point(&self, i: usize) -> [f32; 2] {
+        self.points[i].map(|v| v as f32 * POINT_UNIT)
+    }
+}
+
+/// Turns the pointer's positions into dabs, evenly spaced along the path whatever the pointer's
+/// speed and however the positions are delivered (a stroke fed in pieces gives the dabs it would
+/// as a whole).
+#[derive(Debug, Clone, Default)]
+pub struct DabWalker {
+    last: Option<[f32; 2]>,
+    /// How much further along the path the next dab is.
+    to_next: f32,
+}
+
+impl DabWalker {
+    pub fn new() -> DabWalker {
+        DabWalker::default()
+    }
+
+    /// Adds the pointer's next position; appends the dabs it makes (the first position makes one).
+    pub fn feed(&mut self, radius: f32, p: [f32; 2], out: &mut Vec<[f32; 2]>) {
+        let spacing = (radius * DAB_SPACING).max(1e-5);
+        let Some(mut a) = self.last else {
+            out.push(p);
+            self.last = Some(p);
+            self.to_next = spacing;
+            return;
+        };
+        let mut d = ((p[0] - a[0]).powi(2) + (p[1] - a[1]).powi(2)).sqrt();
+        while d >= self.to_next && d > 0.0 {
+            let t = self.to_next / d;
+            a = [a[0] + (p[0] - a[0]) * t, a[1] + (p[1] - a[1]) * t];
+            out.push(a);
+            d -= self.to_next;
+            self.to_next = spacing;
+        }
+        self.to_next -= d;
+        self.last = Some(p);
+    }
+}
+
+/// Brush layers are this many pixels on the frame's long edge.
+pub const LAYER_EDGE: u32 = 2048;
+
+/// The size of a brush layer for a frame of `frame` pixels: `LAYER_EDGE` on the long edge.
+pub fn layer_dims(frame: (u32, u32)) -> (u32, u32) {
+    let edge = frame.0.max(frame.1).max(1) as f32;
+    let scale = LAYER_EDGE as f32 / edge;
+    (
+        ((frame.0 as f32 * scale).round() as u32).clamp(1, LAYER_EDGE),
+        ((frame.1 as f32 * scale).round() as u32).clamp(1, LAYER_EDGE),
+    )
+}
+
+/// A brush component's layer: how much of the mask each pixel of the frame is, 0–1 as 16 bits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Raster {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u16>,
+    /// The rectangle (left, top, right, bottom; right and bottom excluded) changed since the last
+    /// `take_dirty`: what to upload.
+    dirty: Option<[u32; 4]>,
+}
+
+impl Raster {
+    pub fn new(dims: (u32, u32)) -> Raster {
+        Raster { width: dims.0, height: dims.1, data: vec![0; dims.0 as usize * dims.1 as usize], dirty: None }
+    }
+
+    /// Paints one dab at `centre` (frame units): every pixel within `radius` moves toward the
+    /// density (toward 0 when erasing) by `flow` × the brush's falloff there, which is 1 inside
+    /// the hard core and eases to 0 at the edge: `m += (density − m) × flow × falloff`.
+    pub fn stamp(&mut self, centre: [f32; 2], radius: f32, feather: f32, flow: f32, density: f32, erase: bool) {
+        let scale = LAYER_EDGE as f32;
+        let (cx, cy, r) = (centre[0] * scale, centre[1] * scale, radius * scale);
+        let inner = r * (1.0 - feather);
+        let x0 = (cx - r).floor().max(0.0) as u32;
+        let y0 = (cy - r).floor().max(0.0) as u32;
+        let x1 = (cx + r).ceil().min(self.width as f32).max(0.0) as u32;
+        let y1 = (cy + r).ceil().min(self.height as f32).max(0.0) as u32;
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let target = if erase { 0.0 } else { density * 65535.0 };
+        let inv = 1.0 / (r - inner).max(1e-6);
+        let width = self.width as usize;
+        let paint_row = |y: u32, line: &mut [u16]| {
+            let dy = y as f32 + 0.5 - cy;
+            // The part of this row inside the circle.
+            let half = (r * r - dy * dy).max(0.0).sqrt();
+            let xs = ((cx - half - 0.5).ceil().max(x0 as f32)) as u32;
+            let xe = (((cx + half - 0.5).floor() + 1.0).min(x1 as f32)).max(xs as f32) as u32;
+            for (i, px) in line[xs as usize..xe as usize].iter_mut().enumerate() {
+                let dx = (xs + i as u32) as f32 + 0.5 - cx;
+                let d = (dx * dx + dy * dy).sqrt();
+                // 1 inside the hard core, easing to 0 at the edge (no branches, so the loop vectorises).
+                let t = ((d - inner) * inv).clamp(0.0, 1.0);
+                let falloff = 1.0 - t * t * (3.0 - 2.0 * t);
+                let m = *px as f32;
+                *px = (m + (target - m) * flow * falloff).round().clamp(0.0, 65535.0) as u16;
+            }
+        };
+        let rows = &mut self.data[y0 as usize * width..y1 as usize * width];
+        if (y1 - y0) * (x1 - x0) > 40_000 {
+            // A big brush: the rows in parallel.
+            use rayon::prelude::*;
+            rows.par_chunks_mut(width).enumerate().for_each(|(i, line)| paint_row(y0 + i as u32, line));
+        } else {
+            for (i, line) in rows.chunks_mut(width).enumerate() {
+                paint_row(y0 + i as u32, line);
+            }
+        }
+        self.dirty = Some(match self.dirty {
+            Some(d) => [d[0].min(x0), d[1].min(y0), d[2].max(x1), d[3].max(y1)],
+            None => [x0, y0, x1, y1],
+        });
+    }
+
+    /// Paints a whole stroke (a new `DabWalker` over its points).
+    pub fn paint(&mut self, stroke: &Stroke) {
+        let mut walker = DabWalker::new();
+        let mut dabs = Vec::new();
+        for i in 0..stroke.points.len() {
+            dabs.clear();
+            walker.feed(stroke.radius, stroke.point(i), &mut dabs);
+            for d in &dabs {
+                self.stamp(*d, stroke.radius, stroke.feather, stroke.flow, stroke.density, stroke.erase);
+            }
+        }
+    }
+
+    /// The layer a list of strokes paints, in order, for a frame of `frame` pixels. All of it is dirty.
+    pub fn rasterize(frame: (u32, u32), strokes: &[Stroke]) -> Raster {
+        let mut r = Raster::new(layer_dims(frame));
+        for s in strokes {
+            r.paint(s);
+        }
+        r.mark_all_dirty();
+        r
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.is_some()
+    }
+
+    pub fn take_dirty(&mut self) -> Option<[u32; 4]> {
+        self.dirty.take()
+    }
+
+    pub fn mark_all_dirty(&mut self) {
+        self.dirty = Some([0, 0, self.width, self.height]);
+    }
+
+    /// Puts a rectangle (as `take_dirty` gave it) back, to be uploaded later.
+    pub fn mark_rect_dirty(&mut self, r: [u32; 4]) {
+        self.dirty = Some(match self.dirty {
+            Some(d) => [d[0].min(r[0]), d[1].min(r[1]), d[2].max(r[2]), d[3].max(r[3])],
+            None => r,
+        });
+    }
+
+    /// The layer at `uv` (fractions of the frame), 0–1, interpolated between pixel centres and held
+    /// at the edge, as the GPU samples it.
+    pub fn sample(&self, uv: [f32; 2]) -> f32 {
+        let fx = (uv[0] * self.width as f32 - 0.5).clamp(0.0, (self.width - 1) as f32);
+        let fy = (uv[1] * self.height as f32 - 0.5).clamp(0.0, (self.height - 1) as f32);
+        let (x0, y0) = (fx.floor() as usize, fy.floor() as usize);
+        let (x1, y1) = ((x0 + 1).min(self.width as usize - 1), (y0 + 1).min(self.height as usize - 1));
+        let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+        let at = |x: usize, y: usize| self.data[y * self.width as usize + x] as f32 / 65535.0;
+        let top = at(x0, y0) * (1.0 - tx) + at(x1, y0) * tx;
+        let bottom = at(x0, y1) * (1.0 - tx) + at(x1, y1) * tx;
+        top * (1.0 - ty) + bottom * ty
+    }
+}
+
+/// The ids of the brush components in `masks`.
+pub fn brush_ids(masks: &Masks) -> Vec<u32> {
+    let mut ids = Vec::new();
+    for m in masks.masks() {
+        for c in m.components() {
+            if c.kind == KIND_BRUSH && !ids.contains(&(c.p[0] as u32)) {
+                ids.push(c.p[0] as u32);
+            }
+        }
+    }
+    ids
+}
+
+/// The strokes of the brush components still in `masks`, if that is fewer than there are.
+pub fn pruned(strokes: &StrokeMap, masks: &Masks) -> Option<StrokeMap> {
+    let ids = brush_ids(masks);
+    if strokes.keys().all(|k| ids.contains(k)) {
+        return None;
+    }
+    Some(strokes.iter().filter(|(k, _)| ids.contains(k)).map(|(k, v)| (*k, v.clone())).collect())
+}
+
+/// The strokes as text, for the sidecar: strokes joined by `;`, each `id E|P radius feather flow
+/// density x0 y0 dx dy dx dy …` (E erases, P paints; the first point whole, the rest as steps from
+/// the one before, in `POINT_UNIT`s). Empty for none.
+pub fn strokes_to_text(strokes: &StrokeMap) -> String {
+    let mut out = Vec::new();
+    for (id, list) in strokes {
+        for s in list.iter() {
+            let mut words = vec![
+                id.to_string(),
+                (if s.erase { "E" } else { "P" }).into(),
+                number(s.radius),
+                number(s.feather),
+                number(s.flow),
+                number(s.density),
+            ];
+            let mut last = [0, 0];
+            for p in &s.points {
+                words.push((p[0] - last[0]).to_string());
+                words.push((p[1] - last[1]).to_string());
+                last = *p;
+            }
+            out.push(words.join(" "));
+        }
+    }
+    out.join(" ; ")
+}
+
+/// Reads [`strokes_to_text`]'s output. A stroke it can't make sense of is left out.
+pub fn strokes_from_text(text: &str) -> StrokeMap {
+    let mut map: std::collections::BTreeMap<u32, Vec<Stroke>> = Default::default();
+    for part in text.split(';') {
+        let w: Vec<&str> = part.split_whitespace().collect();
+        if w.len() < 6 {
+            continue;
+        }
+        let (Ok(id), Ok(radius), Ok(feather), Ok(flow), Ok(density)) =
+            (w[0].parse::<u32>(), w[2].parse::<f32>(), w[3].parse::<f32>(), w[4].parse::<f32>(), w[5].parse::<f32>())
+        else {
+            continue;
+        };
+        let mut s = Stroke::new(w[1] == "E", radius, feather, flow, density);
+        let nums: Option<Vec<i32>> = w[6..].iter().map(|v| v.parse().ok()).collect();
+        let Some(nums) = nums.filter(|n| n.len() % 2 == 0) else { continue };
+        let mut at = [0i32, 0];
+        for pair in nums.chunks(2) {
+            at = [
+                at[0].saturating_add(pair[0]).clamp(-1_000_000, 1_000_000),
+                at[1].saturating_add(pair[1]).clamp(-1_000_000, 1_000_000),
+            ];
+            s.points.push(at);
+        }
+        map.entry(id).or_default().push(s);
+    }
+    map.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect()
 }
 
 #[cfg(test)]
@@ -610,7 +946,7 @@ mod tests {
         assert_eq!(weight(&one(&[full], 0.0), [0.1, 0.1]), 0.0);
         // A mask with no shapes has no weight; an unknown kind (the brush, for now) too.
         assert_eq!(weight(&one(&[], 100.0), [0.1, 0.1]), 0.0);
-        assert_eq!(weight(&one(&[Component { kind: KIND_BRUSH, ..Default::default() }], 100.0), [0.1, 0.1]), 0.0);
+        assert_eq!(weight(&one(&[Component { kind: KIND_BRUSH, ..Default::default() }], 100.0), [0.1, 0.1]), 0.0, "no layer, no weight");
     }
 
     #[test]
@@ -715,5 +1051,197 @@ mod tests {
         assert_eq!(size_of::<GpuComponent>(), 48);
         assert_eq!(size_of::<GpuMask>(), 448);
         assert_eq!(size_of::<GpuMaskSet>(), 3600);
+    }
+
+    fn dabs_of(radius: f32, points: &[[f32; 2]]) -> Vec<[f32; 2]> {
+        let (mut w, mut out) = (DabWalker::new(), Vec::new());
+        for p in points {
+            w.feed(radius, *p, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn dabs_are_evenly_spaced_however_fast_the_pointer_moves() {
+        // A click is one dab.
+        assert_eq!(dabs_of(0.05, &[[0.3, 0.3]]).len(), 1);
+        // 0.1 along at spacing 0.2 × 0.05 = 0.01: 11 dabs, evenly, from one jump or many small steps.
+        let jump = dabs_of(0.05, &[[0.2, 0.3], [0.3, 0.3]]);
+        let steps: Vec<[f32; 2]> = (0..=100).map(|i| [0.2 + i as f32 * 0.001, 0.3]).collect();
+        let slow = dabs_of(0.05, &steps);
+        for dabs in [&jump, &slow] {
+            assert_eq!(dabs.len(), 11, "{dabs:?}");
+            for pair in dabs.windows(2) {
+                assert!(((pair[1][0] - pair[0][0]) - 0.01).abs() < 1e-4 && (pair[1][1] - 0.3).abs() < 1e-6);
+            }
+        }
+        // Fed in pieces, a stroke gives the dabs it gives whole, and a bend keeps the spacing on the path.
+        let bend = [[0.1, 0.1], [0.1137, 0.1], [0.1137, 0.1291], [0.16, 0.2]];
+        let whole = dabs_of(0.04, &bend);
+        let (mut w, mut pieces) = (DabWalker::new(), Vec::new());
+        for p in bend {
+            w.feed(0.04, p, &mut pieces);
+        }
+        assert_eq!(whole, pieces);
+        // Slow movement under the spacing still adds up to dabs.
+        let creep: Vec<[f32; 2]> = (0..50).map(|i| [0.5 + i as f32 * 0.0004, 0.5]).collect();
+        assert_eq!(dabs_of(0.05, &creep).len(), 1 + (0.0004 * 49.0 / 0.01) as usize);
+    }
+
+    #[test]
+    fn rasterizing_flow_density_erase_and_feather() {
+        let frame = (2048, 1536);
+        let centre = [0.5, 0.375];
+        let (cx, cy) = (1024usize, 768usize);
+        let at = |r: &Raster, x: usize, y: usize| r.data[y * r.width as usize + x] as f32 / 65535.0;
+        assert_eq!(layer_dims((5184, 3888)), (2048, 1536));
+        assert_eq!(layer_dims((3888, 5184)), (1536, 2048));
+        // Each dab moves the core `flow` of the way to the density: 1 − (1 − flow)^n of it after n.
+        let mut r = Raster::new(layer_dims(frame));
+        for n in 1..=4 {
+            r.stamp(centre, 0.1, 0.5, 0.4, 0.8, false);
+            let want = 0.8 * (1.0 - 0.6f32.powi(n));
+            assert!((at(&r, cx, cy) - want).abs() < 2e-4, "dab {n}: {} against {want}", at(&r, cx, cy));
+        }
+        // It never passes the density, however many dabs.
+        for _ in 0..200 {
+            r.stamp(centre, 0.1, 0.5, 0.4, 0.8, false);
+        }
+        assert!(at(&r, cx, cy) <= 0.8 + 1e-4 && at(&r, cx, cy) > 0.799);
+        // Erasing moves toward 0 by the same rule.
+        let before = at(&r, cx, cy);
+        r.stamp(centre, 0.1, 0.5, 0.25, 1.0, true);
+        assert!((at(&r, cx, cy) - before * 0.75).abs() < 2e-4);
+        // Outside the radius is untouched, the hard core is full flow, the feather eases between.
+        let mut r = Raster::new(layer_dims(frame));
+        r.stamp(centre, 0.1, 0.5, 1.0, 1.0, false);
+        let radius = 0.1 * LAYER_EDGE as f32; // 204.8 px
+        assert_eq!(at(&r, cx + radius as usize + 2, cy), 0.0);
+        assert!(at(&r, cx + (radius * 0.45) as usize, cy) > 0.999, "inside the core");
+        let mid = at(&r, cx + (radius * 0.75) as usize, cy);
+        assert!(mid > 0.3 && mid < 0.7, "{mid}");
+        let mut last = 1.0;
+        for i in 0..=100 {
+            let v = at(&r, cx + (radius * i as f32 / 101.0) as usize, cy);
+            assert!(v <= last + 1e-4, "falls outward");
+            last = v;
+        }
+        // Feather 0 is a hard edge, 1 falls from the centre.
+        let mut hard = Raster::new(layer_dims(frame));
+        hard.stamp(centre, 0.1, 0.0, 1.0, 1.0, false);
+        assert!(at(&hard, cx + radius as usize - 3, cy) > 0.999);
+        let mut soft = Raster::new(layer_dims(frame));
+        soft.stamp(centre, 0.1, 1.0, 1.0, 1.0, false);
+        assert!(at(&soft, cx + (radius * 0.5) as usize, cy) < 0.6);
+        // The dirty rectangle is the dab's box, cleared when taken, and grows with the next dab.
+        let mut r = Raster::new(layer_dims(frame));
+        assert!(r.take_dirty().is_none());
+        r.stamp([0.2, 0.2], 0.01, 0.5, 1.0, 1.0, false);
+        let a = r.take_dirty().unwrap();
+        assert!(a[0] <= 409 - 20 && a[2] >= 409 + 20 && a[2] - a[0] <= 44, "{a:?}");
+        assert!(r.take_dirty().is_none());
+        r.stamp([0.2, 0.2], 0.01, 0.5, 1.0, 1.0, false);
+        r.stamp([0.4, 0.3], 0.01, 0.5, 1.0, 1.0, false);
+        let b = r.take_dirty().unwrap();
+        assert!(b[0] <= a[0] && b[2] >= 819 && b[3] >= 614, "{b:?}");
+        // A dab off the layer does nothing.
+        r.stamp([3.0, 3.0], 0.01, 0.5, 1.0, 1.0, false);
+        assert!(r.take_dirty().is_none());
+    }
+
+    fn stroke(erase: bool, pts: &[[f32; 2]]) -> Stroke {
+        let mut s = Stroke::new(erase, 0.03, 0.5, 0.6, 0.9);
+        s.points = pts.iter().map(|p| Stroke::quantise(*p)).collect();
+        s
+    }
+
+    #[test]
+    fn rasterizing_strokes_in_order_and_as_they_arrive() {
+        let frame = (1200, 800);
+        let a = stroke(false, &[[0.2, 0.2], [0.6, 0.3], [0.8, 0.5]]);
+        let b = stroke(true, &[[0.4, 0.25], [0.5, 0.28]]);
+        let both = Raster::rasterize(frame, &[a.clone(), b.clone()]);
+        // Painted live, dab by dab as the points arrive, it is the same layer.
+        let mut live = Raster::new(layer_dims(frame));
+        for s in [&a, &b] {
+            let mut walker = DabWalker::new();
+            let mut dabs = Vec::new();
+            for i in 0..s.points.len() {
+                dabs.clear();
+                walker.feed(s.radius, s.point(i), &mut dabs);
+                for d in &dabs {
+                    live.stamp(*d, s.radius, s.feather, s.flow, s.density, s.erase);
+                }
+            }
+        }
+        assert_eq!(live.data, both.data);
+        // Erasing took something out of the first stroke, and order matters.
+        let only_a = Raster::rasterize(frame, &[a.clone()]);
+        assert!(both.data.iter().zip(&only_a.data).any(|(x, y)| x < y));
+        let reversed = Raster::rasterize(frame, &[b, a]);
+        assert_ne!(reversed.data, both.data);
+        // Nothing is painted far from the path, and the sample reads what was painted.
+        assert_eq!(only_a.sample([0.9, 0.9]), 0.0);
+        assert!(only_a.sample([0.2, 0.3]) > 0.5, "uv is fractions of the frame: y 0.2 long edges is 0.3 of an 800-high frame");
+        let mid = only_a.sample([0.4, 0.375]);
+        assert!(mid > 0.5, "{mid}");
+    }
+
+    #[test]
+    fn brush_text_round_trip_and_pruning() {
+        let a = stroke(false, &[[0.2, 0.2], [0.2013, 0.2], [0.19, 0.25]]);
+        let b = stroke(true, &[[0.5, 0.5]]);
+        let c = stroke(false, &[[0.7, 0.1], [0.8, 0.2]]);
+        let mut map = StrokeMap::new();
+        map.insert(3, std::sync::Arc::new(vec![a, b]));
+        map.insert(7, std::sync::Arc::new(vec![c]));
+        let text = strokes_to_text(&map);
+        assert!(text.starts_with("3 P 0.03 0.5 0.6 0.9 2000 2000 13 0 -113 500 ; 3 E "), "{text}");
+        assert_eq!(strokes_from_text(&text), map);
+        assert_eq!(strokes_to_text(&StrokeMap::new()), "");
+        // Damage costs the stroke it is in.
+        let bad = text.replace("2000 2000 13", "2000 2000 x");
+        let read = strokes_from_text(&bad);
+        assert_eq!(read[&3].len(), 1);
+        assert_eq!(read[&7], map[&7]);
+        assert!(strokes_from_text("3 P 0.03").is_empty());
+        // Settings are rounded and held in range as they are made.
+        let s = Stroke::new(false, 0.123456789, 2.0, -1.0, f32::NAN);
+        assert_eq!((s.radius, s.feather, s.flow, s.density), (0.12346, 1.0, 0.0, 0.0));
+        // Strokes of a deleted brush component go; those still used stay.
+        let mut masks = Masks::default();
+        let mut m = Mask::new();
+        m.components[0] = Component { kind: KIND_BRUSH, p: [7.0, 0.7, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0], ..Default::default() };
+        m.count = 1;
+        masks.masks[0] = m;
+        masks.count = 1;
+        assert_eq!(brush_ids(&masks), vec![7]);
+        let left = pruned(&map, &masks).unwrap();
+        assert_eq!(left.keys().copied().collect::<Vec<_>>(), vec![7]);
+        assert!(pruned(&left, &masks).is_none());
+    }
+
+    #[test]
+    fn brush_components_weigh_their_layer() {
+        let mut masks = Masks::default();
+        let mut m = Mask::new();
+        m.sliders[slider::EXPOSURE] = 2.0;
+        m.components[0] = Component { kind: KIND_BRUSH, p: [5.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0], ..Default::default() };
+        m.components[1] = Component { kind: KIND_BRUSH, mode: SUBTRACT, p: [6.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0], ..Default::default() };
+        m.count = 2;
+        masks.masks[0] = m;
+        masks.count = 1;
+        // Layer 0 (id 5) is 0.8 here, layer 1 (id 6) 0.5: the mask is 0.8 × (1 − 0.5).
+        let sampler = |slice: u32, _uv: [f32; 2]| if slice == 0 { 0.8 } else { 0.5 };
+        let set = GpuMaskSet::with_layers(&masks, &IDENTITY, &|id| Some(id - 5));
+        let l = set.local_with([0.3, 0.3], [0.3, 0.3], &sampler);
+        assert!((l.exposure - 2.0 * 0.8 * 0.5).abs() < 1e-6, "{}", l.exposure);
+        // Without a layer for it (not made yet) a brush component weighs nothing.
+        let none = GpuMaskSet::with_layers(&masks, &IDENTITY, &|_| None);
+        assert_eq!(none.local_with([0.3, 0.3], [0.3, 0.3], &sampler).exposure, 0.0);
+        // The sidecar text for a brush component.
+        let text = to_text(&masks);
+        assert!(text.contains("B+ 5 0.5 0.5") && text.contains("B- 6 "), "{text}");
+        assert_eq!(from_text(&text), masks);
     }
 }

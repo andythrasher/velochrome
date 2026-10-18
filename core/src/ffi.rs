@@ -221,6 +221,42 @@ pub extern "C" fn we_set_mask_overlay(handle: *const Handle, index: i32) -> i32 
     })
 }
 
+/// Paints with the brush of brush component `id` (`Component::p[0]`) of photo `index`: adds the
+/// `count` pointer positions in `points` (x, y pairs, frame units as masks use) to the stroke under
+/// way, or with `first` 1 starts a new one with these settings (`radius` in units of the long edge;
+/// `feather`, `flow`, `density` 0–1; `erase` 1 rubs out). The dabs show at once; `we_brush_end`
+/// finishes the stroke, which is one step for undo.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_brush_paint(
+    handle: *const Handle,
+    index: i32,
+    id: u32,
+    radius: f32,
+    feather: f32,
+    flow: f32,
+    density: f32,
+    erase: i32,
+    first: i32,
+    points: *const f32,
+    count: i32,
+) -> i32 {
+    guard(handle, |e| {
+        let pts: Vec<[f32; 2]> = if points.is_null() || count <= 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(points, count as usize * 2) }.chunks(2).map(|p| [p[0], p[1]]).collect()
+        };
+        let brush = crate::engine::Brush { erase: erase != 0, radius, feather, flow, density };
+        Ok(e.brush_paint(index.max(0) as usize, id, brush, first != 0, &pts) as i32)
+    })
+}
+
+/// Ends the brush stroke under way on photo `index`. Returns 1 if there was one.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_brush_end(handle: *const Handle, index: i32) -> i32 {
+    guard(handle, |e| Ok(e.brush_end(index.max(0) as usize) as i32))
+}
+
 /// Undoes (`redo` 0) or redoes (1) a photo's last change, writing its adjustments and masks now
 /// into `edit` and `masks`. Returns 1 if something changed, 0 if there was nothing to undo or redo.
 #[unsafe(no_mangle)]

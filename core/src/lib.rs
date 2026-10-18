@@ -26,4 +26,5 @@ pub mod pick;
 pub mod detail;
 pub mod mixer;
 pub mod masks;
+pub mod brushgpu;
 pub mod import;

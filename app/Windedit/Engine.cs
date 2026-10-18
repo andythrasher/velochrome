@@ -69,6 +69,8 @@ public sealed unsafe partial class Engine : IDisposable
     [LibraryImport(Dll)] private static partial int we_get_masks(IntPtr engine, int index, out Masks masks);
     [LibraryImport(Dll)] private static partial int we_set_masks(IntPtr engine, int index, in Masks masks, int commit);
     [LibraryImport(Dll)] private static partial int we_set_mask_overlay(IntPtr engine, int index);
+    [LibraryImport(Dll)] private static partial int we_brush_paint(IntPtr engine, int index, uint id, float radius, float feather, float flow, float density, int erase, int first, float* points, int count);
+    [LibraryImport(Dll)] private static partial int we_brush_end(IntPtr engine, int index);
     [LibraryImport(Dll)] private static partial int we_as_shot_white_balance(IntPtr engine, int index, out float kelvin, out float tint);
     [LibraryImport(Dll)] private static partial int we_lens_info(IntPtr engine, int index, out int distortion, out int chromaticAberration);
     [LibraryImport(Dll)] private static partial int we_pick_white_balance(IntPtr engine, float x, float y, out float kelvin, out float tint);
@@ -167,7 +169,7 @@ public sealed unsafe partial class Engine : IDisposable
     // ---- Masks (masks.rs). All zero is none; keep the layouts in step with the Rust structs. ----
 
     public const int MaxMasks = 8, MaxComponents = 8, MaskSliders = 10;
-    public const uint LinearShape = 1, RadialShape = 2, SubtractMode = 1;
+    public const uint LinearShape = 1, RadialShape = 2, BrushShape = 3, SubtractMode = 1;
 
     [InlineArray(8)] public struct Floats8 { float element; }
     [InlineArray(MaskSliders)] public struct MaskSliderValues { float element; }
@@ -319,6 +321,21 @@ public sealed unsafe partial class Engine : IDisposable
 
     /// <summary>Changes a photo's masks, as <see cref="SetEdit"/> does the adjustments.</summary>
     public void SetMasks(int index, in Masks masks, bool commit) => Check(we_set_masks(handle, index, in masks, commit ? 1 : 0));
+
+    /// <summary>
+    /// Paints with a brush component's brush (<see cref="MaskComponent.P"/>[0] is its id): adds the positions in
+    /// <paramref name="points"/> (x, y pairs in the units masks use: the raw's long edge) to the stroke under way,
+    /// or starts one with these settings when <paramref name="first"/> is true. <paramref name="radius"/> is in
+    /// long-edge units, <paramref name="feather"/>, <paramref name="flow"/> and <paramref name="density"/> 0–1.
+    /// </summary>
+    public void BrushPaint(int index, uint id, float radius, float feather, float flow, float density, bool erase, bool first, float[] points)
+    {
+        fixed (float* p = points)
+            Check(we_brush_paint(handle, index, id, radius, feather, flow, density, erase ? 1 : 0, first ? 1 : 0, p, points.Length / 2));
+    }
+
+    /// <summary>Ends the stroke under way: one step for undo.</summary>
+    public void BrushEnd(int index) => Check(we_brush_end(handle, index));
 
     /// <summary>Shows mask <paramref name="index"/> of the photo in view as a red overlay; -1 for none.</summary>
     public void SetMaskOverlay(int index) => Check(we_set_mask_overlay(handle, index));

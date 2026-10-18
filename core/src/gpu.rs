@@ -396,6 +396,20 @@ impl Gpu {
         unsafe { self.device.CreateShaderResourceView(&self.masks, Some(&desc), self.cpu_handle(slot)) };
     }
 
+    /// A view of a texture array with `slices` slices (or, with None, a descriptor that points at
+    /// nothing, for a kernel that declares an array it doesn't read).
+    pub fn srv_texture_array(&self, resource: Option<&ID3D12Resource>, format: DXGI_FORMAT, slices: u32, slot: u32) {
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MostDetailedMip: 0, MipLevels: 1, FirstArraySlice: 0, ArraySize: slices, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+            },
+        };
+        unsafe { self.device.CreateShaderResourceView(resource, Some(&desc), self.cpu_handle(slot)) };
+    }
+
     /// A descriptor that points at nothing, for a table slot a kernel declares but doesn't read.
     pub fn srv_null(&self, slot: u32) {
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
