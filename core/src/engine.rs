@@ -119,6 +119,11 @@ impl Engine {
         let _ = self.viewer.send(Command::EditMode(on));
     }
 
+    /// In crop mode: which point of the frame (fractions) sits at the view's centre.
+    pub fn set_crop_view(&self, x: f32, y: f32) {
+        let _ = self.viewer.send(Command::CropView(x, y));
+    }
+
     pub fn set_crop_mode(&self, on: bool) {
         {
             let mut v = self.view.lock().unwrap();

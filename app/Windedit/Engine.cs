@@ -51,6 +51,7 @@ public sealed unsafe partial class Engine : IDisposable
     [LibraryImport(Dll)] private static partial int we_show(IntPtr engine, int index);
     [LibraryImport(Dll)] private static partial int we_set_zoom(IntPtr engine, int actual, float x, float y);
     [LibraryImport(Dll)] private static partial int we_set_edit_mode(IntPtr engine, int on);
+    [LibraryImport(Dll)] private static partial int we_set_crop_view(IntPtr engine, float x, float y);
     [LibraryImport(Dll)] private static partial int we_set_crop_mode(IntPtr engine, int on);
     [LibraryImport(Dll)] private static partial int we_constrain_crop(float width, float height, float angle, int mode, float a, float b, float* b0, float* desired, float* output);
     [LibraryImport(Dll)] private static partial int we_set_canvas_color(IntPtr engine, float r, float g, float b);
@@ -275,6 +276,10 @@ public sealed unsafe partial class Engine : IDisposable
     /// <summary>Every photo's metadata, in folder order.</summary>
     public Metadata[] GetMetadata(int count)
     {
+    /// <summary>In crop mode, the point of the frame (fractions of its size) at the view's centre: 0.5, 0.5,
+    /// except while the photo is dragged under a fixed crop box.</summary>
+    public void SetCropView(float x, float y) => Check(we_set_crop_view(handle, x, y));
+
         var all = new Metadata[count];
         fixed (Metadata* p = all)
             Check(we_get_metadata(handle, p, count));

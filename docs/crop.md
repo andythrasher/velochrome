@@ -101,3 +101,13 @@ space after that, so the crop works on the corrected photo.
   leaving room outside the box to grab and turn. Pointer over the box shows resize, move and turn
   cursors (a crosshair with a ↻ glyph beside it outside the box). Turning shows a ten-by-ten grid and the angle;
   Shift snaps to whole degrees, otherwise 0.1° steps.
+- **Moving the photo.** A drag inside the box moves the photo under a box that stays where it is on
+  screen, as in Lightroom. The data is the same (the box slides the opposite way in the frame,
+  constrained by `Slide`); the view follows the box while dragging (`we_set_crop_view`, the point of
+  the frame at the view's centre, `Zoom::Frame { x, y }`) and eases back to the frame's middle on
+  release. Arrow keys nudge the photo a screen pixel (Shift: ten) by moving the box the other way;
+  unlike the drag, the frame stays put. Cursor: a hand inside the box.
+- **A bug found on the way:** a box held as `f32` (as the app and the sidecar hold it) is a hundredth of
+  a pixel outside the turned photo, `constrain_crop` took it for invalid after straightening, and Move
+  collapsed it to a sliver. The base box now only has to be valid to 0.05 px (test
+  `a_box_kept_in_f32_still_fits_and_slides_without_shrinking`).

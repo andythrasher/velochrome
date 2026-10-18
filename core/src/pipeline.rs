@@ -431,8 +431,10 @@ pub enum Zoom {
     /// and output pixels per photo pixel (1 for the photo's own size). Output pixel (0, 0) sits
     /// on the corner, so tiles at whole-pixel corners line up without any resampling.
     Region { x: f32, y: f32, scale: f32 },
-    /// The whole frame (not just the crop) as large as fits, with the photo turned beneath it: crop mode.
-    Frame,
+    /// The whole frame (not just the crop) as large as fits, with a margin, and the photo turned
+    /// beneath it: crop mode. The point of the frame (fractions of its size) at the view's centre is
+    /// (`x`, `y`): the middle, except while the photo is dragged under a fixed crop box.
+    Frame { x: f32, y: f32 },
 }
 
 /// A texture the develop pass draws into, the size of the view.

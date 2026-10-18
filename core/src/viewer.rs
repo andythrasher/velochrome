@@ -36,6 +36,8 @@ pub enum Command {
     EditMode(bool),
     /// Crop mode shows the whole frame at Fit, with the photo turned beneath it (and no zoom).
     CropMode(bool),
+    /// In crop mode, the point of the frame (fractions) at the view's centre.
+    CropView(f32, f32),
     /// The colour of the empty canvas around the photo.
     Canvas([f32; 3]),
     /// Create or resize the swap chain. Replies with the IDXGISwapChain pointer.
@@ -261,6 +263,7 @@ struct Viewer {
     edit: Edit,
     edit_mode: bool,
     crop_mode: bool,
+    crop_center: (f32, f32),
     /// Previews on the GPU, one per tier (quick, loupe, full size). Separate, so moving between
     /// tiers (sharpening up, zooming in and out) never swaps one texture between two sizes,
     /// which would reallocate it each time (50–170 ms on some laptops). Each is reused for the
@@ -294,6 +297,7 @@ impl Viewer {
             edit: Edit::default(),
             edit_mode: false,
             crop_mode: false,
+            crop_center: (0.5, 0.5),
             previews: Default::default(),
             image: None,
             dirty: false,
@@ -382,8 +386,13 @@ impl Viewer {
                 self.edit_mode = on;
                 self.dirty = true;
             }
+            Command::CropView(x, y) => {
+                self.crop_center = (x, y);
+                self.dirty = true;
+            }
             Command::CropMode(on) => {
                 self.crop_mode = on;
+                self.crop_center = (0.5, 0.5);
                 self.dirty = true;
             }
             Command::Canvas(rgb) => {
@@ -471,7 +480,7 @@ impl Viewer {
         match self.zoom {
             Zoom::Fit => &[Kind::Loupe, Kind::Full, Kind::Fast],
             Zoom::Actual { .. } if self.has_full_size_jpeg(index) => &[Kind::Full, Kind::Raw, Kind::Loupe, Kind::Fast],
-            Zoom::Actual { .. } | Zoom::Region { .. } | Zoom::Frame => &[Kind::Raw, Kind::Full, Kind::Loupe, Kind::Fast],
+            Zoom::Actual { .. } | Zoom::Region { .. } | Zoom::Frame { .. } => &[Kind::Raw, Kind::Full, Kind::Loupe, Kind::Fast],
         }
     }
 
@@ -546,7 +555,7 @@ impl Viewer {
         };
         let (raw_width, raw_height) = self.jobs.raw(index).map_or((0, 0), |r| (r.width, r.height));
         let edit = self.edit;
-        let zoom = if self.crop_mode { Zoom::Frame } else { self.zoom };
+        let zoom = self.view_zoom();
         // What the view shows: the crop, or in crop mode the whole frame, and where on the view.
         let frame = geometry::frame_size(photo_size, edit.rotation);
         let shown = if self.crop_mode { [0.0, 0.0, frame.0 as f64, frame.1 as f64] } else { geometry::window(frame, edit.crop) };
@@ -844,13 +853,20 @@ impl Viewer {
 }
 
 impl Viewer {
+    /// How the view is drawn: the user's zoom, or in crop mode the whole frame.
+    fn view_zoom(&self) -> Zoom {
+        if self.crop_mode { Zoom::Frame { x: self.crop_center.0, y: self.crop_center.1 } } else { self.zoom }
+    }
+}
+
+impl Viewer {
     /// The white balance that makes the spot at (`x`, `y`) on the view neutral, read from the raw
     /// of the photo in view through the same transform the last frame drew it with.
     fn pick(&self, x: f32, y: f32) -> Result<(f32, f32), String> {
         let index = self.focus.ok_or("There is no photo to pick from.")?;
         let frame = self.jobs.raw(index).ok_or("The raw is still being read.")?;
         let out = self.presenter.as_ref().map(|p| p.size()).or(self.offscreen.as_ref().map(|t| (t.width, t.height))).unwrap_or((1, 1));
-        let zoom = if self.crop_mode { Zoom::Frame } else { self.zoom };
+        let zoom = self.view_zoom();
         crate::pick::pick(&frame, &self.edit, zoom, out, (x, y)).map_err(|e| e.to_string())
     }
 }

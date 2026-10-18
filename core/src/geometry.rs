@@ -72,7 +72,7 @@ pub struct ViewMap {
 /// The affine map from output pixels to texture coordinates, covering zoom, pan, the camera's
 /// orientation, the quarter turns, straightening and the crop. `texture` is the texture's size,
 /// `turns` from [`turns`], and `frame` the frame's size. `Zoom` is relative to the crop (to the
-/// whole frame for `Zoom::Frame`), except `Region`, which is in frame pixels.
+/// whole frame for `Zoom::Frame`, wherever its centre is), except `Region`, which is in frame pixels.
 pub fn view_map(
     texture: (u32, u32),
     turns: u32,
@@ -87,14 +87,14 @@ pub fn view_map(
     let (fw, fh) = (frame.0 as f64, frame.1 as f64);
     let (out_w, out_h) = (out.0 as f64, out.1 as f64);
     let [wx, wy, ww, wh] = match zoom {
-        Zoom::Frame => [0.0, 0.0, fw, fh],
+        Zoom::Frame { .. } => [0.0, 0.0, fw, fh],
         _ => window(frame, crop),
     };
     let (scale, center) = match zoom {
         Zoom::Fit => ((out_w / ww).min(out_h / wh), (wx + ww / 2.0, wy + wh / 2.0)),
-        Zoom::Frame => {
+        Zoom::Frame { x, y } => {
             let room = 1.0 - 2.0 * FRAME_MARGIN;
-            ((out_w * room / ww).min(out_h * room / wh), (wx + ww / 2.0, wy + wh / 2.0))
+            ((out_w * room / ww).min(out_h * room / wh), (x as f64 * fw, y as f64 * fh))
         }
         Zoom::Actual { x, y } => (1.0, (wx + x.clamp(0.0, 1.0) as f64 * ww, wy + y.clamp(0.0, 1.0) as f64 * wh)),
         Zoom::Region { x, y, scale } => (scale as f64, (x as f64 + out_w / scale as f64 / 2.0, y as f64 + out_h / scale as f64 / 2.0)),
@@ -140,13 +140,17 @@ pub fn view_map(
 
 /// Whether the rectangle lies inside the frame and inside the photo turned by `angle` degrees.
 pub fn fits(frame: (f64, f64), angle: f64, r: Rect) -> bool {
+    fits_within(frame, angle, r, 1e-4)
+}
+
+/// [`fits`] allowing the box to be `tolerance` pixels outside.
+fn fits_within(frame: (f64, f64), angle: f64, r: Rect, tolerance: f64) -> bool {
     let (w, h) = frame;
     let slack = 1e-6;
     if r[0] < -slack || r[1] < -slack || r[2] > 1.0 + slack || r[3] > 1.0 + slack {
         return false;
     }
     let (sin, cos) = angle.to_radians().sin_cos();
-    let tolerance = 1e-4; // pixels
     [(r[0], r[1]), (r[2], r[1]), (r[0], r[3]), (r[2], r[3])].iter().all(|&(fx, fy)| {
         let (dx, dy) = (fx * w - w / 2.0, fy * h - h / 2.0);
         let (qx, qy) = (dx * cos + dy * sin, -dx * sin + dy * cos);
@@ -175,7 +179,10 @@ pub enum Constrain {
 /// crop before this drag step), `desired` what the drag asks for, possibly past the photo.
 pub fn constrain_crop(frame: (f64, f64), angle: f64, base: Rect, desired: Rect, how: Constrain) -> Rect {
     let ok = |r: Rect| fits(frame, angle, r);
-    let base = if ok(base) { base } else { [0.5 - MIN_SIZE, 0.5 - MIN_SIZE, 0.5 + MIN_SIZE, 0.5 + MIN_SIZE] };
+    // A box that was valid and has been through `f32` (as the app and the sidecar hold it) is off by
+    // about 1e-4 pixels, so the base only has to be valid to a few hundredths of a pixel; taken for
+    // invalid it would collapse to a sliver.
+    let base = if fits_within(frame, angle, base, 0.05) { base } else { [0.5 - MIN_SIZE, 0.5 - MIN_SIZE, 0.5 + MIN_SIZE, 0.5 + MIN_SIZE] };
     // The furthest value along good → bad that still passes (good must pass).
     let furthest = |good: f64, bad: f64, pass: &dyn Fn(f64) -> bool| {
         if pass(bad) {
@@ -324,6 +331,19 @@ mod tests {
     }
 
     #[test]
+    fn a_box_kept_in_f32_still_fits_and_slides_without_shrinking() {
+        // Straighten, hold the box as `f32` the way the app does, then move it: it must stay the same
+        // size (a box taken for invalid collapses to a sliver).
+        for angle in [0.3, 2.0, 9.5, 17.0, -9.5, -33.0] {
+            let shown = constrain_crop(FRAME, angle, FULL, FULL, Constrain::Shrink);
+            let held = shown.map(|v| v as f32 as f64);
+            assert!(fits_within(FRAME, angle, held, 0.05), "{angle}: {held:?}");
+            let moved = constrain_crop(FRAME, angle, held, [held[0] - 0.1, held[1], held[2] - 0.1, held[3]], Constrain::Slide);
+            assert!(((moved[2] - moved[0]) - (held[2] - held[0])).abs() < 1e-9, "{angle}: {moved:?}");
+        }
+    }
+
+    #[test]
     fn square_frame_at_45_degrees() {
         // The biggest centred square in a square turned 45° has a side of 1/√2.
         let r = constrain_crop((1000.0, 1000.0), 45.0, FULL, FULL, Constrain::Shrink);
@@ -449,7 +469,7 @@ mod tests {
         assert_eq!(texture_at(&m, 200.0, 200.0), [1.0, 1.0]);
         assert_eq!(m.clip, [0.0, 0.0, 200.0, 200.0]);
         // In crop mode the whole frame is shown instead.
-        let m = view_map((400, 200), 0, (400, 200), 0.0, crop, Zoom::Frame, (400, 200));
+        let m = view_map((400, 200), 0, (400, 200), 0.0, crop, Zoom::Frame { x: 0.5, y: 0.5 }, (400, 200));
         assert_eq!(texture_at(&m, m.clip[0], m.clip[1]), [0.0, 0.0]);
         // With a margin all round: the frame's box is inside the view, centred.
         assert!(m.clip[0] > 0.0 && m.clip[1] > 0.0 && 400.0 - m.clip[2] - m.clip[0] < 1e-3 && 200.0 - m.clip[3] - m.clip[1] < 1e-3);
@@ -462,12 +482,12 @@ mod tests {
     fn straightening_turns_the_photo_clockwise_about_the_centre() {
         // At +90° (not allowed by the slider, but the maths holds) the picture's top edge ends
         // up on the right: the frame's right-middle shows the photo's top-middle.
-        let m = view_map((200, 200), 0, (200, 200), 90.0, FULL_CROP, Zoom::Frame, (200, 200));
+        let m = view_map((200, 200), 0, (200, 200), 90.0, FULL_CROP, Zoom::Frame { x: 0.5, y: 0.5 }, (200, 200));
         let [u, v] = texture_at(&m, m.clip[2], 100.0);
         assert!((u - 0.5).abs() < 1e-5 && v.abs() < 1e-5, "{u} {v}");
         // The centre stays put at any angle.
         for angle in [-17.0, 4.0, 33.0] {
-            let m = view_map((300, 200), 0, (300, 200), angle, FULL_CROP, Zoom::Frame, (300, 200));
+            let m = view_map((300, 200), 0, (300, 200), angle, FULL_CROP, Zoom::Frame { x: 0.5, y: 0.5 }, (300, 200));
             let [u, v] = texture_at(&m, 150.0, 100.0);
             assert!((u - 0.5).abs() < 1e-5 && (v - 0.5).abs() < 1e-5);
         }

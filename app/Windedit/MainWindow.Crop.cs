@@ -50,6 +50,11 @@ public sealed partial class MainWindow
     float[] dragCrop = new float[4];
     float dragAngle;
     double dragAspect = 1;
+    // Dragging the photo: the box stays where it was on screen while the view follows it.
+    (float X, float Y) viewCenter = (0.5f, 0.5f);
+    (float X, float Y) dragCenter;
+    Rect dragFrame, dragBox;
+    Microsoft.UI.Xaml.DispatcherTimer? recenter;
 
     Button cropButton = null!;
     ComboBox aspectBox = null!;
@@ -162,9 +167,15 @@ public sealed partial class MainWindow
             case VirtualKey.Enter when cropping: ExitCrop(cancel: false); return true;
             case VirtualKey.Escape when cropping: ExitCrop(cancel: true); return true;
             case VirtualKey.X when cropping: SwapAspect(); return true;
+            case VirtualKey.Left when cropping: NudgePhoto(-1, 0, Shifted()); return true;
+            case VirtualKey.Right when cropping: NudgePhoto(1, 0, Shifted()); return true;
+            case VirtualKey.Up when cropping: NudgePhoto(0, -1, Shifted()); return true;
+            case VirtualKey.Down when cropping: NudgePhoto(0, 1, Shifted()); return true;
             default: return false;
         }
     }
+
+    static bool Shifted() => InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift).HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
 
     // ---- Entering and leaving ----
 
@@ -223,6 +234,8 @@ public sealed partial class MainWindow
                 Change(e => WithCrop(e with { Rotation = cropEntry.Rotation, Angle = cropEntry.Angle }, CropOf(cropEntry)), commit: true);
             AfterCommit(p);
         }
+        StopRecenter();
+        viewCenter = (0.5f, 0.5f);
         cropping = false;
         dragging = false;
         engine.SetCropMode(false);
@@ -419,6 +432,12 @@ public sealed partial class MainWindow
         if (!ready)
             return;
         var r = CropRect(f, CropOf(edit));
+        if (dragging && dragKind == Move)
+        {
+            // Exactly where the drag puts them, not where the last drawn frame had them.
+            f = new Rect(dragFrame.X - (viewCenter.X - dragCenter.X) * f.Width, dragFrame.Y - (viewCenter.Y - dragCenter.Y) * f.Height, f.Width, f.Height);
+            r = dragBox;
+        }
         void Place(UIElement e, double x, double y, double w, double h)
         {
             Canvas.SetLeft(e, x);
@@ -493,6 +512,10 @@ public sealed partial class MainWindow
         dragAngle = edit.Angle;
         dragAspect = CropAspect(edit);
         dragKind = HitTest(p, CropRect(f, dragCrop));
+        StopRecenter();
+        dragCenter = viewCenter;
+        dragFrame = f;
+        dragBox = CropRect(f, dragCrop);
         dragging = true;
         CropCanvas.CapturePointer(e.Pointer);
         SetGrid(dragKind == Turn);
@@ -541,8 +564,12 @@ public sealed partial class MainWindow
         float[] result;
         if (dragKind == Move)
         {
-            float[] want = [s[0] + dx, s[1] + dy, s[2] + dx, s[3] + dy];
+            // The photo follows the pointer under a box that stays where it is: the box moves the
+            // other way in the frame, and the view follows the box.
+            float[] want = [s[0] - dx, s[1] - dy, s[2] - dx, s[3] - dy];
             result = Engine.ConstrainCrop(fw, fh, angle, Engine.Constrain.Slide, current, want);
+            viewCenter = (dragCenter.X + (result[0] + result[2] - s[0] - s[2]) / 2, dragCenter.Y + (result[1] + result[3] - s[1] - s[3]) / 2);
+            engine.SetCropView(viewCenter.X, viewCenter.Y);
         }
         else if (aspectLocked || shift)
         {
@@ -631,7 +658,7 @@ public sealed partial class MainWindow
             Right | Top or Left | Bottom => InputSystemCursorShape.SizeNortheastSouthwest,
             Left or Right => InputSystemCursorShape.SizeWestEast,
             Top or Bottom => InputSystemCursorShape.SizeNorthSouth,
-            Move => InputSystemCursorShape.SizeAll,
+            Move => InputSystemCursorShape.Hand,
             _ => InputSystemCursorShape.Cross,
         };
         CropCanvas.SetCursor(InputSystemCursor.Create(shape));
@@ -650,11 +677,52 @@ public sealed partial class MainWindow
         EndDrag();
     }
 
+    /// <summary>Eases the view back to the frame's middle after the photo was dragged.</summary>
+    void GlideBack()
+    {
+        StopRecenter();
+        var from = viewCenter;
+        var step = 0;
+        recenter = new Microsoft.UI.Xaml.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+        recenter.Tick += (_, _) =>
+        {
+            step++;
+            var t = Math.Min(1.0, step / 10.0);
+            var ease = (float)(1 - (1 - t) * (1 - t));
+            viewCenter = (from.X + (0.5f - from.X) * ease, from.Y + (0.5f - from.Y) * ease);
+            engine.SetCropView(viewCenter.X, viewCenter.Y);
+            if (t >= 1)
+                StopRecenter();
+        };
+        recenter.Start();
+    }
+
+    void StopRecenter()
+    {
+        recenter?.Stop();
+        recenter = null;
+    }
+
+    /// <summary>Arrow keys move the photo under the box by a screen pixel, ten with Shift.</summary>
+    void NudgePhoto(int dx, int dy, bool big)
+    {
+        if (!cropping || last.ViewW <= 0 || last.FrameWidth == 0)
+            return;
+        var px = big ? 10 : 1;
+        var current = CropOf(edit);
+        float mx = -dx * px / last.ViewW, my = -dy * px / last.ViewH;
+        float[] want = [current[0] + mx, current[1] + my, current[2] + mx, current[3] + my];
+        var result = Engine.ConstrainCrop(last.FrameWidth, last.FrameHeight, edit.Angle, Engine.Constrain.Slide, current, want);
+        Change(ed => WithCrop(ed, result), commit: true);
+    }
+
     void EndDrag()
     {
         if (!dragging)
             return;
         dragging = false;
+        if (dragKind == Move)
+            GlideBack();
         SetGrid(null);
         CommitEdit(); // one undo step for the whole drag
     }

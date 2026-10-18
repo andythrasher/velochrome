@@ -476,3 +476,13 @@ pub extern "C" fn we_constrain_crop(
     }
     0
 }
+
+/// In crop mode, which point of the frame (fractions of its width and height) is at the centre of
+/// the view: 0.5, 0.5 normally; the app moves it while the photo is dragged under a fixed crop box.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_set_crop_view(handle: *const Handle, x: f32, y: f32) -> i32 {
+    guard(handle, |e| {
+        e.set_crop_view(x, y);
+        Ok(0)
+    })
+}

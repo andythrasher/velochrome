@@ -61,6 +61,9 @@ pub fn bench_crop(files: &[PathBuf]) {
         failed |= !report("rotation 1 = unrotated turned 90°", format!("mean {mean:.4}, largest {max} levels, {over} of {} values off by more than 1", diffs.len()), max <= 3 && over * 10_000 < diffs.len());
 
         // 2. A crop, at pixel positions that are whole at this scale.
+        // Against the uncropped photo drawn the same way (Fit), since the detail pass treats export tiles
+        // and screen views differently.
+        let plain_fit = render!(&edit, Zoom::Fit, a, b);
         let snap = |v: f32, size: u32| (v * size as f32 / k as f32).round() as u32 * k;
         let (x0, y0) = (snap(0.2, ow), snap(0.3, oh));
         let (x1, y1) = (snap(0.8, ow), snap(0.75, oh));
@@ -72,7 +75,7 @@ pub fn bench_crop(files: &[PathBuf]) {
         for y in 0..ch as usize {
             for x in 0..cw as usize {
                 for c in 0..3 {
-                    diffs.push(cropped[(y * cw as usize + x) * 4 + c].abs_diff(plain[((y + oy) * a as usize + x + ox) * 4 + c]));
+                    diffs.push(cropped[(y * cw as usize + x) * 4 + c].abs_diff(plain_fit[((y + oy) * a as usize + x + ox) * 4 + c]));
                 }
             }
         }
