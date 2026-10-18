@@ -63,6 +63,8 @@ public sealed unsafe partial class Engine : IDisposable
     [LibraryImport(Dll)] private static partial int we_set_edit(IntPtr engine, int index, in Edit edit, int commit);
     [LibraryImport(Dll)] private static partial int we_undo(IntPtr engine, int index, int redo, out Edit edit);
     [LibraryImport(Dll)] private static partial int we_as_shot_white_balance(IntPtr engine, int index, out float kelvin, out float tint);
+    [LibraryImport(Dll)] private static partial int we_lens_info(IntPtr engine, int index, out int distortion, out int chromaticAberration);
+    [LibraryImport(Dll)] private static partial int we_pick_white_balance(IntPtr engine, float x, float y, out float kelvin, out float tint);
     [LibraryImport(Dll)] private static partial int we_set_rating(IntPtr engine, int index, int rating);
     [LibraryImport(Dll)] private static partial int we_set_pick(IntPtr engine, int index, int pick);
     [LibraryImport(Dll)] private static partial int we_set_label(IntPtr engine, int index, int label);
@@ -104,6 +106,14 @@ public sealed unsafe partial class Engine : IDisposable
         /// <summary>The crop as fractions of the frame. 0, 0, 1, 1 is none (a zeroed Edit is read as that
         /// too, but use <see cref="None"/>).</summary>
         public float CropLeft, CropTop, CropRight, CropBottom;
+        /// <summary>Manual lens vignetting, −100 (darker corners) to 100 (brighter).</summary>
+        public float VignetteAmount;
+        /// <summary>The vignetting midpoint (0–100, 50 by default) as an offset from 50, so a zeroed
+        /// Edit holds the default.</summary>
+        public float VignetteMidpoint;
+        /// <summary>1 turns the camera's distortion correction off, 1 its chromatic aberration correction;
+        /// both are off-flags so a zeroed Edit keeps them on.</summary>
+        public uint NoDistortion, NoChromaticAberration;
 
         /// <summary>The photo as shot: no adjustments, no crop.</summary>
         public static Edit None => new() { CropRight = 1, CropBottom = 1 };
@@ -202,6 +212,21 @@ public sealed unsafe partial class Engine : IDisposable
     /// <summary>The white balance as shot (kelvin, tint), once the raw is decoded.</summary>
     public (float Kelvin, float Tint)? AsShotWhiteBalance(int index) =>
         Check(we_as_shot_white_balance(handle, index, out var k, out var t)) == 1 ? (k, t) : null;
+
+    /// <summary>Which lens corrections the photo's raw has data for, once it is decoded.</summary>
+    public (bool Distortion, bool ChromaticAberration)? LensInfo(int index) =>
+        Check(we_lens_info(handle, index, out var d, out var c)) == 1 ? (d != 0, c != 0) : null;
+
+    /// <summary>
+    /// The temperature (kelvin) and tint that make the spot at (x, y) on the view neutral, with
+    /// the position in the view's physical pixels. Throws with a message for the user when the
+    /// spot can't be used (clipped, too dark, off the photo, raw not read yet).
+    /// </summary>
+    public (float Kelvin, float Tint) PickWhiteBalance(float x, float y)
+    {
+        Check(we_pick_white_balance(handle, x, y, out var k, out var t));
+        return (k, t);
+    }
 
     /// <summary>
     /// Queues a full-size JPEG export of a photo, with its adjustments as they are now. If the

@@ -75,7 +75,13 @@ pub fn parse(text: &str) -> Option<Metadata> {
     }
     e.custom_white_balance = number(FIRST_EDIT + 1).is_some() as u32;
     e.rotation = number(ROTATION).map_or(0.0, |v| v.rem_euclid(4.0)) as u32;
+    e.vignette_amount = number(ROTATION + 1).unwrap_or(0.0);
+    e.vignette_midpoint = number(ROTATION + 2).map_or(0.0, |v| v - 50.0);
+    // Written as 0 when off; anything else (or nothing) leaves the correction on.
+    e.no_distortion = (number(ROTATION + 3) == Some(0.0)) as u32;
+    e.no_chromatic_aberration = (number(ROTATION + 4) == Some(0.0)) as u32;
     geometry::clean(e);
+    e.clean_lens();
     Some(meta)
 }
 
@@ -169,7 +175,7 @@ const PICK: usize = 2;
 /// (namespace, the prefix to declare if the file has none for it, local name)
 const FIRST_EDIT: usize = 3;
 /// (namespace, the prefix to declare if the file has none for it, local name)
-const PROPS: [(&str, &str, &str); 19] = [
+const PROPS: [(&str, &str, &str); 23] = [
     (NS_XMP, "xmp", "Rating"),
     (NS_XMP, "xmp", "Label"),
     (NS_WINDEDIT, "windedit", "Pick"),
@@ -189,6 +195,10 @@ const PROPS: [(&str, &str, &str); 19] = [
     (NS_WINDEDIT, "windedit", "CropRight"),
     (NS_WINDEDIT, "windedit", "CropBottom"),
     (NS_WINDEDIT, "windedit", "Rotation"),
+    (NS_WINDEDIT, "windedit", "VignetteAmount"),
+    (NS_WINDEDIT, "windedit", "VignetteMidpoint"),
+    (NS_WINDEDIT, "windedit", "LensDistortion"),
+    (NS_WINDEDIT, "windedit", "LensChromaticAberration"),
 ];
 
 /// The edit's fields, in PROPS order from FIRST_EDIT.
@@ -276,6 +286,13 @@ fn values(meta: &Metadata, keep_zero_rating: bool) -> Vec<Option<String>> {
         v.push(written.then_some(text));
     }
     v.push((e.rotation != 0).then(|| e.rotation.to_string()));
+    let amount = number_text(e.vignette_amount, 2);
+    v.push((amount != "0").then_some(amount));
+    // The midpoint is written as the slider shows it (0–100, 50 by default).
+    let midpoint = number_text(50.0 + e.vignette_midpoint, 2);
+    v.push((midpoint != "50").then_some(midpoint));
+    v.push((e.no_distortion != 0).then(|| "0".to_string()));
+    v.push((e.no_chromatic_aberration != 0).then(|| "0".to_string()));
     v
 }
 
@@ -659,6 +676,37 @@ mod tests {
         // A damaged crop reads as none.
         let bad = out.replace("windedit:CropLeft=\"0.0125\"", "windedit:CropLeft=\"0.95\"");
         assert_eq!(parse(&bad).unwrap().edit.crop, [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn lens_fields_round_trip_and_defaults_are_not_written() {
+        let edit = Edit { vignette_amount: -35.5, vignette_midpoint: 20.0, no_distortion: 1, no_chromatic_aberration: 1, ..Default::default() };
+        let meta = Metadata { edit, ..Default::default() };
+        let fresh = new_sidecar(&meta);
+        assert!(fresh.contains("windedit:VignetteAmount=\"-35.5\"") && fresh.contains("windedit:VignetteMidpoint=\"70\""), "{fresh}");
+        assert!(fresh.contains("windedit:LensDistortion=\"0\"") && fresh.contains("windedit:LensChromaticAberration=\"0\""), "{fresh}");
+        assert_eq!(parse(&fresh), Some(meta.clone()));
+        let out = update(LIGHTROOM, &meta).unwrap();
+        assert_eq!(parse(&out), Some(meta));
+        // Each field on its own, and the defaults leave nothing in the file.
+        for one in [
+            Edit { vignette_amount: 100.0, ..Default::default() },
+            Edit { vignette_midpoint: -50.0, vignette_amount: 1.0, ..Default::default() },
+            Edit { no_chromatic_aberration: 1, ..Default::default() },
+        ] {
+            let m = Metadata { edit: one, ..Default::default() };
+            assert_eq!(parse(&new_sidecar(&m)), Some(m));
+        }
+        let plain = new_sidecar(&Metadata { rating: 1, ..Default::default() });
+        assert!(!plain.contains("Vignette") && !plain.contains("Lens"), "{plain}");
+        let read = parse(&plain).unwrap().edit;
+        assert!(read.is_default() && read.no_distortion == 0 && read.vignette_midpoint == 0.0);
+        // Damage is put in range.
+        let bad = out.replace("VignetteAmount=\"-35.5\"", "VignetteAmount=\"900\"");
+        assert_eq!(parse(&bad).unwrap().edit.vignette_amount, 100.0);
+        // Back to the defaults takes them out of the file.
+        let back = update(&out, &Metadata::default()).unwrap();
+        assert!(!back.contains("windedit:Vignette") && !back.contains("windedit:Lens"));
     }
 
     #[test]

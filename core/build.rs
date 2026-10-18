@@ -12,6 +12,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=DXC");
     println!("cargo:rerun-if-changed=shaders/common.hlsli");
     println!("cargo:rerun-if-changed=shaders/tone.hlsli");
+    println!("cargo:rerun-if-changed=shaders/lens.hlsli");
     for name in SHADERS {
         let src = format!("shaders/{name}.hlsl");
         println!("cargo:rerun-if-changed={src}");

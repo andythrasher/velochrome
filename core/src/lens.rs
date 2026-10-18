@@ -137,8 +137,35 @@ pub enum Channel {
 }
 
 impl LensCorrection {
+    /// Whether this correction changes the geometry at all (some lenses need none and carry
+    /// only chromatic aberration data).
+    pub fn has_distortion(&self) -> bool {
+        self.scale != 1.0 || self.k != [0.0; 3]
+    }
+
     pub fn has_ca(&self) -> bool {
         self.ca_red != [0.0; 3] || self.ca_blue != [0.0; 3]
+    }
+
+    /// What is left of this correction with the Edit's switches: without distortion the geometry
+    /// is the sensor's own (no scale, no zoom, so the frame keeps its size); without chromatic
+    /// aberration the colour terms are dropped. None if nothing is left to apply.
+    pub fn with_switches(&self, distortion: bool, chromatic_aberration: bool) -> Option<LensCorrection> {
+        let ca = chromatic_aberration && self.has_ca();
+        if !distortion && !ca {
+            return None;
+        }
+        let mut l = *self;
+        if !distortion {
+            l.scale = 1.0;
+            l.k = [0.0; 3];
+            l.zoom = 1.0;
+        }
+        if !ca {
+            l.ca_red = [0.0; 3];
+            l.ca_blue = [0.0; 3];
+        }
+        Some(l)
     }
 
     /// Source radius ÷ corrected radius for the green channel, at corrected radius `r`.
@@ -328,6 +355,31 @@ mod tests {
 
     fn file(path: &str) -> Option<Vec<u8>> {
         Path::new(path).exists().then(|| std::fs::read(path).unwrap())
+    }
+
+    #[test]
+    fn switches_flatten_the_geometry_and_drop_colour_terms() {
+        let l = LensCorrection {
+            model: LensModel::Olympus,
+            scale: 0.97,
+            k: [0.02, 0.0, 0.0],
+            ca_red: [0.001, 0.0, 0.0],
+            ca_blue: [-0.001, 0.0, 0.0],
+            zoom: 0.98,
+        };
+        assert_eq!(l.with_switches(true, true), Some(l));
+        let flat = l.with_switches(false, true).unwrap();
+        assert_eq!((flat.scale, flat.zoom, flat.k), (1.0, 1.0, [0.0; 3]));
+        assert!(flat.has_ca());
+        // Distortion off with nothing else to do: the sensor's own geometry exactly.
+        let source = flat.source(Channel::Green, [1000.0, 700.0], 5184.0, 3888.0);
+        assert_eq!(source, [1000.0, 700.0]);
+        let no_ca = l.with_switches(true, false).unwrap();
+        assert!(!no_ca.has_ca() && no_ca.scale == 0.97);
+        assert_eq!(l.with_switches(false, false), None);
+        // A correction with no colour data left alone has nothing for the CA switch to keep.
+        let plain = LensCorrection { ca_red: [0.0; 3], ca_blue: [0.0; 3], ..l };
+        assert_eq!(plain.with_switches(false, true), None);
     }
 
     #[test]

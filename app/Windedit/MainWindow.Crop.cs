@@ -163,6 +163,7 @@ public sealed partial class MainWindow
     {
         if (CurrentPhoto == null)
             return;
+        SetPicking(false);
         if (gridMode)
             SetGridMode(false);
         if (!editMode)

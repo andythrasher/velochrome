@@ -164,6 +164,22 @@ impl Engine {
         Ok(id)
     }
 
+    /// The temperature (K) and tint that make the spot at (`x`, `y`) on the view neutral (the
+    /// view's physical pixels). Waits briefly for the GPU thread, which knows the view; the
+    /// reading itself is a few hundred CPU samples.
+    pub fn pick_white_balance(&self, x: f32, y: f32) -> Result<(f32, f32), String> {
+        let (reply, result) = channel();
+        let _ = self.viewer.send(Command::Pick { x, y, reply });
+        result.recv_timeout(std::time::Duration::from_secs(3)).map_err(|_| "The picker timed out.".to_string())?
+    }
+
+    /// What lens data the photo's raw carries, once it is decoded: whether there is distortion
+    /// to correct, and whether there is chromatic aberration to correct.
+    pub fn lens_info(&self, index: usize) -> Option<(bool, bool)> {
+        let raw = self.jobs.raw(index)?;
+        Some(raw.lens.map_or((false, false), |l| (l.has_distortion(), l.has_ca())))
+    }
+
     /// The photo's white balance as shot, as temperature (K) and tint, once its raw is decoded.
     pub fn as_shot_white_balance(&self, index: usize) -> Option<(f32, f32)> {
         let raw = self.jobs.raw(index)?;

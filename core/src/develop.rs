@@ -31,6 +31,15 @@ pub struct Edit {
     pub angle: f32,
     /// Left, top, right and bottom of the crop, as fractions of the frame. [0, 0, 1, 1] is none.
     pub crop: [f32; 4],
+    /// Manual lens vignetting, −100 (darker corners) to +100 (brighter), 0 = none.
+    pub vignette_amount: f32,
+    /// The vignetting midpoint (0–100, 50 by default) as an offset from 50, so a zeroed `Edit`
+    /// holds the default. Lower reaches further in from the corners.
+    pub vignette_midpoint: f32,
+    /// 1 turns off the camera's distortion correction; 0 (the default) applies it.
+    pub no_distortion: u32,
+    /// 1 turns off the camera's chromatic aberration correction.
+    pub no_chromatic_aberration: u32,
 }
 
 /// No crop.
@@ -53,6 +62,10 @@ impl Default for Edit {
             rotation: 0,
             angle: 0.0,
             crop: FULL_CROP,
+            vignette_amount: 0.0,
+            vignette_midpoint: 0.0,
+            no_distortion: 0,
+            no_chromatic_aberration: 0,
         }
     }
 }
@@ -61,6 +74,35 @@ impl Edit {
     pub fn is_default(&self) -> bool {
         *self == Edit::default()
     }
+
+    /// Puts the lens fields in range: what a hand-edited or damaged sidecar might hold.
+    pub fn clean_lens(&mut self) {
+        let fix = |v: f32, limit: f32| if v.is_finite() { v.clamp(-limit, limit) } else { 0.0 };
+        self.vignette_amount = fix(self.vignette_amount, 100.0);
+        self.vignette_midpoint = fix(self.vignette_midpoint, 50.0);
+        self.no_distortion = (self.no_distortion != 0) as u32;
+        self.no_chromatic_aberration = (self.no_chromatic_aberration != 0) as u32;
+    }
+}
+
+// ---- Vignetting ----
+
+/// What the shader gets for the vignetting: stops at the corners (±1 for ±100), and the radius
+/// where the change starts. That moves out toward the corners as the midpoint rises (as in
+/// Lightroom: a lower midpoint reaches further in); 0.9 at most, so the ramp keeps some width.
+pub fn vignette_terms(amount: f32, midpoint_offset: f32) -> (f32, f32) {
+    (amount / 100.0, 0.9 * ((50.0 + midpoint_offset) / 100.0).clamp(0.0, 1.0))
+}
+
+/// The vignetting gain in stops at normalized radius `r` (the lens-corrected frame's corners
+/// are at 1). The CPU twin of `vignetteStops` in shaders/lens.hlsli.
+pub fn vignette_stops(amount: f32, midpoint_offset: f32, r: f32) -> f32 {
+    let (scale, r0) = vignette_terms(amount, midpoint_offset);
+    if scale == 0.0 {
+        return 0.0;
+    }
+    let t = ((r - r0) / (1.0 - r0)).clamp(0.0, 1.0);
+    scale * (t * t * (3.0 - 2.0 * t)).powf(1.5)
 }
 
 // ---- White balance ----
@@ -173,8 +215,38 @@ mod tests {
         assert!(!Edit { rotation: 1, ..Default::default() }.is_default());
         assert!(!Edit { angle: 0.5, ..Default::default() }.is_default());
         assert!(!Edit { crop: [0.1, 0.0, 1.0, 1.0], ..Default::default() }.is_default());
+        assert!(!Edit { vignette_amount: 10.0, ..Default::default() }.is_default());
+        assert!(!Edit { no_distortion: 1, ..Default::default() }.is_default());
         // Struct update from a default keeps the whole-frame crop.
         assert!(Edit { exposure: 0.0, ..Default::default() }.is_default());
+    }
+
+    #[test]
+    fn vignette_gain_shape() {
+        // Nothing at 0, and nothing inside the start radius (0.45 at the default midpoint).
+        assert_eq!(vignette_stops(0.0, 0.0, 1.0), 0.0);
+        assert_eq!(vignette_stops(100.0, 0.0, 0.0), 0.0);
+        assert_eq!(vignette_stops(100.0, 0.0, 0.4), 0.0);
+        // One stop at the corners at ±100, in proportion between.
+        assert!((vignette_stops(100.0, 0.0, 1.0) - 1.0).abs() < 1e-6);
+        assert!((vignette_stops(-100.0, 0.0, 1.0) + 1.0).abs() < 1e-6);
+        assert!((vignette_stops(50.0, 0.0, 1.0) - 0.5).abs() < 1e-6);
+        // Rises with radius, and a higher midpoint keeps the change nearer the corners.
+        let mut last = 0.0;
+        for i in 0..=20 {
+            let g = vignette_stops(100.0, 0.0, i as f32 / 20.0);
+            assert!(g >= last - 1e-6, "{g} after {last}");
+            last = g;
+        }
+        assert!(vignette_stops(100.0, -50.0, 0.7) > vignette_stops(100.0, 0.0, 0.7));
+        assert!(vignette_stops(100.0, 0.0, 0.7) > vignette_stops(100.0, 50.0, 0.7));
+    }
+
+    #[test]
+    fn clean_lens_repairs_damage() {
+        let mut e = Edit { vignette_amount: 300.0, vignette_midpoint: f32::NAN, no_distortion: 7, ..Default::default() };
+        e.clean_lens();
+        assert_eq!((e.vignette_amount, e.vignette_midpoint, e.no_distortion, e.no_chromatic_aberration), (100.0, 0.0, 1, 0));
     }
 
     #[test]

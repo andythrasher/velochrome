@@ -112,6 +112,7 @@ public sealed partial class MainWindow : Window
         }
         folder = path;
         ExitCrop(cancel: false);
+        SetPicking(false);
         realized.Clear();
         var metadata = engine.GetMetadata(count);
         all = new PhotoItem[count];
@@ -195,6 +196,7 @@ public sealed partial class MainWindow : Window
         if (newPosition < 0 || newPosition >= shown.Count)
             return;
         ExitCrop(cancel: false);
+        SetPicking(false);
         CommitEdit(); // a slider change still being dragged belongs to the photo it started on
         if (CurrentPhoto is { } old)
             old.IsCurrent = false;
@@ -342,7 +344,7 @@ public sealed partial class MainWindow : Window
             return;
         var ctrl = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control).HasFlag(CoreVirtualKeyStates.Down);
         var shift = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift).HasFlag(CoreVirtualKeyStates.Down);
-        if (all.Length > 0 && CropShortcut(e.Key, ctrl))
+        if (all.Length > 0 && (PickerShortcut(e.Key, ctrl) || CropShortcut(e.Key, ctrl)))
         {
             e.Handled = true;
             return;
@@ -435,7 +437,10 @@ public sealed partial class MainWindow : Window
     void SetGridMode(bool on)
     {
         if (on)
+        {
             ExitCrop(cancel: false);
+            SetPicking(false);
+        }
         gridMode = on;
         LoupeToggle.IsChecked = !on;
         GridToggle.IsChecked = on;
@@ -457,7 +462,10 @@ public sealed partial class MainWindow : Window
     void SetEditMode(bool on)
     {
         if (!on)
+        {
             ExitCrop(cancel: false);
+            SetPicking(false);
+        }
         editMode = on;
         EditToggle.IsChecked = on;
         engine.SetEditMode(on);
@@ -613,8 +621,13 @@ public sealed partial class MainWindow : Window
         if (cropping && e.Photo == CurrentPhoto?.Index)
             UpdateCropOverlay();
         // The as-shot white balance is known once the raw is decoded: show it.
-        if (e.Layer == 4 && e.Photo == CurrentPhoto?.Index && edit.CustomWhiteBalance == 0 && !editPending)
-            ShowEdit();
+        if (e.Layer == 4 && e.Photo == CurrentPhoto?.Index && !editPending)
+        {
+            if (edit.CustomWhiteBalance == 0)
+                ShowEdit();
+            else
+                UpdateLensSwitches();
+        }
         RememberSize(e.RawWidth, e.RawHeight);
         if (e.Photo != CurrentPhoto?.Index)
             return;

@@ -201,6 +201,8 @@ struct DevelopConstants {
     lens: [[f32; 4]; 4],
     clip: [f32; 4],
     canvas: [f32; 4],
+    /// Manual vignetting: stops at the corners, and the radius where it starts.
+    vignette: [f32; 4],
 }
 
 /// What the tone shaders read, field for field as in tone.hlsli: the model's numbers, the
@@ -224,6 +226,9 @@ const _: () = assert!(size_of::<ToneParams>() == 37 * 4);
 #[derive(Clone, Copy)]
 struct SmallCopyConstants {
     lum: [f32; 4],
+    lens_a: [f32; 4],
+    lens_k: [f32; 4],
+    vignette: [f32; 4],
     small: [u32; 2],
     source: [u32; 2],
     factor: f32,
@@ -488,7 +493,7 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
             let lum = [0, 1, 2].map(|c| {
                 gain * wb[c] * (0.2126 * to_srgb[0][c] + 0.7152 * to_srgb[1][c] + 0.0722 * to_srgb[2][c])
             });
-            let base = tone_prepass(gpu, image, [lum[0], lum[1], lum[2], 0.0], edit.exposure);
+            let base = tone_prepass(gpu, image, [lum[0], lum[1], lum[2], 0.0], edit);
             (rows, [lum[0], lum[1], lum[2], 0.0], MODE_DEVELOP, base)
         }
         Layer::Preview(_) => ([[0.0; 4]; 3], [0.0; 4], MODE_PREVIEW, ([1.0; 2], [1.0; 2])),
@@ -510,9 +515,10 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
         vibrance: edit.vibrance / 100.0,
         base_scale: base.0,
         base_size: base.1,
-        lens: lens_constants(layer),
+        lens: lens_constants(layer, edit),
         clip: view.clip,
         canvas: canvas_color(),
+        vignette: vignette_constants(layer, edit),
     };
     match layer {
         Layer::Raw(image) => gpu.srv_texture(&image.linear, LINEAR_FORMAT, 0, image.levels, SLOT_DEVELOP),
@@ -538,7 +544,7 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
 /// percentiles. Reads a coarse pyramid level, never the full-resolution image; the copy is in
 /// the texture's own orientation, like the image. Returns what the develop pass needs to find
 /// the coefficients: image coordinates → small-copy pixels, and the small copy's size.
-fn tone_prepass(gpu: &Gpu, image: &Image, lum: [f32; 4], exposure: f32) -> ([f32; 2], [f32; 2]) {
+fn tone_prepass(gpu: &Gpu, image: &Image, lum: [f32; 4], edit: &Edit) -> ([f32; 2], [f32; 2]) {
     let (width, height) = (image.width, image.height);
     let edge = width.max(height);
     // A small copy at most BASE_EDGE across, each pixel a block of `factor` photo pixels, and
@@ -561,7 +567,17 @@ fn tone_prepass(gpu: &Gpu, image: &Image, lum: [f32; 4], exposure: f32) -> ([f32
     gpu.uav_buffer(&t.stats, DXGI_FORMAT_R32_FLOAT, 2, SLOT_TONE + 6);
     gpu.uav_texture(&t.scene, DXGI_FORMAT_R32_FLOAT, 0, SLOT_TONE + 7);
 
-    let constants = SmallCopyConstants { lum, small, source: [width, height], factor: factor as f32, exposure };
+    let lens = lens_constants(Layer::Raw(image), edit);
+    let constants = SmallCopyConstants {
+        lum,
+        lens_a: lens[0],
+        lens_k: lens[1],
+        vignette: vignette_constants(Layer::Raw(image), edit),
+        small,
+        source: [width, height],
+        factor: factor as f32,
+        exposure: edit.exposure,
+    };
     gpu.dispatch(&gpu.kernels.tone_small, &constants, SLOT_TONE, (small[0], small[1]));
     gpu.uav_barrier();
     for pass in 0..4 {
@@ -801,9 +817,13 @@ fn read_floats(gpu: &mut Gpu, texture: &ID3D12Resource, channels: usize, w: usiz
 
 /// The lens correction as the develop shader reads it: model (0 none, 1 Olympus, 2 Panasonic),
 /// scale, zoom and a chromatic aberration flag; then the distortion terms and red's and blue's
-/// chromatic aberration terms. A camera JPEG is already corrected, so it gets none.
-fn lens_constants(layer: Layer) -> [[f32; 4]; 4] {
+/// chromatic aberration terms. A camera JPEG is already corrected, so it gets none; the edit's
+/// switches take out the distortion or the colour terms (`LensCorrection::with_switches`).
+fn lens_constants(layer: Layer, edit: &Edit) -> [[f32; 4]; 4] {
     let Layer::Raw(Image { lens: Some(l), .. }) = layer else { return [[0.0; 4]; 4] };
+    let Some(l) = l.with_switches(edit.no_distortion == 0, edit.no_chromatic_aberration == 0) else {
+        return [[0.0; 4]; 4];
+    };
     let model = match l.model {
         LensModel::Olympus => 1.0,
         LensModel::Panasonic => 2.0,
@@ -814,4 +834,11 @@ fn lens_constants(layer: Layer) -> [[f32; 4]; 4] {
         [l.ca_red[0], l.ca_red[1], l.ca_red[2], 0.0],
         [l.ca_blue[0], l.ca_blue[1], l.ca_blue[2], 0.0],
     ]
+}
+
+/// The manual vignetting as the shaders read it (develop::vignette_terms). Not for a camera JPEG.
+fn vignette_constants(layer: Layer, edit: &Edit) -> [f32; 4] {
+    let Layer::Raw(_) = layer else { return [0.0; 4] };
+    let (stops, start) = develop::vignette_terms(edit.vignette_amount, edit.vignette_midpoint);
+    [stops, start, 0.0, 0.0]
 }

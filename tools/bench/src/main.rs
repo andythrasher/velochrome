@@ -10,6 +10,7 @@
 mod crop;
 mod lens;
 mod vignette;
+mod wb;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -42,6 +43,7 @@ fn main() {
         "jpegsegments" => jpeg_segments(&files),
         "lens" => lens::bench_lens(&files),
         "crop" => crop::bench_crop(&files),
+        "wb" => wb::bench_wb(&files),
         "lensscan" => lens::lens_scan(rest),
         "lenstags" => lens::lens_tags(&files),
         "vignette" => lens::bench_vignette(&files),

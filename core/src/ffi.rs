@@ -184,6 +184,7 @@ pub extern "C" fn we_set_edit(handle: *const Handle, index: i32, edit: *const Ed
     guard(handle, |e| {
         let mut edit = unsafe { *edit };
         crate::geometry::clean(&mut edit); // a zeroed Edit from a wrapper means no crop
+        edit.clean_lens();
         if e.set_edit(index as usize, edit, commit != 0) { Ok(0) } else { Err(format!("there's no photo {index}")) }
     })
 }
@@ -214,6 +215,38 @@ pub extern "C" fn we_as_shot_white_balance(handle: *const Handle, index: i32, ke
             Ok(1)
         }
         None => Ok(0),
+    })
+}
+
+/// Which lens corrections the photo's raw has data for: writes 1 or 0 to `distortion` and to
+/// `chromatic_aberration`, and returns 1 once the raw has been decoded (0 before, and nothing written).
+#[unsafe(no_mangle)]
+pub extern "C" fn we_lens_info(handle: *const Handle, index: i32, distortion: *mut i32, chromatic_aberration: *mut i32) -> i32 {
+    guard(handle, |e| match e.lens_info(index as usize) {
+        Some((d, c)) => {
+            unsafe {
+                *distortion = d as i32;
+                *chromatic_aberration = c as i32;
+            }
+            Ok(1)
+        }
+        None => Ok(0),
+    })
+}
+
+/// Picks a white balance from a click at (`view_x`, `view_y`) on the view (physical pixels), the
+/// way the view is drawn now (zoom, crop, straighten, rotation and lens included): writes the
+/// temperature and tint that make the spot neutral and returns 1. A spot that can't be used
+/// (clipped, black, off the photo, raw not read yet) fails with the reason in `we_last_error`.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_pick_white_balance(handle: *const Handle, view_x: f32, view_y: f32, kelvin: *mut f32, tint: *mut f32) -> i32 {
+    guard(handle, |e| {
+        let (k, t) = e.pick_white_balance(view_x, view_y)?;
+        unsafe {
+            *kelvin = k;
+            *tint = t;
+        }
+        Ok(1)
     })
 }
 

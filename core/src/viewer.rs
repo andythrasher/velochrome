@@ -52,6 +52,8 @@ pub enum Command {
     Folder,
     /// Read back the view (offscreen, or the swap chain's last frame) as RGBA, for tests.
     Snapshot(Sender<Option<(u32, u32, Vec<u8>)>>),
+    /// Pick a white balance from a click on the view (physical pixels): temperature and tint.
+    Pick { x: f32, y: f32, reply: Sender<Result<(f32, f32), String>> },
     /// Export a photo as a full-size JPEG. Jobs run one after another.
     Export(ExportJob),
     /// A raw decoded for an export that had to wait for it (job id).
@@ -437,6 +439,9 @@ impl Viewer {
                     None => None,
                 };
                 let _ = reply.send(shot);
+            }
+            Command::Pick { x, y, reply } => {
+                let _ = reply.send(self.pick(x, y));
             }
             Command::Shutdown => self.shutdown = true,
         }
@@ -828,5 +833,17 @@ impl Viewer {
             text: if text.is_some() { wide.as_ptr() as usize } else { 0 },
             ..Default::default()
         });
+    }
+}
+
+impl Viewer {
+    /// The white balance that makes the spot at (`x`, `y`) on the view neutral, read from the raw
+    /// of the photo in view through the same transform the last frame drew it with.
+    fn pick(&self, x: f32, y: f32) -> Result<(f32, f32), String> {
+        let index = self.focus.ok_or("There is no photo to pick from.")?;
+        let frame = self.jobs.raw(index).ok_or("The raw is still being read.")?;
+        let out = self.presenter.as_ref().map(|p| p.size()).or(self.offscreen.as_ref().map(|t| (t.width, t.height))).unwrap_or((1, 1));
+        let zoom = if self.crop_mode { Zoom::Frame } else { self.zoom };
+        crate::pick::pick(&frame, &self.edit, zoom, out, (x, y)).map_err(|e| e.to_string())
     }
 }

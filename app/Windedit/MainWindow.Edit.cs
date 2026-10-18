@@ -16,6 +16,8 @@ public sealed partial class MainWindow
     {
         public required string Name;
         public required double Min, Max, Step;
+        /// <summary>What double-clicking resets it to.</summary>
+        public double Default;
         public required Func<Engine.Edit, double> Get;
         public required Func<Engine.Edit, double, Engine.Edit> Set;
         public required Func<double, string> Format;
@@ -44,11 +46,23 @@ public sealed partial class MainWindow
         BuildCropGroup();
 
         Header("White balance");
-        whiteBalanceText = new TextBlock { Opacity = 0.6, FontSize = 12, Margin = new Thickness(0, 0, 0, 2) };
+        whiteBalanceText = new TextBlock { Opacity = 0.6, FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
+        pickerButton = new ToggleButton
+        {
+            Content = new FontIcon { Glyph = ((char)0xEF3C).ToString(), FontSize = 14 },
+            Padding = new Thickness(6, 3, 6, 3), MinWidth = 0, MinHeight = 0,
+        };
+        ToolTipService.SetToolTip(pickerButton, "White balance selector (W): click a spot that should be neutral");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(pickerButton, "White balance selector");
+        pickerButton.Click += (_, _) =>
+        {
+            SetPicking(pickerButton.IsChecked == true);
+            FocusKeys();
+        };
         var asShot = new HyperlinkButton { Content = "As shot", Padding = new Thickness(4, 0, 4, 0), FontSize = 12 };
         asShot.Click += (_, _) => Change(e => e with { CustomWhiteBalance = 0 }, commit: true);
-        var row = new Grid();
-        row.Children.Add(whiteBalanceText);
+        var row = new Grid { Margin = new Thickness(0, 0, 0, 2) };
+        row.Children.Add(new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { pickerButton, whiteBalanceText } });
         row.Children.Add(asShot);
         asShot.HorizontalAlignment = HorizontalAlignment.Right;
         group.Children.Add(row);
@@ -85,6 +99,24 @@ public sealed partial class MainWindow
         Header("Presence");
         AddPercent("Vibrance", e => e.Vibrance, (e, v) => e with { Vibrance = v });
         AddPercent("Saturation", e => e.Saturation, (e, v) => e with { Saturation = v });
+
+        Header("Lens");
+        Add(new Adjustment
+        {
+            Name = "Vignetting", Min = -100, Max = 100, Step = 1,
+            Get = e => e.VignetteAmount,
+            Set = (e, v) => e with { VignetteAmount = (float)v },
+            Format = v => $"{v:+0;-0;0}",
+        });
+        Add(new Adjustment
+        {
+            Name = "Midpoint", Min = 0, Max = 100, Step = 1, Default = 50,
+            Get = e => 50 + e.VignetteMidpoint,
+            Set = (e, v) => e with { VignetteMidpoint = (float)v - 50 },
+            Format = v => $"{v:0}",
+        });
+        distortionSwitch = LensSwitch("Distortion", "Correct the distortion recorded in the raw", on => e => e with { NoDistortion = on ? 0u : 1u });
+        aberrationSwitch = LensSwitch("Chromatic aberration", "Correct the colour fringing recorded in the raw", on => e => e with { NoChromaticAberration = on ? 0u : 1u });
 
         var reset = new Button { Content = "Reset all", Margin = new Thickness(0, 16, 0, 0), HorizontalAlignment = HorizontalAlignment.Stretch };
         reset.Click += (_, _) => Change(_ => Engine.Edit.None, commit: true);
@@ -138,6 +170,54 @@ public sealed partial class MainWindow
         };
         EditControls.Children.Add(button);
         EditControls.Children.Add(body);
+    }
+
+    ToggleSwitch distortionSwitch = null!, aberrationSwitch = null!;
+
+    /// <summary>A labelled on/off switch for one of the automatic lens corrections. It sets the
+    /// edit's off-flag, so a photo with no edit has both on.</summary>
+    ToggleSwitch LensSwitch(string name, string tip, Func<bool, Func<Engine.Edit, Engine.Edit>> change)
+    {
+        var toggle = new ToggleSwitch { OnContent = "", OffContent = "", MinWidth = 0, IsOn = true };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(toggle, name);
+        ToolTipService.SetToolTip(toggle, tip);
+        toggle.Toggled += (_, _) =>
+        {
+            if (!updatingSliders)
+                Change(change(toggle.IsOn), commit: true);
+            FocusKeys();
+        };
+        var row = new Grid { Margin = new Thickness(0, 4, 0, 0) };
+        row.Children.Add(new TextBlock { Text = name, FontSize = 13, VerticalAlignment = VerticalAlignment.Center });
+        toggle.HorizontalAlignment = HorizontalAlignment.Right;
+        row.Children.Add(toggle);
+        group.Children.Add(row);
+        return toggle;
+    }
+
+    /// <summary>The photo whose lens data the switches were set from, or -1 until it is known.</summary>
+    int lensKnownFor = -1;
+
+    /// <summary>Greys out a lens switch the photo has no data for, with the reason in its tooltip.
+    /// Unknown until the raw is decoded.</summary>
+    void UpdateLensSwitches()
+    {
+        if (CurrentPhoto is { } current && lensKnownFor == current.Index)
+            return;
+        var info = CurrentPhoto is { } p ? engine.LensInfo(p.Index) : null;
+        lensKnownFor = info == null || CurrentPhoto == null ? -1 : CurrentPhoto.Index;
+        void Set(ToggleSwitch toggle, bool? has, string what, string available)
+        {
+            toggle.IsEnabled = has == true;
+            ToolTipService.SetToolTip(toggle, has switch
+            {
+                true => available,
+                false => $"This photo has no {what} data to correct.",
+                null => "Reading the raw…",
+            });
+        }
+        Set(distortionSwitch, info?.Distortion, "distortion", "Correct the distortion recorded in the raw");
+        Set(aberrationSwitch, info?.ChromaticAberration, "chromatic aberration", "Correct the colour fringing recorded in the raw");
     }
 
     void AddPercent(string name, Func<Engine.Edit, float> get, Func<Engine.Edit, float, Engine.Edit> set) => Add(new Adjustment
@@ -194,7 +274,7 @@ public sealed partial class MainWindow
         if (a == temperature || a == tint)
             Change(e => e with { CustomWhiteBalance = 0 }, commit: true);
         else
-            Change(e => a.Set(e, 0), commit: true);
+            Change(e => a.Set(e, a.Default), commit: true);
     }
 
     /// <summary>Applies a change to the photo in view and shows it on the sliders.</summary>
@@ -275,6 +355,9 @@ public sealed partial class MainWindow
         temperature.Value.Text = known ? temperature.Format(temperature.Slider.Value) : "";
         tint.Value.Text = known ? tint.Format(tint.Slider.Value) : "";
         whiteBalanceText.Text = edit.CustomWhiteBalance != 0 ? "Custom" : known ? "As shot" : "As shot (reading the raw…)";
+        distortionSwitch.IsOn = edit.NoDistortion == 0;
+        aberrationSwitch.IsOn = edit.NoChromaticAberration == 0;
+        UpdateLensSwitches();
         updatingSliders = false;
     }
 
