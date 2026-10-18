@@ -185,6 +185,11 @@
                         </Flyout>
                     </AppBarButton.Flyout>
                 </AppBarButton>
+                <AppBarToggleButton x:Name="MasksToggle" Label="Masks" Click="Masks_Click" ToolTipService.ToolTip="Masks: local adjustments (Shift+W)">
+                    <AppBarToggleButton.Icon>
+                        <FontIcon Glyph="&#xE91B;" />
+                    </AppBarToggleButton.Icon>
+                </AppBarToggleButton>
                 <AppBarToggleButton x:Name="EditToggle" Label="Edit" Click="Edit_Click" ToolTipService.ToolTip="Edit: the developed raw (D, F8)">
                     <AppBarToggleButton.Icon>
                         <FontIcon Glyph="&#xE70F;" />
@@ -224,6 +229,8 @@
                                 PointerPressed="Panel_PointerPressed" />
                 <!-- Crop mode's overlay (MainWindow.Crop.cs): follows the panel's size, so it follows the window and the side panels. -->
                 <local:CursorCanvas x:Name="CropCanvas" Visibility="Collapsed" Background="Transparent" />
+                <!-- The Masks panel's handles on the photo (MainWindow.Masks.cs). -->
+                <local:CursorCanvas x:Name="MaskCanvas" Visibility="Collapsed" Background="Transparent" />
                 <!-- The white balance picker's layer (MainWindow.Picker.cs): takes the click, shows a crosshair. -->
                 <local:CursorGrid x:Name="PickLayer" Visibility="Collapsed" Background="Transparent"
                                   PointerPressed="PickLayer_PointerPressed" />
@@ -243,7 +250,11 @@
 
             <ScrollViewer x:Name="EditPanel" Grid.Column="2" Width="300" Visibility="Collapsed"
                           BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1,0,0,0">
-                <StackPanel x:Name="EditControls" Padding="16,10,16,16" Spacing="2" />
+                <StackPanel>
+                    <StackPanel x:Name="EditControls" Padding="16,10,16,16" Spacing="2" />
+                    <!-- The Masks panel (MainWindow.Masks.cs) takes the place of the Edit groups while it is open. -->
+                    <StackPanel x:Name="MaskControls" Padding="16,10,16,16" Spacing="2" Visibility="Collapsed" />
+                </StackPanel>
             </ScrollViewer>
         </Grid>
 
@@ -270,7 +281,7 @@
             <TextBlock x:Name="PhotoText" FontWeight="SemiBold" />
             <TextBlock x:Name="PickStatus" Grid.Column="1" Visibility="Collapsed" TextTrimming="CharacterEllipsis" />
             <TextBlock x:Name="KeysText" Grid.Column="1" Opacity="0.55" TextTrimming="CharacterEllipsis"
-                       Text="← → move · 0–5 stars · P pick · X reject · U clear · 6–9 labels · Shift or Caps Lock: rate and move on · R crop · W white balance · Z 100% · G grid · E loupe · D edit · F7 folders · F8 edit panel · Tab both · Ctrl+Shift+E export" />
+                       Text="← → move · 0–5 stars · P pick · X reject · U clear · 6–9 labels · Shift or Caps Lock: rate and move on · R crop · W white balance · Shift+W masks (M, Shift+M, O) · Z 100% · G grid · E loupe · D edit · F7 folders · F8 edit panel · Tab both · Ctrl+Shift+E export" />
             <StackPanel x:Name="ExportStatus" Grid.Column="1" Orientation="Horizontal" Spacing="10" Visibility="Collapsed"
                         VerticalAlignment="Center">
                 <ProgressBar x:Name="ExportProgress" Width="120" Maximum="1" VerticalAlignment="Center" />

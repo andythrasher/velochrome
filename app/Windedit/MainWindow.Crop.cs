@@ -192,6 +192,7 @@ public sealed partial class MainWindow
         if (CurrentPhoto == null)
             return;
         SetPicking(false);
+        ExitMasks();
         if (gridMode)
             SetGridMode(false);
         if (!editMode)
@@ -228,7 +229,8 @@ public sealed partial class MainWindow
             {
                 if (engine.Undo(p.Index, false) is not { } now)
                     break;
-                edit = now;
+                edit = now.Edit;
+                masks = now.Masks;
             }
             if (!SameGeometry(edit, cropEntry))
                 Change(e => WithCrop(e with { Rotation = cropEntry.Rotation, Angle = cropEntry.Angle }, CropOf(cropEntry)), commit: true);

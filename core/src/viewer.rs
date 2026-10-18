@@ -22,7 +22,8 @@ use crate::export::{self, Encoded, Request, Strip, TileRenderer};
 use crate::geometry;
 use crate::gpu::Gpu;
 use crate::jobs::{Jobs, Kind};
-use crate::pipeline::{Edit, Image, ImageMemory, Layer, PreviewTexture, Slot, Target, Zoom, render, warm_up};
+use crate::masks::Masks;
+use crate::pipeline::{Edit, Image, ImageMemory, Layer, MaskInput, PreviewTexture, Slot, Target, Zoom, render_masked, warm_up};
 use crate::present::Presenter;
 use crate::preview::Preview;
 
@@ -32,6 +33,10 @@ pub enum Command {
     Zoom(Zoom),
     /// The adjustments of the photo in view.
     SetEdit(Edit),
+    /// The masks of the photo in view.
+    SetMasks(Box<Masks>),
+    /// The mask to show as a red overlay, if any (the Masks panel's selection).
+    MaskOverlay(Option<usize>),
     /// Edit mode shows the developed raw; Cull mode shows camera JPEGs.
     EditMode(bool),
     /// Crop mode shows the whole frame at Fit, with the photo turned beneath it (and no zoom).
@@ -73,6 +78,7 @@ pub struct ExportJob {
     /// Where to write; a taken name gets -2, -3, … (see `export::write_new_file`).
     pub path: PathBuf,
     pub edit: Edit,
+    pub masks: Box<Masks>,
     pub request: Request,
 }
 
@@ -118,6 +124,10 @@ pub struct FrameEvent {
     pub export_state: u32,
     pub progress: f32,
     pub text: usize,
+    /// Where the raw's texture coordinates (0..1, in the sensor's own orientation: where masks live)
+    /// are on the view: the coordinates at pixel position (0, 0), then the change per pixel to the
+    /// right and per pixel down, as x, y pairs (`geometry::ViewMap`). All 0 until the raw is decoded.
+    pub map: [f32; 6],
 }
 
 impl Default for FrameEvent {
@@ -144,6 +154,7 @@ impl Default for FrameEvent {
             export_state: 0,
             progress: 0.0,
             text: 0,
+            map: [0.0; 6],
         }
     }
 }
@@ -261,6 +272,8 @@ struct Viewer {
     shown_at: Instant,
     zoom: Zoom,
     edit: Edit,
+    masks: Masks,
+    mask_overlay: Option<usize>,
     edit_mode: bool,
     crop_mode: bool,
     crop_center: (f32, f32),
@@ -295,6 +308,8 @@ impl Viewer {
             shown_at: Instant::now(),
             zoom: Zoom::Fit,
             edit: Edit::default(),
+            masks: Masks::default(),
+            mask_overlay: None,
             edit_mode: false,
             crop_mode: false,
             crop_center: (0.5, 0.5),
@@ -379,6 +394,18 @@ impl Viewer {
             Command::SetEdit(edit) => {
                 if edit != self.edit {
                     self.edit = edit;
+                    self.dirty = true;
+                }
+            }
+            Command::SetMasks(masks) => {
+                if *masks != self.masks {
+                    self.masks = *masks;
+                    self.dirty = true;
+                }
+            }
+            Command::MaskOverlay(index) => {
+                if index != self.mask_overlay {
+                    self.mask_overlay = index;
                     self.dirty = true;
                 }
             }
@@ -555,6 +582,8 @@ impl Viewer {
         };
         let (raw_width, raw_height) = self.jobs.raw(index).map_or((0, 0), |r| (r.width, r.height));
         let edit = self.edit;
+        let masks = self.masks;
+        let mask_input = MaskInput { masks: &masks, overlay: self.mask_overlay };
         let zoom = self.view_zoom();
         // What the view shows: the crop, or in crop mode the whole frame, and where on the view.
         let frame = geometry::frame_size(photo_size, edit.rotation);
@@ -562,14 +591,18 @@ impl Viewer {
         let (width, height) = (shown[2].round().max(1.0) as u32, shown[3].round().max(1.0) as u32);
         let out = self.presenter.as_ref().map(|p| p.size()).or(self.offscreen.as_ref().map(|t| (t.width, t.height))).unwrap_or((1, 1));
         let rect = geometry::view_map((1, 1), 0, frame, edit.angle, edit.crop, zoom, out).clip;
+        let map = self.jobs.raw(index).map_or([0.0; 6], |r| {
+            let m = geometry::view_map((r.width, r.height), geometry::turns(r.orientation, edit.rotation), frame, edit.angle, edit.crop, zoom, out);
+            [m.origin[0], m.origin[1], m.step_x[0], m.step_x[1], m.step_y[0], m.step_y[1]]
+        });
         let timings = match &mut self.presenter {
-            Some(p) => p.present(&mut self.gpu, |gpu, target| render(gpu, layer, &edit, zoom, photo_size, target))?,
+            Some(p) => p.present(&mut self.gpu, |gpu, target| render_masked(gpu, layer, &edit, &mask_input, zoom, photo_size, target))?,
             None => {
                 let target = self.offscreen.as_ref().unwrap();
                 let start = Instant::now();
                 self.gpu.begin()?;
                 let a = self.gpu.timestamp();
-                render(&self.gpu, layer, &edit, zoom, photo_size, target);
+                render_masked(&self.gpu, layer, &edit, &mask_input, zoom, photo_size, target);
                 let b = self.gpu.timestamp();
                 let ts = self.gpu.submit()?;
                 let gpu_ms = ts[b as usize] - ts[a as usize];
@@ -594,6 +627,7 @@ impl Viewer {
             gpu_ms: timings.gpu_ms,
             cpu_ms: timings.cpu_ms,
             open_ms,
+            map,
             ..Default::default()
         });
         Ok(())
@@ -764,7 +798,7 @@ impl Viewer {
         }
         let run = a.run.as_mut().unwrap();
         let image = &self.image.as_ref().unwrap().1;
-        run.pending = run.renderer.step(&mut self.gpu, image, &a.job.edit).map_err(|e| e.to_string())?;
+        run.pending = run.renderer.step_masked(&mut self.gpu, image, &a.job.edit, &a.job.masks).map_err(|e| e.to_string())?;
         let progress = run.renderer.tiles_done() as f32 / run.renderer.tiles() as f32;
         self.emit_export(a.job.id, a.job.index, EXPORT_PROGRESS, progress, None);
         Ok(Next::Again)

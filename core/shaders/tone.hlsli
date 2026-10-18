@@ -48,14 +48,15 @@ StructuredBuffer<ToneParams> params : register(t1);
     "StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR," \
     " addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)"
 
-// Contrast then Blacks, on log2 brightness.
-float toneGlobal(float x)
+// Contrast then Blacks, on log2 brightness, for the sliders sl: the global ones, or with a mask's
+// share added (develop.hlsl).
+float toneGlobal(float x, Sliders sl)
 {
     ToneParams p = params[0];
-    x = p.middle + (x - p.middle) * exp2(p.m.contrast * p.s.contrast);
+    x = p.middle + (x - p.middle) * exp2(p.m.contrast * sl.contrast);
     float lin = exp2(x);
-    float amount = pow(abs(p.s.blacks), p.m.blacksPower);
-    if (p.s.blacks < 0.0)
+    float amount = pow(abs(sl.blacks), p.m.blacksPower);
+    if (sl.blacks < 0.0)
     {
         float b = p.m.blacksDown * amount;
         lin = max(lin - b, 1e-9) / (1.0 - b);
@@ -67,13 +68,17 @@ float toneGlobal(float x)
     return log2(lin);
 }
 
-// Highlights, Shadows and Whites: the change in stops for a pixel at x whose base is base.
-// stats = (99.5th percentile, 25th percentile) of the image's tones.
-float toneLocal(float x, float base, float2 stats)
+float toneGlobal(float x)
+{
+    return toneGlobal(x, params[0].s);
+}
+
+// Highlights, Shadows and Whites: the change in stops for a pixel at x whose base is base, for
+// the sliders s. stats = (99.5th percentile, 25th percentile) of the image's tones.
+float toneLocal(float x, float base, float2 stats, Sliders s)
 {
     ToneParams p = params[0];
     Model m = p.m;
-    Sliders s = p.s;
     float dx = 0.0;
     float d = base - p.middle;
     float h = m.highlightsFloor + m.highlightsAmount * smoothstep(m.highlightsFrom, m.highlightsTo, d);

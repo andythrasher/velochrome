@@ -19,7 +19,8 @@ use crate::exif;
 use crate::geometry;
 use crate::gpu::Gpu;
 use crate::jpeg;
-use crate::pipeline::{Edit, Image, Layer, Target, Zoom, render};
+use crate::masks::Masks;
+use crate::pipeline::{Edit, Image, Layer, MaskInput, Target, Zoom, render_masked};
 
 /// Tile size in pixels. Four megapixels: big enough that per-tile work is small, small enough
 /// that the target and the readback buffer are 16 MB each.
@@ -123,6 +124,11 @@ impl TileRenderer {
 
     /// Develops the next tile. Returns the band of rows it completed, if it was the band's last.
     pub fn step(&mut self, gpu: &mut Gpu, image: &Image, edit: &Edit) -> Result<Option<Strip>> {
+        self.step_masked(gpu, image, edit, &Masks::NONE)
+    }
+
+    /// Like [`step`](Self::step), with the photo's masks.
+    pub fn step_masked(&mut self, gpu: &mut Gpu, image: &Image, edit: &Edit, masks: &Masks) -> Result<Option<Strip>> {
         if edit.detail().luminance > 0.0 || edit.detail().color > 0.0 {
             image.ensure_noise(gpu)?;
         }
@@ -140,7 +146,8 @@ impl TileRenderer {
         let zoom = Zoom::Region { x: (w.x + left) as f32, y: (w.y + top) as f32, scale: 1.0 };
         gpu.begin()?;
         let a = gpu.timestamp();
-        render(gpu, Layer::Raw(image), edit, zoom, image.oriented_size(), &view);
+        // Masks are in frame coordinates, so a tile needs nothing of them but the same set.
+        render_masked(gpu, Layer::Raw(image), edit, &MaskInput { masks, overlay: None }, zoom, image.oriented_size(), &view);
         let b = gpu.timestamp();
         self.copy_to_readback(gpu, tile_w, tile_h);
         let c = gpu.timestamp();

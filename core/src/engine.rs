@@ -12,6 +12,7 @@ use crate::jobs::{self, Focus, Jobs};
 use crate::library::{self, Photo};
 use crate::ratings::Ratings;
 use crate::develop::{self, Edit};
+use crate::masks::Masks;
 use crate::pipeline::Zoom;
 use crate::export::Request;
 use crate::viewer::{self, Command, EventSink, ExportJob, GpuInfo};
@@ -98,6 +99,7 @@ impl Engine {
         }
         // Its adjustments first, so the first frame of it already has them.
         let _ = self.viewer.send(Command::SetEdit(self.ratings.edit(index).unwrap_or_default()));
+        let _ = self.viewer.send(Command::SetMasks(Box::new(self.ratings.masks(index).unwrap_or_default())));
         let _ = self.viewer.send(Command::Show(index));
     }
 
@@ -148,13 +150,29 @@ impl Engine {
         ok
     }
 
-    /// Undoes (or redoes) a photo's last committed change; returns its adjustments now.
-    pub fn undo(&self, index: usize, redo: bool) -> Option<Edit> {
-        let edit = self.ratings.undo(index, redo)?;
+    /// Changes a photo's masks, like [`set_edit`](Self::set_edit): `commit` false while a handle or
+    /// a slider is dragged, true when it is let go.
+    pub fn set_masks(&self, index: usize, masks: Masks, commit: bool) -> bool {
+        let ok = self.ratings.set_masks(index, masks, commit);
+        if ok && self.view.lock().unwrap().index == Some(index) {
+            let _ = self.viewer.send(Command::SetMasks(Box::new(masks)));
+        }
+        ok
+    }
+
+    /// Shows mask `index` of the photo in view as a red overlay (None: no overlay).
+    pub fn set_mask_overlay(&self, index: Option<usize>) {
+        let _ = self.viewer.send(Command::MaskOverlay(index));
+    }
+
+    /// Undoes (or redoes) a photo's last committed change; returns its adjustments and masks now.
+    pub fn undo(&self, index: usize, redo: bool) -> Option<(Edit, Masks)> {
+        let (edit, masks) = self.ratings.undo(index, redo)?;
         if self.view.lock().unwrap().index == Some(index) {
             let _ = self.viewer.send(Command::SetEdit(edit));
+            let _ = self.viewer.send(Command::SetMasks(Box::new(masks)));
         }
-        Some(edit)
+        Some((edit, masks))
     }
 
     /// Queues a full-size JPEG export of a photo with its adjustments as they are now. Returns
@@ -164,8 +182,9 @@ impl Engine {
         let photo = photos.get(index).ok_or(format!("there's no photo {index}"))?;
         let raw = photo.raw.clone().ok_or(format!("{} has no raw file to export", photo.name))?;
         let edit = self.ratings.edit(index).unwrap_or_default();
+        let masks = self.ratings.masks(index).unwrap_or_default();
         let id = self.next_export.fetch_add(1, Ordering::Relaxed);
-        let _ = self.viewer.send(Command::Export(ExportJob { id, index, raw, path, edit, request }));
+        let _ = self.viewer.send(Command::Export(ExportJob { id, index, raw, path, edit, masks: Box::new(masks), request }));
         Ok(id)
     }
 

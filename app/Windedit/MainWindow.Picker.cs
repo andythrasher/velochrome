@@ -50,6 +50,7 @@ public sealed partial class MainWindow
         if (on)
         {
             ExitCrop(cancel: false);
+            ExitMasks();
             if (!editMode)
                 SetEditMode(true);
             CommitEdit();

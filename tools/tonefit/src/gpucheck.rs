@@ -1,16 +1,54 @@
 //! Checks that the GPU develop pipeline matches the CPU tone model (core/src/tone.rs): the raw
 //! is opened and drawn through the engine, and compared with `tone::render` on the same raw's
-//! scene-linear image, for the default settings and each tone slider at its extremes.
+//! scene-linear image, for the default settings and each tone slider at its extremes, and for masks
+//! (a gradient and an ellipse) carrying the tone sliders, Exposure and Clarity.
 
 use std::path::Path;
 
-use windedit_core::decode;
+use windedit_core::decode::{self, Orientation};
 use windedit_core::gpu::Gpu;
-use windedit_core::pipeline::{Edit, Image, ImageMemory, Target, Zoom, read_target, render_image, warm_up};
+use windedit_core::masks::{self, ADD, Component, GpuMaskSet, KIND_LINEAR, KIND_RADIAL, Local, Mask, Masks, SUBTRACT, slider};
+use windedit_core::pipeline::{Edit, Image, ImageMemory, MaskInput, Target, Zoom, read_target, render_image_masked, warm_up};
 use windedit_core::tone::{self, MODEL};
 
 use crate::linear::{display_code_quantiles, scene_linear};
 use crate::util::*;
+
+/// Masks for the checks: a linear gradient over the top carrying `top`, and a feathered ellipse in
+/// the middle carrying `middle`, with a notch taken out of it, each as (slider, value).
+fn two_masks(top: &[(usize, f32)], middle: &[(usize, f32)]) -> Masks {
+    let mut a = Mask::new();
+    a.components[0] = Component { kind: KIND_LINEAR, mode: ADD, p: [0.5, 0.05, 0.5, 0.45, 0.0, 0.0, 0.0, 0.0] };
+    a.count = 1;
+    for &(i, v) in top {
+        a.sliders[i] = v;
+    }
+    let mut b = Mask::new();
+    b.amount = 80.0;
+    b.components[0] = Component { kind: KIND_RADIAL, mode: ADD, p: [0.5, 0.35, 0.3, 0.18, 0.5, 70.0, 0.0, 0.0] };
+    b.components[1] = Component { kind: KIND_RADIAL, mode: SUBTRACT, p: [0.62, 0.35, 0.08, 0.08, 0.0, 30.0, 0.0, 0.0] };
+    b.count = 2;
+    for &(i, v) in middle {
+        b.sliders[i] = v;
+    }
+    let mut m = Masks::default();
+    m.masks[0] = a;
+    m.masks[1] = b;
+    m.count = 2;
+    m
+}
+
+fn mask_settings(d: Edit) -> Vec<(&'static str, Edit, Masks)> {
+    use slider::*;
+    vec![
+        ("mask exposure", d, two_masks(&[(EXPOSURE, -1.5)], &[(EXPOSURE, 1.0)])),
+        ("mask contrast", d, two_masks(&[(CONTRAST, 80.0)], &[(CONTRAST, -60.0)])),
+        ("mask shadows+hl", d, two_masks(&[(SHADOWS, 100.0), (HIGHLIGHTS, -70.0)], &[(SHADOWS, -80.0)])),
+        ("mask whites+blacks", d, two_masks(&[(WHITES, -80.0), (BLACKS, 50.0)], &[(WHITES, 90.0), (BLACKS, -40.0)])),
+        ("mask clarity", d, two_masks(&[(CLARITY, 100.0)], &[(CLARITY, -80.0)])),
+        ("mask clarity+global", Edit { clarity: 40.0, shadows: 30.0, ..d }, two_masks(&[(CLARITY, 90.0), (SHADOWS, 80.0)], &[(CLARITY, -100.0), (CONTRAST, 50.0)])),
+    ]
+}
 
 fn settings() -> Vec<(&'static str, Edit)> {
     // Detail processing is off: the CPU reference has no sharpening or noise reduction.
@@ -36,6 +74,17 @@ fn settings() -> Vec<(&'static str, Edit)> {
     ]
 }
 
+/// Where the sensor image's position is for pixel (i, j) of the oriented, downscaled scene.
+fn sensor_uv(i: usize, j: usize, w: usize, h: usize, orientation: Orientation) -> [f32; 2] {
+    let (a, b) = ((i as f32 + 0.5) / w as f32, (j as f32 + 0.5) / h as f32);
+    match orientation {
+        Orientation::Normal => [a, b],
+        Orientation::Rotate90 => [b, 1.0 - a],
+        Orientation::Rotate180 => [1.0 - a, 1.0 - b],
+        _ => [1.0 - b, a],
+    }
+}
+
 pub fn run(raw: &Path, out_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(out_dir)?;
     let frame = decode::decode_file(raw)?;
@@ -51,13 +100,21 @@ pub fn run(raw: &Path, out_dir: &Path) -> Result<()> {
     println!("{:<16} {:>8} {:>8} {:>10}   (8-bit levels; luminance quantiles, then per pixel)", "setting", "median", "p95", "mean/pixel");
 
     let mut worst = 0f32;
-    for (name, edit) in settings() {
+    let none = Masks::default();
+    let all: Vec<(&str, Edit, Masks)> =
+        settings().into_iter().map(|(n, e)| (n, e, none)).chain(mask_settings(settings()[0].1)).collect();
+    for (name, edit, mask_set) in all {
         // The reference, quantized to 8 bits as the GPU's output is.
-        let cpu = tone::render(&MODEL, &scene, w, h, &edit, offset);
+        let set = GpuMaskSet::new(&mask_set, &frame.xyz_to_cam);
+        let dims = (frame.width, frame.height);
+        let locals: Vec<Local> = (0..w * h)
+            .map(|k| set.local(masks::to_frame(sensor_uv(k % w, k / w, w, h, frame.orientation), dims)))
+            .collect();
+        let cpu = tone::render_masked(&MODEL, &scene, w, h, &edit, offset, (!mask_set.is_empty()).then_some(&locals[..]));
         let cpu_codes: Vec<[u8; 3]> = cpu.iter().map(|p| p.map(|v| (linear_to_srgb(v) * 255.0).round() as u8)).collect();
 
         gpu.begin()?;
-        render_image(&gpu, &image, &edit, Zoom::Fit, &target);
+        render_image_masked(&gpu, &image, &edit, &MaskInput { masks: &mask_set, overlay: None }, Zoom::Fit, &target);
         gpu.submit()?;
         let rgba = read_target(&mut gpu, &target)?;
         if std::env::var_os("GPUCHECK_DEBUG").is_some() {

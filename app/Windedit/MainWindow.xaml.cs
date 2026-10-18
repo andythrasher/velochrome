@@ -68,6 +68,8 @@ public sealed partial class MainWindow : Window
         PrepareRememberedSizes();
         LoadLayout();
         BuildEditPanel();
+        BuildMaskPanel();
+        InitMasks();
         InitCrop();
         InitExport();
         InitAppearance();
@@ -198,6 +200,7 @@ public sealed partial class MainWindow : Window
         ExitCrop(cancel: false);
         SetPicking(false);
         CommitEdit(); // a slider change still being dragged belongs to the photo it started on
+        CommitMasks();
         if (CurrentPhoto is { } old)
             old.IsCurrent = false;
         position = newPosition;
@@ -344,7 +347,7 @@ public sealed partial class MainWindow : Window
             return;
         var ctrl = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control).HasFlag(CoreVirtualKeyStates.Down);
         var shift = InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift).HasFlag(CoreVirtualKeyStates.Down);
-        if (all.Length > 0 && (PickerShortcut(e.Key, ctrl) || CropShortcut(e.Key, ctrl)))
+        if (all.Length > 0 && (MaskShortcut(e.Key, ctrl, shift) || PickerShortcut(e.Key, ctrl) || CropShortcut(e.Key, ctrl)))
         {
             e.Handled = true;
             return;
@@ -439,6 +442,7 @@ public sealed partial class MainWindow : Window
         if (on)
         {
             ExitCrop(cancel: false);
+            ExitMasks();
             SetPicking(false);
         }
         gridMode = on;
@@ -464,6 +468,7 @@ public sealed partial class MainWindow : Window
         if (!on)
         {
             ExitCrop(cancel: false);
+            ExitMasks();
             SetPicking(false);
         }
         editMode = on;
@@ -620,6 +625,8 @@ public sealed partial class MainWindow : Window
         last = e;
         if (cropping && e.Photo == CurrentPhoto?.Index)
             UpdateCropOverlay();
+        if (masking && e.Photo == CurrentPhoto?.Index)
+            UpdateMaskOverlay();
         // The as-shot white balance is known once the raw is decoded: show it.
         if (e.Layer == 4 && e.Photo == CurrentPhoto?.Index && !editPending)
         {

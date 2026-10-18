@@ -18,6 +18,7 @@
 
 use crate::color;
 use crate::develop::Edit;
+use crate::masks::Local;
 
 /// The curve input that becomes middle grey (0.18).
 pub const MIDDLE: f32 = -3.72;
@@ -350,10 +351,40 @@ pub fn clarity_shift(x: f32, base: f32, c: f32) -> f32 {
 /// Develops a scene-linear image (linear sRGB primaries, 1.0 = the sensor's clipping point) to
 /// display-linear sRGB with the tone model: the reference the GPU must match.
 pub fn render(m: &Model, linear: &[[f32; 3]], w: usize, h: usize, edit: &Edit, camera_offset: f32) -> Vec<[f32; 3]> {
+    render_masked(m, linear, w, h, edit, camera_offset, None)
+}
+
+/// Like [`render`], with each pixel's share of the masks' sliders (`masks::GpuMaskSet::local`, per
+/// pixel in image order). The local white balance multiplies the channels of `linear` (which the
+/// GPU multiplies in camera space, the same thing only when the camera is linear sRGB). Saturation
+/// is not part of this reference.
+///
+/// What the masks change is each pixel's own exposure and sliders; the pre-pass (the small copy,
+/// its guided filter, the percentiles) sees only the global ones, as on the GPU.
+pub fn render_masked(m: &Model, linear: &[[f32; 3]], w: usize, h: usize, edit: &Edit, camera_offset: f32, locals: Option<&[Local]>) -> Vec<[f32; 3]> {
     let s = Sliders::from_edit(edit);
     let gain = (camera_offset + edit.exposure).exp2();
     let x: Vec<f32> = linear.iter().map(|p| (luminance(*p) * gain).max(1e-9).log2()).collect();
-    let xg: Vec<f32> = x.iter().map(|v| global(m, *v, &s)).collect();
+    let xg_global: Vec<f32> = x.iter().map(|v| global(m, *v, &s)).collect();
+    // Each pixel as the masks leave it: light, brightness, sliders.
+    let local_at = |k: usize| locals.map_or_else(Local::default, |l| l[k]);
+    let lit: Vec<[f32; 3]> = linear.iter().enumerate().map(|(k, p)| {
+        let l = local_at(k);
+        [0, 1, 2].map(|c| p[c] * (l.exposure + l.wb_log2[c]).exp2())
+    }).collect();
+    let sliders_at = |k: usize| {
+        let l = local_at(k);
+        let clamp = |v: f32| v.clamp(-1.0, 1.0);
+        Sliders {
+            contrast: clamp(s.contrast + l.contrast),
+            highlights: clamp(s.highlights + l.highlights),
+            shadows: clamp(s.shadows + l.shadows),
+            whites: clamp(s.whites + l.whites),
+            blacks: clamp(s.blacks + l.blacks),
+        }
+    };
+    let x_local: Vec<f32> = lit.iter().map(|p| (luminance(*p) * gain).max(1e-9).log2()).collect();
+    let xg: Vec<f32> = (0..x.len()).map(|k| global(m, x_local[k], &sliders_at(k))).collect();
     let edge = w.max(h) as f32;
     let factor = ((edge / BASE_EDGE).ceil() as usize).max(1);
     let radius = ((edge * m.base_radius / factor as f32).round() as usize).max(1);
@@ -361,13 +392,13 @@ pub fn render(m: &Model, linear: &[[f32; 3]], w: usize, h: usize, edit: &Edit, c
     // see the photo as shot (before Exposure and the other sliders), so moving a slider never
     // changes what the adaptive terms react to: otherwise lowering Exposure deepens the
     // shadows, Shadows lifts them further, and the photo can end up brighter.
-    let (small, sw, sh) = small_copy(&xg, w, h, factor);
+    let (small, sw, sh) = small_copy(&xg_global, w, h, factor);
     let base = base_from_small(&small, sw, sh, &xg, w, h, factor, radius, m.base_eps);
     // Clarity's base: a bigger small copy and a wider, stricter filter.
-    let clarity_base = (edit.clarity != 0.0).then(|| {
+    let clarity_base = (edit.clarity != 0.0 || locals.is_some_and(|l| l.iter().any(|l| l.clarity != 0.0))).then(|| {
         let factor = ((edge / CLARITY_EDGE).ceil() as usize).max(1);
         let radius = ((edge * CLARITY_RADIUS / factor as f32).round() as usize).max(1);
-        let (small, sw, sh) = small_copy(&xg, w, h, factor);
+        let (small, sw, sh) = small_copy(&xg_global, w, h, factor);
         base_from_small(&small, sw, sh, &xg, w, h, factor, radius, CLARITY_EPS)
     });
     let as_shot: Vec<f32> = x.iter().map(|v| v - edit.exposure).collect();
@@ -380,15 +411,14 @@ pub fn render(m: &Model, linear: &[[f32; 3]], w: usize, h: usize, edit: &Edit, c
     // fifth of a stop), which Lightroom, working in a wide space too, doesn't.
     let to_wide = color::invert(&color::REC2020_TO_SRGB);
     let apply = |m: &color::Mat3, p: [f32; 3]| m.map(|r| r[0] * p[0] + r[1] * p[1] + r[2] * p[2]);
-    linear
-        .iter()
+    lit.iter()
         .enumerate()
         .map(|(k, p)| {
-            let mut out = xg[k] + local(m, xg[k], base[k], &s, &stats);
+            let mut out = xg[k] + local(m, xg[k], base[k], &sliders_at(k), &stats);
             if let Some(b) = &clarity_base {
-                out += clarity_shift(xg[k], b[k], edit.clarity / 100.0);
+                out += clarity_shift(xg[k], b[k], (edit.clarity / 100.0 + local_at(k).clarity).clamp(-1.0, 1.0));
             }
-            let wide = apply(&to_wide, p.map(|v| v * gain * (out - x[k]).exp2()));
+            let wide = apply(&to_wide, p.map(|v| v * gain * (out - x_local[k]).exp2()));
             apply(&color::REC2020_TO_SRGB, tone_rgb(wide)).map(|v| v.clamp(0.0, 1.0))
         })
         .collect()

@@ -38,6 +38,9 @@ public sealed unsafe partial class Engine : IDisposable
         public uint ExportId, ExportState;
         public float Progress;
         public IntPtr Text;
+        /// <summary>The raw's texture coordinates (0..1, sensor orientation) on the view: at pixel (0, 0), then the change per
+        /// pixel right and per pixel down. All 0 until the raw is decoded. What the mask handles are placed with.</summary>
+        public float MapOriginU, MapOriginV, MapStepXU, MapStepXV, MapStepYU, MapStepYV;
     }
 
     [LibraryImport(Dll)] private static partial IntPtr we_engine_create(delegate* unmanaged[Cdecl]<IntPtr, Frame*, void> callback, IntPtr user);
@@ -62,7 +65,10 @@ public sealed unsafe partial class Engine : IDisposable
     [LibraryImport(Dll)] private static partial int we_get_metadata(IntPtr engine, Metadata* output, int count);
     [LibraryImport(Dll)] private static partial int we_get_edit(IntPtr engine, int index, out Edit edit);
     [LibraryImport(Dll)] private static partial int we_set_edit(IntPtr engine, int index, in Edit edit, int commit);
-    [LibraryImport(Dll)] private static partial int we_undo(IntPtr engine, int index, int redo, out Edit edit);
+    [LibraryImport(Dll)] private static partial int we_undo(IntPtr engine, int index, int redo, out Edit edit, out Masks masks);
+    [LibraryImport(Dll)] private static partial int we_get_masks(IntPtr engine, int index, out Masks masks);
+    [LibraryImport(Dll)] private static partial int we_set_masks(IntPtr engine, int index, in Masks masks, int commit);
+    [LibraryImport(Dll)] private static partial int we_set_mask_overlay(IntPtr engine, int index);
     [LibraryImport(Dll)] private static partial int we_as_shot_white_balance(IntPtr engine, int index, out float kelvin, out float tint);
     [LibraryImport(Dll)] private static partial int we_lens_info(IntPtr engine, int index, out int distortion, out int chromaticAberration);
     [LibraryImport(Dll)] private static partial int we_pick_white_balance(IntPtr engine, float x, float y, out float kelvin, out float tint);
@@ -154,6 +160,45 @@ public sealed unsafe partial class Engine : IDisposable
         public static Edit None => new() { CropRight = 1, CropBottom = 1 };
     }
 
+    // ---- Masks (masks.rs). All zero is none; keep the layouts in step with the Rust structs. ----
+
+    public const int MaxMasks = 8, MaxComponents = 8, MaskSliders = 10;
+    public const uint LinearShape = 1, RadialShape = 2, SubtractMode = 1;
+
+    [InlineArray(8)] public struct Floats8 { float element; }
+    [InlineArray(MaskSliders)] public struct MaskSliderValues { float element; }
+
+    /// <summary>One shape of a mask. Linear: P = x, y where the effect is full, x, y where it is gone. Radial: centre x, y;
+    /// radii x, y; rotation (radians); feather 0–100; invert 0 or 1. Positions are in units of the raw's long edge.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MaskComponent
+    {
+        public uint Kind, Mode;
+        public Floats8 P;
+    }
+
+    [InlineArray(MaxComponents)] public struct MaskComponents { MaskComponent element; }
+
+    /// <summary>A mask: its shapes, Amount (0–100) and sliders (Temperature, Tint, Exposure (stops), Contrast, Highlights,
+    /// Shadows, Whites, Blacks, Clarity, Saturation).</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Mask
+    {
+        public uint Count;
+        public float Amount;
+        public MaskSliderValues Sliders;
+        public MaskComponents Components;
+    }
+
+    [InlineArray(MaxMasks)] public struct MaskList { Mask element; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Masks
+    {
+        public uint Count;
+        public MaskList Items;
+    }
+
     IntPtr handle;
     GCHandle self;
 
@@ -241,8 +286,21 @@ public sealed unsafe partial class Engine : IDisposable
     /// </summary>
     public void SetEdit(int index, Edit edit, bool commit) => Check(we_set_edit(handle, index, in edit, commit ? 1 : 0));
 
-    /// <summary>Undoes (or redoes) a photo's last change: its adjustments now, or null if none.</summary>
-    public Edit? Undo(int index, bool redo) => Check(we_undo(handle, index, redo ? 1 : 0, out var edit)) == 1 ? edit : null;
+    /// <summary>Undoes (or redoes) a photo's last change: its adjustments and masks now, or null if none.</summary>
+    public (Edit Edit, Masks Masks)? Undo(int index, bool redo) =>
+        Check(we_undo(handle, index, redo ? 1 : 0, out var edit, out var masks)) == 1 ? (edit, masks) : null;
+
+    public Masks GetMasks(int index)
+    {
+        Check(we_get_masks(handle, index, out var masks));
+        return masks;
+    }
+
+    /// <summary>Changes a photo's masks, as <see cref="SetEdit"/> does the adjustments.</summary>
+    public void SetMasks(int index, in Masks masks, bool commit) => Check(we_set_masks(handle, index, in masks, commit ? 1 : 0));
+
+    /// <summary>Shows mask <paramref name="index"/> of the photo in view as a red overlay; -1 for none.</summary>
+    public void SetMaskOverlay(int index) => Check(we_set_mask_overlay(handle, index));
 
     /// <summary>The white balance as shot (kelvin, tint), once the raw is decoded.</summary>
     public (float Kelvin, float Tint)? AsShotWhiteBalance(int index) =>

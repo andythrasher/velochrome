@@ -354,13 +354,16 @@ public sealed partial class MainWindow
         if (CurrentPhoto is not { } p)
             return;
         CommitEdit();
+        CommitMasks();
         if (engine.Undo(p.Index, redo) is { } now)
         {
-            edit = now;
+            edit = now.Edit;
+            masks = now.Masks;
             if (cropping)
                 cropCommits += redo ? 1 : -1;
             AfterCommit(p);
             ShowEdit();
+            MasksChanged();
         }
     }
 
@@ -369,6 +372,7 @@ public sealed partial class MainWindow
     {
         CommitEdit();
         edit = CurrentPhoto is { } p ? engine.GetEdit(p.Index) : Engine.Edit.None;
+        LoadMasks();
         ShowEdit();
     }
 

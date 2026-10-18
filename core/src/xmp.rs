@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::develop::{DETAIL_DEFAULTS, Detail, Edit, MIXER_FIELDS};
 use crate::geometry;
@@ -41,6 +42,9 @@ pub struct Metadata {
     /// The adjustments, saved in our namespace (`windedit:Exposure` and so on). Only those
     /// that differ from the photo as shot are written.
     pub edit: Edit,
+    /// The local adjustments (docs/phase2d-masks.md), `windedit:Masks` as one line of text
+    /// (`masks::to_text`). None when there are none; never Some of an empty set.
+    pub masks: Option<Arc<crate::masks::Masks>>,
 }
 
 /// The sidecar for a photo whose files are named `stem` in `dir`.
@@ -96,6 +100,7 @@ pub fn parse(text: &str) -> Option<Metadata> {
     e.clean_lens();
     e.clean_detail();
     e.clean_mixer();
+    meta.masks = scan.props[MASKS].as_ref().map(|p| crate::masks::from_text(&p.value)).filter(|m| !m.is_empty()).map(Arc::new);
     Some(meta)
 }
 
@@ -189,7 +194,7 @@ const PICK: usize = 2;
 /// (namespace, the prefix to declare if the file has none for it, local name)
 const FIRST_EDIT: usize = 3;
 /// (namespace, the prefix to declare if the file has none for it, local name)
-const PROPS: [(&str, &str, &str); 33 + MIXER_FIELDS] = [
+const PROPS: [(&str, &str, &str); 34 + MIXER_FIELDS] = [
     (NS_XMP, "xmp", "Rating"),
     (NS_XMP, "xmp", "Label"),
     (NS_WINDEDIT, "windedit", "Pick"),
@@ -247,6 +252,7 @@ const PROPS: [(&str, &str, &str); 33 + MIXER_FIELDS] = [
     (NS_WINDEDIT, "windedit", "LuminanceBlue"),
     (NS_WINDEDIT, "windedit", "LuminancePurple"),
     (NS_WINDEDIT, "windedit", "LuminanceMagenta"),
+    (NS_WINDEDIT, "windedit", "Masks"),
 ];
 
 /// The edit's fields, in PROPS order from FIRST_EDIT.
@@ -352,6 +358,7 @@ fn values(meta: &Metadata, keep_zero_rating: bool) -> Vec<Option<String>> {
         let text = number_text(m, 2);
         v.push((text != "0").then_some(text));
     }
+    v.push(meta.masks.as_deref().filter(|m| !m.is_empty()).map(crate::masks::to_text));
     v
 }
 
@@ -361,6 +368,9 @@ const DETAIL: usize = ROTATION + 5;
 /// Where the colour mixer sliders start in PROPS (after Texture and Clarity): hue, saturation and
 /// luminance for each range.
 const MIXER: usize = DETAIL + 10;
+
+/// Where the masks' text sits in PROPS: the last.
+const MASKS: usize = MIXER + MIXER_FIELDS;
 
 /// The detail sliders, in PROPS order from DETAIL.
 fn detail_fields_mut(d: &mut Detail) -> [&mut f32; 9] {
@@ -876,6 +886,36 @@ mod tests {
         // Back to zero takes them out of the file.
         let back = update(&out, &Metadata::default()).unwrap();
         assert!(!back.contains("windedit:Hue") && !back.contains("windedit:Saturation") && !back.contains("windedit:Luminance"));
+    }
+
+    #[test]
+    fn masks_round_trip_and_none_is_not_written() {
+        use crate::masks::{ADD, Component, KIND_LINEAR, KIND_RADIAL, Mask, Masks, SUBTRACT};
+        let mut masks = Masks::default();
+        let mut m = Mask::new();
+        m.amount = 70.0;
+        m.sliders[2] = -0.75;
+        m.sliders[3] = 30.0;
+        m.components[0] = Component { kind: KIND_LINEAR, mode: ADD, p: [0.1, 0.1, 0.4, 0.5, 0.0, 0.0, 0.0, 0.0] };
+        m.components[1] = Component { kind: KIND_RADIAL, mode: SUBTRACT, p: [0.5, 0.3, 0.2, 0.1, 0.4, 25.0, 1.0, 0.0] };
+        m.count = 2;
+        masks.masks[0] = m;
+        masks.count = 1;
+        let meta = Metadata { rating: 1, edit: Edit { exposure: 0.5, ..Default::default() }, masks: Some(Arc::new(masks)), ..Default::default() };
+        let fresh = new_sidecar(&meta);
+        assert!(fresh.contains("windedit:Masks=\"amount=70 exposure=-0.75 contrast=30 | L+ 0.1 0.1 0.4 0.5 | R- 0.5 0.3 0.2 0.1 0.4 25 1\""), "{fresh}");
+        assert_eq!(parse(&fresh), Some(meta.clone()));
+        // Into Lightroom's file, and back out: gone again, with everything else of ours.
+        let out = update(LIGHTROOM, &meta).unwrap();
+        assert_eq!(parse(&out), Some(meta.clone()));
+        let back = update(&out, &Metadata { rating: 1, ..Default::default() }).unwrap();
+        assert!(!back.contains("windedit:Masks") && !back.contains("windedit:Exposure"), "{back}");
+        // Masks alone make an edited photo's sidecar; no masks write nothing, and damage reads as none.
+        let plain = new_sidecar(&Metadata { rating: 1, ..Default::default() });
+        assert!(!plain.contains("Masks") && parse(&plain).unwrap().masks.is_none());
+        let bad = fresh.replace("windedit:Masks=\"", "windedit:Masks=\"zz | ");
+        assert_eq!(parse(&bad).unwrap().masks.unwrap().masks[0].count, 2);
+        assert!(parse(&fresh.replace("amount=70 exposure=-0.75 contrast=30 | L+ 0.1 0.1 0.4 0.5 | R- 0.5 0.3 0.2 0.1 0.4 25 1", "")).unwrap().masks.is_none());
     }
 
     #[test]

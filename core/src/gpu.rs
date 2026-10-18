@@ -24,6 +24,8 @@ pub struct Kernels {
     pub demosaic: Kernel,
     pub downsample: Kernel,
     pub develop: Kernel,
+    /// The develop pass with masks (`MASKS` in develop.hlsl).
+    pub develop_masks: Kernel,
     pub tone_small: Kernel,
     pub tone_guide: Kernel,
     pub tone_stats: Kernel,
@@ -64,6 +66,9 @@ pub struct Gpu {
     /// for each frame (safe, as every submission waits for the GPU).
     params: ID3D12Resource,
     params_ptr: *mut u8,
+    /// The masks the develop pass reads (t6), the same way.
+    masks: ID3D12Resource,
+    masks_ptr: *mut u8,
     /// What the tone pre-pass works in. Small and fixed in size whatever the photo, so they are
     /// made once here.
     pub tone: ToneResources,
@@ -77,6 +82,8 @@ pub struct Gpu {
 
 /// Room for the tone parameters.
 const PARAMS_BYTES: u64 = 512;
+/// Room for the masks (`masks::GpuMaskSet::masks`, 3584 bytes).
+const MASKS_BYTES: u64 = 4096;
 
 /// Textures and a buffer for the tone pre-pass, which reduces the photo to a copy about
 /// `BASE_EDGE` pixels across. All stay in the unordered access state, except while the develop
@@ -173,6 +180,7 @@ impl Gpu {
                 demosaic: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/demosaic.dxil")))?,
                 downsample: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/downsample.dxil")))?,
                 develop: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/develop.dxil")))?,
+                develop_masks: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/developmasks.dxil")))?,
                 tone_small: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/tonesmall.dxil")))?,
                 tone_guide: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/toneguide.dxil")))?,
                 tone_stats: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/tonestats.dxil")))?,
@@ -188,6 +196,9 @@ impl Gpu {
             let params = new_buffer(&device, PARAMS_BYTES, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)?;
             let mut params_ptr = std::ptr::null_mut();
             params.Map(0, Some(&D3D12_RANGE::default()), Some(&mut params_ptr))?;
+            let masks = new_buffer(&device, MASKS_BYTES, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+            let mut masks_ptr = std::ptr::null_mut();
+            masks.Map(0, Some(&D3D12_RANGE::default()), Some(&mut masks_ptr))?;
             let tone = ToneResources::new(&device, BASE_EDGE as u32)?;
             let clarity = ToneResources::new(&device, crate::tone::CLARITY_EDGE as u32)?;
             Ok(Gpu {
@@ -210,6 +221,8 @@ impl Gpu {
                 kernels,
                 params,
                 params_ptr: params_ptr as *mut u8,
+                masks,
+                masks_ptr: masks_ptr as *mut u8,
                 tone,
                 clarity,
                 clarity_key: Default::default(),
@@ -357,6 +370,30 @@ impl Gpu {
             },
         };
         unsafe { self.device.CreateShaderResourceView(&self.params, Some(&desc), self.cpu_handle(slot)) };
+    }
+
+    /// Writes the masks for the next develop pass.
+    pub fn set_masks<T: Copy>(&self, value: &T) {
+        assert!(size_of::<T>() as u64 <= MASKS_BYTES);
+        unsafe { std::ptr::copy_nonoverlapping(value as *const T as *const u8, self.masks_ptr, size_of::<T>()) };
+    }
+
+    /// A view of the masks, which `set_masks` wrote as an array of `count` `T`s.
+    pub fn srv_masks<T>(&self, count: u32, slot: u32) {
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 0,
+                    NumElements: count,
+                    StructureByteStride: size_of::<T>() as u32,
+                    Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                },
+            },
+        };
+        unsafe { self.device.CreateShaderResourceView(&self.masks, Some(&desc), self.cpu_handle(slot)) };
     }
 
     /// A descriptor that points at nothing, for a table slot a kernel declares but doesn't read.

@@ -9,11 +9,11 @@
 
 #include "tone.hlsli"
 
-// Like the other kernels', but with four inputs: the image, the tone parameters, the guided
-// filter's coefficients and the statistics.
+// Like the other kernels', but with more inputs: the image, the tone parameters, the guided
+// filter's coefficients, the statistics, the detail texture, Clarity's coefficients and the masks.
 #define DEVELOP_ROOT_SIGNATURE \
-    "RootConstants(num32BitConstants=60, b0)," \
-    "DescriptorTable(SRV(t0, numDescriptors=6), UAV(u0))," \
+    "RootConstants(num32BitConstants=62, b0)," \
+    "DescriptorTable(SRV(t0, numDescriptors=7), UAV(u0))," \
     "StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR," \
     " addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)"
 
@@ -44,12 +44,117 @@ cbuffer Constants : register(b0)
     float4 clip;      // the picture on the output, in pixels: left, top, right, bottom (outside is canvas)
     float4 canvas;    // the empty canvas around the photo (rgb)
     float4 vignette;  // manual lens vignetting: stops at the corners, and the radius where it starts
+    uint maskCount;   // masks in use (0: the loop is skipped entirely)
+    uint maskFlags;   // bit 0: Clarity's base is there even if the global Clarity is 0; bit 1: draw mask maskFlags >> 8 as a red overlay
 };
 
 Texture2D<float4> image : register(t0);
 Texture2D<float2> baseCoefficients : register(t2);
-Texture2D<float2> clarityCoefficients : register(t5); // Clarity's base, when lum.w != 0
+Texture2D<float2> clarityCoefficients : register(t5); // Clarity's base, when lum.w != 0 or maskFlags bit 0
 Buffer<float> stats : register(t3); // the 99.5th and 25th percentiles of the tones
+
+// ---- Masks (core/src/masks.rs is the reference; docs/phase2d-masks.md) ----
+
+// Must match GpuComponent and GpuMask in masks.rs, word for word.
+struct MaskComponent
+{
+    uint kind;      // 0 none, 1 linear, 2 radial, 3 brush (part B)
+    uint flags;     // bit 0: subtract; bit 1: invert
+    float inner;
+    float offset;
+    float2 centre;
+    float2 axisX;   // linear: the gradient
+    float2 axisY;
+    float2 pad;
+};
+
+struct MaskData
+{
+    uint count;
+    float opacity;
+    float exposure;
+    float3 wbLog2;
+    float contrast, highlights, shadows, whites, blacks, clarity, saturation;
+    float3 pad;
+    MaskComponent components[8];
+};
+
+// The buffer holds the eight masks (masks.rs `GpuMaskSet::masks`); maskCount says how many are in use.
+#ifdef MASKS
+StructuredBuffer<MaskData> maskSet : register(t6);
+
+// The masks' sliders weighted at one pixel and summed (masks.rs `Local`).
+struct MaskLocal
+{
+    float exposure;
+    float3 wbLog2;
+    float contrast, highlights, shadows, whites, blacks, clarity, saturation;
+};
+
+float componentWeight(MaskComponent c, float2 p)
+{
+    float w = 0.0;
+    if (c.kind == 1)
+    {
+        float t = saturate(dot(p, c.axisX) + c.offset);
+        w = 1.0 - t * t * (3.0 - 2.0 * t);
+    }
+    else if (c.kind == 2)
+    {
+        float2 d = p - c.centre;
+        float2 q = float2(dot(d, c.axisX), dot(d, c.axisY));
+        float r2 = dot(q, q);
+        // Past the ellipse (most pixels, for a small shape) is 0 without the square root.
+        if (r2 < 1.0)
+        {
+            float t = saturate((sqrt(r2) - c.inner) / (1.0 - c.inner));
+            w = 1.0 - t * t * (3.0 - 2.0 * t);
+        }
+        w = (c.flags & 2) != 0 ? 1.0 - w : w;
+    }
+    // kind 3 (the brush, part B) will read its raster layer here.
+    return w;
+}
+
+float maskWeight(uint m, float2 p)
+{
+    float add = 1.0, sub = 1.0;
+    uint n = maskSet[m].count;
+    [loop] for (uint i = 0; i < n; i++)
+    {
+        MaskComponent c = maskSet[m].components[i];
+        float w = componentWeight(c, p);
+        if ((c.flags & 1) != 0)
+            sub *= 1.0 - w;
+        else
+            add *= 1.0 - w;
+    }
+    return (1.0 - add) * sub * maskSet[m].opacity;
+}
+
+MaskLocal evalMasks(float2 p)
+{
+    MaskLocal l = (MaskLocal)0;
+    uint n = min(maskCount, 8u);
+    [loop] for (uint m = 0; m < n; m++)
+    {
+        float w = maskWeight(m, p);
+        if (w <= 0.0)
+            continue;
+        MaskData d = maskSet[m];
+        l.exposure += w * d.exposure;
+        l.wbLog2 += w * d.wbLog2;
+        l.contrast += w * d.contrast;
+        l.highlights += w * d.highlights;
+        l.shadows += w * d.shadows;
+        l.whites += w * d.whites;
+        l.blacks += w * d.blacks;
+        l.clarity += w * d.clarity;
+        l.saturation += w * d.saturation;
+    }
+    return l;
+}
+#endif
 SamplerState linearClamp : register(s0);
 RWTexture2D<unorm float4> output : register(u0);
 
@@ -88,7 +193,7 @@ float3 fromOkLab(float3 lab)
 
 // Saturation scales every color's colorfulness alike; vibrance mostly the muted ones, so it
 // can enrich a scene without pushing already-strong colors over.
-float3 presence(float3 rgb)
+float3 presence(float3 rgb, float saturation)
 {
     if (saturation == 0.0 && vibrance == 0.0)
         return rgb;
@@ -277,28 +382,54 @@ void main(uint3 id : SV_DispatchThreadID)
     // Vignetting works on scene light, before white balance and tone, at the radius of the
     // corrected frame (uv_in), so cropping doesn't move it.
     float3 cam = texel * exp2(vignetteStops(length((uv_in - 0.5) * dims) / (0.5 * length(dims))));
+    // The masks' share of each slider at this pixel, in the lens-corrected frame (uv_in), in units of
+    // the long edge. The sliders are the global ones plus it, held in range.
+    Sliders sl = params[0].s;
+    float satNow = saturation;
+    float clarityNow = lum.w;
+    float overlay = 0.0;
+#ifdef MASKS
+    if (maskCount != 0)
+    {
+        float2 pm = uv_in * dims / max(dims.x, dims.y);
+        MaskLocal ml = evalMasks(pm);
+        cam *= exp2(ml.exposure + ml.wbLog2);
+        sl.contrast = clamp(sl.contrast + ml.contrast, -1.0, 1.0);
+        sl.highlights = clamp(sl.highlights + ml.highlights, -1.0, 1.0);
+        sl.shadows = clamp(sl.shadows + ml.shadows, -1.0, 1.0);
+        sl.whites = clamp(sl.whites + ml.whites, -1.0, 1.0);
+        sl.blacks = clamp(sl.blacks + ml.blacks, -1.0, 1.0);
+        clarityNow = clamp(clarityNow + ml.clarity, -1.0, 1.0);
+        satNow = clamp(satNow + ml.saturation, -1.0, 1.0);
+        if ((maskFlags & 2) != 0)
+            overlay = maskWeight(maskFlags >> 8, pm);
+    }
+#endif
     float3 wide = float3(dot(row0, cam), dot(row1, cam), dot(row2, cam));
     // Brightness in stops, moved by the sliders: the pixel's own for Contrast, Blacks and
     // Whites, and its surroundings' (the base) for Highlights and Shadows.
     float x = log2(max(dot(lum.xyz, cam), 1e-9));
-    float xg = toneGlobal(x);
+    float xg = toneGlobal(x, sl);
     float2 baseDims;
     baseCoefficients.GetDimensions(baseDims.x, baseDims.y);
     float2 ab = baseCoefficients.SampleLevel(linearClamp, clamp(uv * baseScale, 0.5, baseSize - 0.5) / baseDims, 0);
     float base = ab.x * xg + ab.y;
-    float shifted = xg + toneLocal(xg, base, float2(stats[0], stats[1]));
-    if (lum.w != 0.0)
+    float shifted = xg + toneLocal(xg, base, float2(stats[0], stats[1]), sl);
+    if (lum.w != 0.0 || (maskFlags & 1) != 0)
     {
         // Clarity's base: its copy's size is the scale rounded up (vignette.zw).
         float2 claritySize = ceil(vignette.zw);
         float2 clarityDims;
         clarityCoefficients.GetDimensions(clarityDims.x, clarityDims.y);
         float2 ab2 = clarityCoefficients.SampleLevel(linearClamp, clamp(uv * vignette.zw, 0.5, claritySize - 0.5) / clarityDims, 0);
-        shifted += clarityShift(xg, ab2.x * xg + ab2.y, lum.w);
+        shifted += clarityShift(xg, ab2.x * xg + ab2.y, clarityNow);
     }
     float3 rgb = mul(REC2020_TO_SRGB, toneRgb(wide * exp2(shifted - x)));
     if (canvas.w != 0.0) // set when any colour mixer slider is not zero
         rgb = mixer(rgb);
-    rgb = saturate(presence(rgb));
-    output[id.xy] = float4(srgbEncode(rgb), 1.0);
+    rgb = saturate(presence(rgb, satNow));
+    float3 display = srgbEncode(rgb);
+    if (overlay > 0.0)
+        display = lerp(display, float3(0.9, 0.05, 0.05), 0.55 * overlay); // the mask being edited, in red
+    output[id.xy] = float4(display, 1.0);
 }

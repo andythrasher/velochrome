@@ -11,6 +11,7 @@ mod crop;
 mod detail;
 mod hsl;
 mod lens;
+mod masks;
 mod vignette;
 mod wb;
 
@@ -50,6 +51,7 @@ fn main() {
         "iso" => detail::bench_iso(rest),
         "partb" => detail::bench_partb(&files),
         "hsl" => hsl::bench_hsl(&files),
+        "masks" => masks::bench_masks(&files),
         "noisescale" => detail::bench_noisescale(&files),
         "lensscan" => lens::lens_scan(rest),
         "lenstags" => lens::lens_tags(&files),

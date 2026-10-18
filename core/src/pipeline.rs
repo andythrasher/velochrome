@@ -17,6 +17,7 @@ use crate::decode::{Orientation, RawFrame};
 use crate::develop;
 use crate::geometry;
 use crate::lens::{LensCorrection, LensModel};
+use crate::masks::{GpuMask, GpuMaskSet, MAX_MASKS, Masks};
 use crate::gpu::{Gpu, new_buffer, new_texture};
 use crate::tone;
 
@@ -28,7 +29,7 @@ const SLOT_DEMOSAIC: u32 = 0; // raw data, then pyramid level 0
 const fn slot_downsample(level: u32) -> u32 {
     2 * level // level - 1, then level
 }
-const SLOT_DEVELOP: u32 = 100; // the whole pyramid, the tone parameters, the base coefficients, the statistics, the detail texture, then the output
+const SLOT_DEVELOP: u32 = 100; // the whole pyramid, the tone parameters, the base coefficients, the statistics, the detail texture, Clarity's coefficients, the masks, then the output
 const SLOT_TONE: u32 = 200; // the tone pre-pass: a pyramid level, the parameters, then six outputs
 const SLOT_CLARITY: u32 = 215; // the same for Clarity's base
 
@@ -218,6 +219,10 @@ struct DevelopConstants {
     canvas: [f32; 4],
     /// Manual vignetting: stops at the corners, and the radius where it starts.
     vignette: [f32; 4],
+    /// How many masks the pass evaluates (0 skips them), and flags: bit 0 says Clarity's base is there
+    /// for a mask's Clarity even with the global slider at 0; bit 1 draws mask `flags >> 8` as the red overlay.
+    mask_count: u32,
+    mask_flags: u32,
 }
 
 /// What the tone shaders read, field for field as in tone.hlsli: the model's numbers, the
@@ -410,6 +415,14 @@ pub fn warm_up(gpu: &mut Gpu) -> Result<f64> {
     // a view first needs it).
     image.noise.set(Some([0.01; 3]));
     render_image(gpu, &image, &Edit::default(), Zoom::Fit, &target);
+    // And the pass with masks, which has its own kernel.
+    let mut masks = Masks::default();
+    masks.masks[0] = crate::masks::Mask::new();
+    masks.masks[0].components[0] = crate::masks::Component { kind: crate::masks::KIND_LINEAR, p: [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], ..Default::default() };
+    masks.masks[0].count = 1;
+    masks.masks[0].sliders[crate::masks::slider::CLARITY] = 10.0;
+    masks.count = 1;
+    render_image_masked(gpu, &image, &Edit::default(), &MaskInput { masks: &masks, overlay: Some(0) }, Zoom::Fit, &target);
     gpu.submit()?;
     {
         let mut detail = gpu.detail.borrow_mut();
@@ -501,6 +514,25 @@ const MODE_PREVIEW: u32 = 1;
 /// turns); a preview smaller than that is scaled up to stand in for it. The edit's rotation,
 /// angle and crop decide what part of it is shown, and `zoom` is relative to that.
 pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32, u32), target: &Target) {
+    render_masked(gpu, layer, edit, &MaskInput::NONE, zoom, photo_size, target);
+}
+
+/// The masks to draw with, and the one to show as a red overlay (the Masks panel's selection).
+#[derive(Clone, Copy)]
+pub struct MaskInput<'a> {
+    pub masks: &'a Masks,
+    pub overlay: Option<usize>,
+}
+
+impl MaskInput<'static> {
+    /// No masks: the pass is what it was before masks existed.
+    pub const NONE: MaskInput<'static> = MaskInput { masks: &Masks::NONE, overlay: None };
+}
+
+/// Like [`render`], with local adjustments.
+pub fn render_masked(gpu: &Gpu, layer: Layer, edit: &Edit, mask_input: &MaskInput, zoom: Zoom, photo_size: (u32, u32), target: &Target) {
+    let masks = mask_input.masks;
+    let masks_on = !masks.is_empty() && matches!(layer, Layer::Raw(_));
     let mixer = crate::mixer::Params::from_sliders(&edit.mixer);
     let params = ToneParams {
         model: tone::MODEL,
@@ -526,7 +558,7 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
                 gain * wb[c] * (0.2126 * to_srgb[0][c] + 0.7152 * to_srgb[1][c] + 0.0722 * to_srgb[2][c])
             });
             let base = tone_prepass(gpu, image, [lum[0], lum[1], lum[2], 0.0], edit);
-            let clarity = (edit.clarity != 0.0).then(|| clarity_prepass(gpu, image, [lum[0], lum[1], lum[2], 0.0], edit));
+            let clarity = (edit.clarity != 0.0 || (masks_on && masks.any_clarity())).then(|| clarity_prepass(gpu, image, [lum[0], lum[1], lum[2], 0.0], edit));
             (rows, [lum[0], lum[1], lum[2], 0.0], MODE_DEVELOP, base, clarity)
         }
         Layer::Preview(_) => ([[0.0; 4]; 3], [0.0; 4], MODE_PREVIEW, ([1.0; 2], [1.0; 2]), None),
@@ -540,6 +572,9 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
         Layer::Raw(image) => crate::detail::prepare(gpu, image, edit, &view, (target.width, target.height), zoom),
         Layer::Preview(_) => None,
     };
+    if let (true, Layer::Raw(image)) = (masks_on, layer) {
+        gpu.set_masks(&GpuMaskSet::new(masks, &image.xyz_to_cam).masks);
+    }
     let (detail_origin, detail_size, detail_level) = detail.as_ref().map_or((0, 0, 0), |d| d.constants());
     let constants = DevelopConstants {
         row0: [rows[0][0], rows[0][1], rows[0][2]],
@@ -571,6 +606,13 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
             let s = clarity.unwrap_or([0.0; 2]);
             [v[0], v[1], s[0], s[1]]
         },
+        mask_count: if masks_on { masks.count } else { 0 },
+        mask_flags: if masks_on {
+            let overlay = mask_input.overlay.filter(|&i| i < masks.count as usize);
+            clarity.is_some() as u32 | overlay.map_or(0, |i| 2 | (i as u32) << 8)
+        } else {
+            0
+        },
     };
     match layer {
         Layer::Raw(image) => gpu.srv_texture(&image.linear, LINEAR_FORMAT, 0, image.levels, SLOT_DEVELOP),
@@ -588,7 +630,8 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
     } else {
         gpu.srv_null(SLOT_DEVELOP + 5);
     }
-    gpu.uav_texture(&target.texture, TARGET_FORMAT, 0, SLOT_DEVELOP + 6);
+    gpu.srv_masks::<GpuMask>(MAX_MASKS as u32, SLOT_DEVELOP + 6);
+    gpu.uav_texture(&target.texture, TARGET_FORMAT, 0, SLOT_DEVELOP + 7);
     let mut reads = vec![&gpu.tone.coefficients, &gpu.tone.stats];
     if clarity.is_some() {
         reads.push(&gpu.clarity.coefficients);
@@ -597,7 +640,8 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
     if mode == MODE_DEVELOP {
         reads.iter().for_each(|r| gpu.transition(r, 0, uav, srv));
     }
-    gpu.dispatch(&gpu.kernels.develop, &constants, SLOT_DEVELOP, (target.width, target.height));
+    let kernel = if constants.mask_count != 0 { &gpu.kernels.develop_masks } else { &gpu.kernels.develop };
+    gpu.dispatch(kernel, &constants, SLOT_DEVELOP, (target.width, target.height));
     if mode == MODE_DEVELOP {
         reads.iter().for_each(|r| gpu.transition(r, 0, srv, uav));
     }
@@ -704,6 +748,11 @@ fn guided_base(gpu: &Gpu, image: &Image, t: &crate::gpu::ToneResources, g: &Guid
 /// Draws a developed raw on its own (the benchmark and tests).
 pub fn render_image(gpu: &Gpu, image: &Image, edit: &Edit, zoom: Zoom, target: &Target) {
     render(gpu, Layer::Raw(image), edit, zoom, image.oriented_size(), target);
+}
+
+/// Like [`render_image`], with masks.
+pub fn render_image_masked(gpu: &Gpu, image: &Image, edit: &Edit, masks: &MaskInput, zoom: Zoom, target: &Target) {
+    render_masked(gpu, Layer::Raw(image), edit, masks, zoom, image.oriented_size(), target);
 }
 
 const PREVIEW_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;

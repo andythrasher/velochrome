@@ -18,6 +18,7 @@ use std::sync::Mutex;
 use crate::develop::Edit;
 use crate::engine::Engine;
 use crate::export::Request;
+use crate::masks::Masks;
 use crate::pipeline::Zoom;
 use crate::ratings::{LABELS, label_code};
 use crate::viewer::FrameEvent;
@@ -190,13 +191,46 @@ pub extern "C" fn we_set_edit(handle: *const Handle, index: i32, edit: *const Ed
     })
 }
 
-/// Undoes (`redo` 0) or redoes (1) a photo's last change, writing its adjustments now into
-/// `edit`. Returns 1 if something changed, 0 if there was nothing to undo or redo.
+/// A photo's masks (masks.rs `Masks`): all zero is none.
 #[unsafe(no_mangle)]
-pub extern "C" fn we_undo(handle: *const Handle, index: i32, redo: i32, edit: *mut Edit) -> i32 {
+pub extern "C" fn we_get_masks(handle: *const Handle, index: i32, masks: *mut Masks) -> i32 {
+    guard(handle, |e| {
+        let current = e.ratings().masks(index as usize).ok_or(format!("there's no photo {index}"))?;
+        unsafe { *masks = current };
+        Ok(0)
+    })
+}
+
+/// Changes a photo's masks, like `we_set_edit`: `commit` 0 while a handle or slider is dragged,
+/// 1 when it's let go (saved, and one step for undo, together with the adjustments).
+#[unsafe(no_mangle)]
+pub extern "C" fn we_set_masks(handle: *const Handle, index: i32, masks: *const Masks, commit: i32) -> i32 {
+    guard(handle, |e| {
+        let mut masks = unsafe { *masks };
+        masks.clean();
+        if e.set_masks(index as usize, masks, commit != 0) { Ok(0) } else { Err(format!("there's no photo {index}")) }
+    })
+}
+
+/// Shows mask `index` of the photo in view as a red overlay; a negative index shows none.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_set_mask_overlay(handle: *const Handle, index: i32) -> i32 {
+    guard(handle, |e| {
+        e.set_mask_overlay((index >= 0).then_some(index as usize));
+        Ok(0)
+    })
+}
+
+/// Undoes (`redo` 0) or redoes (1) a photo's last change, writing its adjustments and masks now
+/// into `edit` and `masks`. Returns 1 if something changed, 0 if there was nothing to undo or redo.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_undo(handle: *const Handle, index: i32, redo: i32, edit: *mut Edit, masks: *mut Masks) -> i32 {
     guard(handle, |e| match e.undo(index as usize, redo != 0) {
-        Some(now) => {
-            unsafe { *edit = now };
+        Some((now, now_masks)) => {
+            unsafe {
+                *edit = now;
+                *masks = now_masks;
+            }
             Ok(1)
         }
         None => Ok(0),
@@ -338,7 +372,7 @@ pub extern "C" fn we_get_metadata(handle: *const Handle, out: *mut PhotoMeta, co
                 Pick::Rejected => -1,
                 Pick::Unflagged => 0,
             };
-            let meta = PhotoMeta { rating: m.rating as i32, pick, label: label_code(&m.label), edited: !m.edit.is_default() as i32 };
+            let meta = PhotoMeta { rating: m.rating as i32, pick, label: label_code(&m.label), edited: (!m.edit.is_default() || m.masks.is_some()) as i32 };
             unsafe { *out.add(i) = meta };
         }
         Ok(all.len() as i32)
