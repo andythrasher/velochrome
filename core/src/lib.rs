@@ -24,3 +24,4 @@ pub mod export;
 pub mod geometry;
 pub mod pick;
 pub mod detail;
+pub mod mixer;

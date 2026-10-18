@@ -232,10 +232,12 @@ struct ToneParams {
     ymax: f32,
     middle: f32,
     near_white: f32,
+    /// The colour mixer (mixer.rs); the develop pass reads it, the tone kernels ignore it.
+    mixer: crate::mixer::Params,
 }
 
-// tone.hlsli's ToneParams: 27 model numbers, 5 sliders and 5 fixed numbers.
-const _: () = assert!(size_of::<ToneParams>() == 37 * 4);
+// tone.hlsli's ToneParams: 27 model numbers, 5 sliders, 5 fixed numbers and the mixer's 4 × 8.
+const _: () = assert!(size_of::<ToneParams>() == (37 + 32) * 4);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -499,6 +501,7 @@ const MODE_PREVIEW: u32 = 1;
 /// turns); a preview smaller than that is scaled up to stand in for it. The edit's rotation,
 /// angle and crop decide what part of it is shown, and `zoom` is relative to that.
 pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32, u32), target: &Target) {
+    let mixer = crate::mixer::Params::from_sliders(&edit.mixer);
     let params = ToneParams {
         model: tone::MODEL,
         sliders: tone::Sliders::from_edit(edit),
@@ -507,6 +510,7 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
         ymax: tone::YMAX,
         middle: tone::MIDDLE,
         near_white: tone::NEAR_WHITE,
+        mixer,
     };
     gpu.set_params(&params);
     let (rows, lum, mode, base, clarity) = match layer {
@@ -559,7 +563,8 @@ pub fn render(gpu: &Gpu, layer: Layer, edit: &Edit, zoom: Zoom, photo_size: (u32
         base_size: base.1,
         lens: lens_constants(layer, edit),
         clip: view.clip,
-        canvas: canvas_color(),
+        // canvas.w is 1 when the colour mixer has something to do (its values are in the parameters).
+        canvas: { let mut c = canvas_color(); c[3] = if mixer.is_neutral() { 0.0 } else { 1.0 }; c },
         // vignette.zw carries the scale from image coordinates to the Clarity base's pixels.
         vignette: {
             let v = vignette_constants(layer, edit);

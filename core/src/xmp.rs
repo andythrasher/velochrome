@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use crate::develop::{DETAIL_DEFAULTS, Detail, Edit};
+use crate::develop::{DETAIL_DEFAULTS, Detail, Edit, MIXER_FIELDS};
 use crate::geometry;
 
 pub const NS_RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
@@ -89,9 +89,13 @@ pub fn parse(text: &str) -> Option<Metadata> {
     }
     e.set_detail(detail);
     e.clarity = number(DETAIL + 9).unwrap_or(0.0);
+    for (i, v) in e.mixer.iter_mut().enumerate() {
+        *v = number(MIXER + i).unwrap_or(0.0);
+    }
     geometry::clean(e);
     e.clean_lens();
     e.clean_detail();
+    e.clean_mixer();
     Some(meta)
 }
 
@@ -185,7 +189,7 @@ const PICK: usize = 2;
 /// (namespace, the prefix to declare if the file has none for it, local name)
 const FIRST_EDIT: usize = 3;
 /// (namespace, the prefix to declare if the file has none for it, local name)
-const PROPS: [(&str, &str, &str); 33] = [
+const PROPS: [(&str, &str, &str); 33 + MIXER_FIELDS] = [
     (NS_XMP, "xmp", "Rating"),
     (NS_XMP, "xmp", "Label"),
     (NS_WINDEDIT, "windedit", "Pick"),
@@ -219,6 +223,30 @@ const PROPS: [(&str, &str, &str); 33] = [
     (NS_WINDEDIT, "windedit", "NoiseColorDetail"),
     (NS_WINDEDIT, "windedit", "Texture"),
     (NS_WINDEDIT, "windedit", "Clarity"),
+    (NS_WINDEDIT, "windedit", "HueRed"),
+    (NS_WINDEDIT, "windedit", "HueOrange"),
+    (NS_WINDEDIT, "windedit", "HueYellow"),
+    (NS_WINDEDIT, "windedit", "HueGreen"),
+    (NS_WINDEDIT, "windedit", "HueAqua"),
+    (NS_WINDEDIT, "windedit", "HueBlue"),
+    (NS_WINDEDIT, "windedit", "HuePurple"),
+    (NS_WINDEDIT, "windedit", "HueMagenta"),
+    (NS_WINDEDIT, "windedit", "SaturationRed"),
+    (NS_WINDEDIT, "windedit", "SaturationOrange"),
+    (NS_WINDEDIT, "windedit", "SaturationYellow"),
+    (NS_WINDEDIT, "windedit", "SaturationGreen"),
+    (NS_WINDEDIT, "windedit", "SaturationAqua"),
+    (NS_WINDEDIT, "windedit", "SaturationBlue"),
+    (NS_WINDEDIT, "windedit", "SaturationPurple"),
+    (NS_WINDEDIT, "windedit", "SaturationMagenta"),
+    (NS_WINDEDIT, "windedit", "LuminanceRed"),
+    (NS_WINDEDIT, "windedit", "LuminanceOrange"),
+    (NS_WINDEDIT, "windedit", "LuminanceYellow"),
+    (NS_WINDEDIT, "windedit", "LuminanceGreen"),
+    (NS_WINDEDIT, "windedit", "LuminanceAqua"),
+    (NS_WINDEDIT, "windedit", "LuminanceBlue"),
+    (NS_WINDEDIT, "windedit", "LuminancePurple"),
+    (NS_WINDEDIT, "windedit", "LuminanceMagenta"),
 ];
 
 /// The edit's fields, in PROPS order from FIRST_EDIT.
@@ -320,11 +348,19 @@ fn values(meta: &Metadata, keep_zero_rating: bool) -> Vec<Option<String>> {
     }
     let clarity = number_text(e.clarity, 2);
     v.push((clarity != "0").then_some(clarity));
+    for &m in &e.mixer {
+        let text = number_text(m, 2);
+        v.push((text != "0").then_some(text));
+    }
     v
 }
 
 /// Where the detail sliders start in PROPS, after the lens fields.
 const DETAIL: usize = ROTATION + 5;
+
+/// Where the colour mixer sliders start in PROPS (after Texture and Clarity): hue, saturation and
+/// luminance for each range.
+const MIXER: usize = DETAIL + 10;
 
 /// The detail sliders, in PROPS order from DETAIL.
 fn detail_fields_mut(d: &mut Detail) -> [&mut f32; 9] {
@@ -804,6 +840,42 @@ mod tests {
         // Back to the defaults takes them out of the file.
         let back = update(&out, &Metadata::default()).unwrap();
         assert!(!back.contains("windedit:Sharpen") && !back.contains("windedit:Noise"));
+    }
+
+    #[test]
+    fn mixer_fields_round_trip_and_zeros_are_not_written() {
+        let mut edit = Edit::default();
+        for (i, v) in edit.mixer.iter_mut().enumerate() {
+            *v = [0.0, 37.5, -100.0, 100.0, -1.0][i % 5];
+        }
+        let meta = Metadata { edit, ..Default::default() };
+        let fresh = new_sidecar(&meta);
+        assert!(fresh.contains("windedit:HueOrange=\"37.5\"") && fresh.contains("windedit:HueYellow=\"-100\""), "{fresh}");
+        assert!(fresh.contains("windedit:SaturationRed=\"37.5\"") || fresh.contains("windedit:SaturationRed=\"-1\"") || fresh.contains("windedit:SaturationRed=\"100\""), "{fresh}");
+        assert!(!fresh.contains("windedit:HueRed"), "zero is not written: {fresh}");
+        assert_eq!(parse(&fresh), Some(meta.clone()));
+        let out = update(LIGHTROOM, &meta).unwrap();
+        assert_eq!(parse(&out), Some(meta));
+        // Each of the 24 on its own.
+        for i in 0..MIXER_FIELDS {
+            let mut one = Edit::default();
+            one.mixer[i] = if i % 2 == 0 { -42.0 } else { 71.0 };
+            let m = Metadata { edit: one, ..Default::default() };
+            let text = new_sidecar(&m);
+            assert_eq!(text.matches("windedit:").count() - 1, 1, "only one value: {text}"); // the namespace declaration is the other
+            assert_eq!(parse(&text), Some(m), "slider {i}");
+        }
+        // Zeros leave nothing in the file; a file without them reads as zeros.
+        let plain = new_sidecar(&Metadata { rating: 1, ..Default::default() });
+        assert!(!plain.contains("Hue") && !plain.contains("Saturation") && !plain.contains("Luminance"), "{plain}");
+        assert!(parse(&plain).unwrap().edit.mixer == [0.0; MIXER_FIELDS]);
+        // Damage is put in range.
+        let bad = fresh.replace("HueOrange=\"37.5\"", "HueOrange=\"900\"").replace("HueYellow=\"-100\"", "HueYellow=\"x\"");
+        let e = parse(&bad).unwrap().edit;
+        assert_eq!((e.mixer[1], e.mixer[2]), (100.0, 0.0));
+        // Back to zero takes them out of the file.
+        let back = update(&out, &Metadata::default()).unwrap();
+        assert!(!back.contains("windedit:Hue") && !back.contains("windedit:Saturation") && !back.contains("windedit:Luminance"));
     }
 
     #[test]

@@ -99,6 +99,77 @@ float3 presence(float3 rgb)
     return fromOkLab(lab);
 }
 
+
+// ---- The colour mixer (core/src/mixer.rs is the reference; docs/phase2c.md) ----
+
+// Each range's centre in OkLCh hue (degrees): Red, Orange, Yellow, Green, Aqua, Blue, Purple, Magenta.
+static const float MIXER_CENTRES[8] = { 29.23, 52.78, 109.77, 142.50, 194.77, 264.05, 293.77, 328.36 };
+
+float mixerGap(uint i)
+{
+    return (i == 7 ? MIXER_CENTRES[0] + 360.0 : MIXER_CENTRES[i + 1]) - MIXER_CENTRES[i];
+}
+
+bool inGamut(float3 c)
+{
+    return all(c >= -1e-5) && all(c <= 1.00001);
+}
+
+float3 lchToRgb(float l, float c, float h)
+{
+    return fromOkLab(float3(l, c * cos(h), c * sin(h)));
+}
+
+// Hue, saturation and luminance for eight colour ranges, in OkLCh. A pixel's hue picks its two
+// nearest ranges (raised-cosine weights summing to 1); chroma decides how much applies at all.
+float3 mixer(float3 rgb)
+{
+    MixerParams p = params[0].mixer;
+    rgb = saturate(rgb);
+    float3 lab = toOkLab(rgb);
+    float chroma = length(lab.yz);
+    float g = smoothstep(0.005, 0.06, chroma);
+    if (g <= 0.0)
+        return rgb;
+    float hue = degrees(atan2(lab.z, lab.y));
+    hue += hue < 0.0 ? 360.0 : 0.0;
+    float h = hue < MIXER_CENTRES[0] ? hue + 360.0 : hue;
+    uint i = 7;
+    [unroll] for (int k = 6; k >= 0; k--)
+        i = h < MIXER_CENTRES[k + 1] ? (uint)k : i;
+    uint j = (i + 1) & 7;
+    float span = mixerGap(i);
+    float t = (h - MIXER_CENTRES[i]) / span;
+    float up = 0.5 - 0.5 * cos(3.14159265 * t);
+    float sat = lerp(p.saturation[i], p.saturation[j], up);
+    float lum = lerp(p.luminance[i], p.luminance[j], up);
+    // A cubic Hermite through the moved centres (monotonic: the CPU limits the slopes).
+    float t2 = t * t, t3 = t2 * t;
+    float moved = (2.0 * t3 - 3.0 * t2 + 1.0) * (MIXER_CENTRES[i] + p.hueShift[i])
+                + (t3 - 2.0 * t2 + t) * span * p.hueSlope[i]
+                + (-2.0 * t3 + 3.0 * t2) * (MIXER_CENTRES[i] + span + p.hueShift[j])
+                + (t3 - t2) * span * p.hueSlope[j] - h;
+    if (abs(moved) < 1e-3 && sat == 0.0 && lum == 0.0)
+        return rgb;
+    float hueTo = radians(hue + g * moved);
+    float chromaTo = chroma * max(1.0 + g * sat, 0.0);
+    // Linear luminance is about the cube of OkLab's lightness: one stop at +-100 for a saturated colour.
+    float lightTo = saturate(lab.x * exp2(g * lum / 3.0));
+    float3 outRgb = lchToRgb(lightTo, chromaTo, hueTo);
+    if (!inGamut(outRgb))
+    {
+        // Lose chroma rather than clip, keeping hue and lightness.
+        float lo = 0.0, hi = chromaTo;
+        [unroll] for (int s = 0; s < 8; s++)
+        {
+            float mid = 0.5 * (lo + hi);
+            if (inGamut(lchToRgb(lightTo, mid, hueTo))) lo = mid; else hi = mid;
+        }
+        outRgb = lchToRgb(lightTo, lo, hueTo);
+    }
+    return saturate(outRgb);
+}
+
 float3 srgbEncode(float3 c)
 {
     return select(c <= 0.0031308, 12.92 * c, 1.055 * pow(c, 1.0 / 2.4) - 0.055);
@@ -226,6 +297,8 @@ void main(uint3 id : SV_DispatchThreadID)
         shifted += clarityShift(xg, ab2.x * xg + ab2.y, lum.w);
     }
     float3 rgb = mul(REC2020_TO_SRGB, toneRgb(wide * exp2(shifted - x)));
+    if (canvas.w != 0.0) // set when any colour mixer slider is not zero
+        rgb = mixer(rgb);
     rgb = saturate(presence(rgb));
     output[id.xy] = float4(srgbEncode(rgb), 1.0);
 }

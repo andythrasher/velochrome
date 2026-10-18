@@ -20,11 +20,21 @@ struct Sliders
     float contrast, highlights, shadows, whites, blacks; // -1..1
 };
 
+// The colour mixer (mixer.rs Params): per range, Red to Magenta.
+struct MixerParams
+{
+    float hueShift[8];  // degrees the range centre moves
+    float hueSlope[8];  // the hue map's slope at each centre
+    float saturation[8]; // -1..1
+    float luminance[8];  // -1..1
+};
+
 struct ToneParams
 {
     Model m;
     Sliders s;
     float n, log2Sigma, ymax, middle, nearWhite; // the base curve's fixed numbers
+    MixerParams mixer;
 };
 
 StructuredBuffer<ToneParams> params : register(t1);

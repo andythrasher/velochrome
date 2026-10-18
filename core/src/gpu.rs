@@ -76,7 +76,7 @@ pub struct Gpu {
 }
 
 /// Room for the tone parameters.
-const PARAMS_BYTES: u64 = 256;
+const PARAMS_BYTES: u64 = 512;
 
 /// Textures and a buffer for the tone pre-pass, which reduces the photo to a copy about
 /// `BASE_EDGE` pixels across. All stay in the unordered access state, except while the develop

@@ -104,6 +104,8 @@ public sealed partial class MainWindow
         AddPercent("Vibrance", e => e.Vibrance, (e, v) => e with { Vibrance = v });
         AddPercent("Saturation", e => e.Saturation, (e, v) => e with { Saturation = v });
 
+        BuildColorMixer();
+
         Header("Detail");
         group.Children.Add(new TextBlock
         {

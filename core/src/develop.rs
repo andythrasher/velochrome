@@ -54,7 +54,13 @@ pub struct Edit {
     /// Texture and Clarity, −100 to +100 (0 = none, so no offset is needed).
     pub texture: f32,
     pub clarity: f32,
+    /// The colour mixer (docs/phase2c.md), −100 to +100 each, 0 = none: hue for Red, Orange, Yellow,
+    /// Green, Aqua, Blue, Purple, Magenta, then their saturations, then their luminances.
+    pub mixer: [f32; MIXER_FIELDS],
 }
+
+/// Sliders in the colour mixer: three for each of the eight ranges.
+pub const MIXER_FIELDS: usize = 3 * crate::mixer::RANGES;
 
 /// No crop.
 pub const FULL_CROP: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
@@ -90,6 +96,7 @@ impl Default for Edit {
             noise_color_detail: 0.0,
             texture: 0.0,
             clarity: 0.0,
+            mixer: [0.0; MIXER_FIELDS],
         }
     }
 }
@@ -125,6 +132,13 @@ impl Edit {
         self.noise_color_detail = fix(self.noise_color_detail, d.color_detail, 0.0, 100.0);
         self.texture = fix(self.texture, 0.0, -100.0, 100.0);
         self.clarity = fix(self.clarity, 0.0, -100.0, 100.0);
+    }
+
+    /// Puts the mixer sliders in range.
+    pub fn clean_mixer(&mut self) {
+        for v in &mut self.mixer {
+            *v = if v.is_finite() { v.clamp(-100.0, 100.0) } else { 0.0 };
+        }
     }
 
     /// The detail sliders as the user sees them (absolute values).

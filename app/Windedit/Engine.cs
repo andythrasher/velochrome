@@ -123,6 +123,32 @@ public sealed unsafe partial class Engine : IDisposable
         public float NoiseLuminance, NoiseLuminanceDetail, NoiseColor, NoiseColorDetail;
         /// <summary>Texture and Clarity, −100 to 100 (0 is none).</summary>
         public float Texture, Clarity;
+        /// <summary>The colour mixer, −100 to 100 (0 is none): hue, then saturation, then luminance, each for
+        /// Red, Orange, Yellow, Green, Aqua, Blue, Purple, Magenta. Keep them together and in this order
+        /// (develop.rs <c>Edit::mixer</c>); use <see cref="GetMixer"/> and <see cref="WithMixer"/> by index
+        /// (kind × 8 + range).</summary>
+        public float HueRed, HueOrange, HueYellow, HueGreen, HueAqua, HueBlue, HuePurple, HueMagenta;
+        public float SaturationRed, SaturationOrange, SaturationYellow, SaturationGreen, SaturationAqua, SaturationBlue, SaturationPurple, SaturationMagenta;
+        public float LuminanceRed, LuminanceOrange, LuminanceYellow, LuminanceGreen, LuminanceAqua, LuminanceBlue, LuminancePurple, LuminanceMagenta;
+
+        public const int MixerFields = 24;
+
+        public static float GetMixer(in Edit e, int index) =>
+            System.Runtime.CompilerServices.Unsafe.Add(ref System.Runtime.CompilerServices.Unsafe.AsRef(in e.HueRed), index);
+
+        public static Edit WithMixer(Edit e, int index, float value)
+        {
+            System.Runtime.CompilerServices.Unsafe.Add(ref e.HueRed, index) = value;
+            return e;
+        }
+
+        /// <summary>Every mixer slider at 0.</summary>
+        public static Edit WithoutMixer(Edit e)
+        {
+            for (var i = 0; i < MixerFields; i++)
+                e = WithMixer(e, i, 0);
+            return e;
+        }
 
         /// <summary>The photo as shot: no adjustments, no crop.</summary>
         public static Edit None => new() { CropRight = 1, CropBottom = 1 };
@@ -250,6 +276,10 @@ public sealed unsafe partial class Engine : IDisposable
     /// report the frame's rectangle (<see cref="Frame.ViewX"/>).</summary>
     public void SetCropMode(bool on) => Check(we_set_crop_mode(handle, on ? 1 : 0));
 
+    /// <summary>In crop mode, the point of the frame (fractions of its size) at the view's centre: 0.5, 0.5,
+    /// except while the photo is dragged under a fixed crop box.</summary>
+    public void SetCropView(float x, float y) => Check(we_set_crop_view(handle, x, y));
+
     public enum Constrain { Shrink = 0, Slide = 1, Edges = 2, Scale = 3, Aspect = 4 }
 
     /// <summary>
@@ -276,10 +306,6 @@ public sealed unsafe partial class Engine : IDisposable
     /// <summary>Every photo's metadata, in folder order.</summary>
     public Metadata[] GetMetadata(int count)
     {
-    /// <summary>In crop mode, the point of the frame (fractions of its size) at the view's centre: 0.5, 0.5,
-    /// except while the photo is dragged under a fixed crop box.</summary>
-    public void SetCropView(float x, float y) => Check(we_set_crop_view(handle, x, y));
-
         var all = new Metadata[count];
         fixed (Metadata* p = all)
             Check(we_get_metadata(handle, p, count));
