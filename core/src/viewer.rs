@@ -169,6 +169,8 @@ pub const EVENT_FRAME: u32 = 1;
 pub const EVENT_THUMBNAIL: u32 = 2;
 /// `FrameEvent::kind`: an export made progress, finished or failed.
 pub const EVENT_EXPORT: u32 = 3;
+/// `FrameEvent::kind`: a card import made progress or ended (see `engine::emit_import` for the fields).
+pub const EVENT_IMPORT: u32 = 4;
 
 pub type EventSink = Box<dyn Fn(&FrameEvent) + Send>;
 

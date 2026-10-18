@@ -64,7 +64,12 @@ impl Ratings {
 
     /// Reads the sidecars of a folder's photos (in parallel; most photos have none).
     pub fn load(&self, dir: &Path, photos: &[Photo]) {
-        let sidecars: Vec<PathBuf> = photos.iter().map(|p| xmp::sidecar_path(dir, &p.name)).collect();
+        self.load_sidecars(photos.iter().map(|p| xmp::sidecar_path(dir, &p.name)).collect());
+    }
+
+    /// Like `load`, with each photo's sidecar named: a card's photos keep their stars and flags
+    /// in the sidecars of the folders they'll be copied to, never on the card.
+    pub fn load_sidecars(&self, sidecars: Vec<PathBuf>) {
         let values: Vec<Metadata> = sidecars.par_iter().map(|path| xmp::read(path)).collect();
         *self.values.lock().unwrap() = values;
         *self.sidecars.lock().unwrap() = sidecars;
@@ -173,6 +178,10 @@ fn write_sidecars(rx: Receiver<(PathBuf, Metadata)>) {
             latest.insert(path, meta);
         }
         for (path, meta) in latest {
+            // A card photo's folder may not exist yet: its sidecar is written before the copy.
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
             if let Err(e) = xmp::write(&path, &meta) {
                 eprintln!("windedit: couldn't save {}: {e}", path.display());
             }
@@ -223,5 +232,19 @@ mod tests {
         let saved = xmp::read(&xmp::sidecar_path(&dir, "P1"));
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(saved.edit.exposure, -1.0, "the last committed change is saved");
+    }
+
+    #[test]
+    fn sidecars_can_be_named_and_their_folder_made() {
+        let dir = std::env::temp_dir().join(format!("windedit-ratings-named-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sidecar = dir.join("2026").join("2026-06-06").join("P1.xmp");
+        let r = Ratings::new();
+        r.load_sidecars(vec![sidecar.clone()]);
+        assert!(r.set(0, |m| m.rating = 4));
+        r.finish();
+        let saved = xmp::read(&sidecar);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(saved.rating, 4);
     }
 }

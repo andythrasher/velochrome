@@ -486,3 +486,47 @@ pub extern "C" fn we_set_crop_view(handle: *const Handle, x: f32, y: f32) -> i32
         Ok(0)
     })
 }
+
+/// Looks at a camera card: `card` is its root (the folder holding DCIM) and `dest_root` the
+/// library folder photos would go to (`<dest_root>\<yyyy>\<yyyy-MM-dd>`). Writes how many photos
+/// the card has and how many of them aren't in the library yet. Reads every photo's date from
+/// the card, so call it from a background thread; nothing is written.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_import_scan(handle: *const Handle, card: *const u16, dest_root: *const u16, total: *mut i32, new: *mut i32) -> i32 {
+    guard(handle, |e| {
+        let (all, fresh) = e.import_scan(&wide_to_path(card), &wide_to_path(dest_root)).map_err(|err| err.to_string())?;
+        unsafe {
+            *total = all as i32;
+            *new = fresh as i32;
+        }
+        Ok(0)
+    })
+}
+
+/// Opens the card scanned last as the set of photos (in the order they were shot), like
+/// `we_open_folder`. Their stars and flags are saved in the library folders' sidecars. Returns
+/// how many photos there are.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_import_open_card(handle: *const Handle) -> i32 {
+    guard(handle, |e| e.open_card().map(|n| n as i32))
+}
+
+/// Starts copying the scanned card's new photos into the library, on a background thread.
+/// `backup_root` (null for none) gets every file as well, laid out the same way; `verify` 1 reads
+/// each copy back and compares it. Progress and the end arrive as EVENT_IMPORT events.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_import_start(handle: *const Handle, backup_root: *const u16, verify: i32) -> i32 {
+    guard(handle, |e| {
+        let backup_root = if backup_root.is_null() { None } else { Some(wide_to_path(backup_root)) };
+        e.import_start(crate::import::Options { backup_root, verify: verify != 0 }).map(|()| 0)
+    })
+}
+
+/// Stops the import that is running; photos already copied stay, and no partial file is left.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_import_cancel(handle: *const Handle) -> i32 {
+    guard(handle, |e| {
+        e.import_cancel();
+        Ok(0)
+    })
+}

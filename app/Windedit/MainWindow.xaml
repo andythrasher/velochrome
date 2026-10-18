@@ -205,15 +205,78 @@
                   BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="0,0,1,0">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
                     <RowDefinition />
                 </Grid.RowDefinitions>
-                <TextBox x:Name="FolderSearch" Margin="8,8,8,0" PlaceholderText="Search folders"
+                <!-- A camera card, while one is in (MainWindow.Import.cs): its photos open like a folder; Import copies the new ones. -->
+                <Border x:Name="ImportEntry" Margin="8,8,8,0" Padding="10,8,8,10" CornerRadius="6" Visibility="Collapsed"
+                        Background="{ThemeResource LayerFillColorDefaultBrush}" BorderThickness="1"
+                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
+                    <StackPanel Spacing="8">
+                        <Grid x:Name="ImportHeader" ColumnSpacing="8" Background="Transparent" Tapped="ImportHeader_Tapped">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <FontIcon Glyph="&#xE896;" FontSize="16" VerticalAlignment="Center" />
+                            <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                <TextBlock x:Name="ImportTitle" Style="{StaticResource BodyStrongTextBlockStyle}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock x:Name="ImportCounts" FontSize="12" Opacity="0.7" TextTrimming="CharacterEllipsis" />
+                            </StackPanel>
+                            <Button x:Name="ImportSettings" Grid.Column="2" Padding="6" Background="Transparent" BorderThickness="0"
+                                    ToolTipService.ToolTip="Import settings">
+                                <FontIcon Glyph="&#xE713;" FontSize="14" />
+                                <Button.Flyout>
+                                    <Flyout x:Name="ImportFlyout" Placement="BottomEdgeAlignedLeft" Opening="ImportFlyout_Opening" Closed="ImportFlyout_Closed">
+                                        <StackPanel Width="320" Spacing="10">
+                                            <TextBlock Text="Import settings" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                                            <StackPanel Spacing="2">
+                                                <TextBlock Text="Copy photos to" Opacity="0.7" />
+                                                <TextBlock Text="Each goes to a folder named for the day it was taken, inside one for the year." FontSize="12" Opacity="0.55" TextWrapping="Wrap" />
+                                                <Grid ColumnSpacing="8">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition />
+                                                        <ColumnDefinition Width="Auto" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock x:Name="ImportDestPath" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                                                    <Button Grid.Column="1" Content="Change…" Click="ImportDest_Click" />
+                                                </Grid>
+                                            </StackPanel>
+                                            <StackPanel Spacing="2">
+                                                <CheckBox x:Name="ImportBackupOn" Content="Also copy to a backup" Click="ImportBackupOn_Click" />
+                                                <Grid ColumnSpacing="8" Margin="28,0,0,0">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition />
+                                                        <ColumnDefinition Width="Auto" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock x:Name="ImportBackupPath" VerticalAlignment="Center" Opacity="0.55" FontSize="12" TextTrimming="CharacterEllipsis" />
+                                                    <Button Grid.Column="1" Content="Change…" Click="ImportBackup_Click" />
+                                                </Grid>
+                                            </StackPanel>
+                                            <CheckBox x:Name="ImportVerify" Content="Check each copy against the card (slower)" Click="ImportVerify_Click" />
+                                            <CheckBox x:Name="ImportEject" Content="Eject the card when done" Click="ImportEject_Click" />
+                                        </StackPanel>
+                                    </Flyout>
+                                </Button.Flyout>
+                            </Button>
+                        </Grid>
+                        <Button x:Name="ImportGo" Style="{StaticResource AccentButtonStyle}" HorizontalAlignment="Stretch" Click="ImportGo_Click" />
+                        <StackPanel x:Name="ImportProgressBox" Spacing="4" Visibility="Collapsed">
+                            <ProgressBar x:Name="ImportBar" Maximum="1" />
+                            <TextBlock x:Name="ImportProgressText" FontSize="12" Opacity="0.75" TextWrapping="Wrap" />
+                            <Button x:Name="ImportCancel" Content="Stop" HorizontalAlignment="Right" Click="ImportCancel_Click" />
+                        </StackPanel>
+                        <TextBlock x:Name="ImportMessage" FontSize="12" TextWrapping="Wrap" Visibility="Collapsed" />
+                    </StackPanel>
+                </Border>
+                <TextBox x:Name="FolderSearch" Grid.Row="1" Margin="8,0,8,0" PlaceholderText="Search folders"
                          TextChanged="FolderSearch_TextChanged" />
-                <TreeView x:Name="FolderTree" Grid.Row="1" SelectionMode="Single" ItemTemplate="{StaticResource FolderTemplate}"
+                <TreeView x:Name="FolderTree" Grid.Row="2" SelectionMode="Single" ItemTemplate="{StaticResource FolderTemplate}"
                           Expanding="FolderTree_Expanding" ItemInvoked="FolderTree_ItemInvoked" />
-                <TreeView x:Name="SearchTree" Grid.Row="1" SelectionMode="Single" ItemTemplate="{StaticResource FolderTemplate}"
+                <TreeView x:Name="SearchTree" Grid.Row="2" SelectionMode="Single" ItemTemplate="{StaticResource FolderTemplate}"
                           Visibility="Collapsed" ItemInvoked="FolderTree_ItemInvoked" />
-                <TextBlock x:Name="SearchStatus" Grid.Row="1" Margin="12,8" Opacity="0.6" TextWrapping="Wrap"
+                <TextBlock x:Name="SearchStatus" Grid.Row="2" Margin="12,8" Opacity="0.6" TextWrapping="Wrap"
                            VerticalAlignment="Top" IsHitTestVisible="False" />
             </Grid>
 

@@ -40,3 +40,27 @@ pub fn set_background(background: bool) {
         let _ = SetThreadPriority(thread, if background { THREAD_PRIORITY_BELOW_NORMAL } else { THREAD_PRIORITY_NORMAL });
     }
 }
+
+/// A file's modified time as the wall clock read in the user's time zone then, for filing a photo
+/// that has no EXIF date under the day it was made.
+pub fn local_stamp(time: std::time::SystemTime) -> Option<crate::exif::Stamp> {
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+    // FILETIME counts 100 ns ticks from 1601; the Unix epoch is 11 644 473 600 s after that.
+    let since_unix = time.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let ticks = (since_unix.as_secs() + 11_644_473_600) * 10_000_000 + since_unix.subsec_nanos() as u64 / 100;
+    let file = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+    let (mut utc, mut local) = (SYSTEMTIME::default(), SYSTEMTIME::default());
+    unsafe {
+        FileTimeToSystemTime(&file, &mut utc).ok()?;
+        SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).ok()?;
+    }
+    Some(crate::exif::Stamp {
+        year: local.wYear,
+        month: local.wMonth as u8,
+        day: local.wDay as u8,
+        hour: local.wHour as u8,
+        minute: local.wMinute as u8,
+        second: local.wSecond as u8,
+    })
+}

@@ -14,7 +14,8 @@ use crate::ratings::Ratings;
 use crate::develop::{self, Edit};
 use crate::pipeline::Zoom;
 use crate::export::Request;
-use crate::viewer::{self, Command, EventSink, ExportJob, GpuInfo};
+use crate::import::{self, Import, Plan};
+use crate::viewer::{self, Command, EventSink, ExportJob, FrameEvent, GpuInfo};
 
 pub struct Engine {
     jobs: Arc<Jobs>,
@@ -24,6 +25,10 @@ pub struct Engine {
     view: Mutex<ViewState>,
     ratings: Ratings,
     next_export: AtomicU32,
+    /// The sink the app gave us: shared, because the card import reports from its own thread.
+    events: Arc<Mutex<EventSink>>,
+    import_plan: Mutex<Option<Arc<Plan>>>,
+    import: Mutex<Option<Import>>,
 }
 
 /// What decides which decodes are wanted.
@@ -40,12 +45,15 @@ impl Engine {
     /// Starts the decode workers and the GPU thread. `events` is called on the GPU thread after
     /// every frame drawn.
     pub fn new(events: EventSink) -> Result<Engine, String> {
+        let events = Arc::new(Mutex::new(events));
+        let for_viewer = events.clone();
+        let viewer_events: EventSink = Box::new(move |event| (for_viewer.lock().unwrap_or_else(|p| p.into_inner()))(event));
         let (tx, rx) = channel();
         let ready = tx.clone();
         let jobs = Jobs::new(Box::new(move |index, kind| {
             let _ = ready.send(Command::Ready(index, kind));
         }));
-        let (gpu_thread, info) = match viewer::spawn(jobs.clone(), events, tx.clone(), rx) {
+        let (gpu_thread, info) = match viewer::spawn(jobs.clone(), viewer_events, tx.clone(), rx) {
             Ok(started) => started,
             Err(e) => {
                 jobs::shutdown(&jobs);
@@ -59,6 +67,9 @@ impl Engine {
             info,
             ratings: Ratings::new(),
             next_export: AtomicU32::new(1),
+            events,
+            import_plan: Mutex::new(None),
+            import: Mutex::new(None),
             view: Mutex::new(ViewState {
                 index: None,
                 direction: 1,
@@ -73,12 +84,55 @@ impl Engine {
     /// Opens a folder; returns how many photos it has. Shows nothing until `show`.
     pub fn open_folder(&self, dir: &Path) -> std::io::Result<usize> {
         let photos = library::scan_folder(dir)?;
+        let sidecars = photos.iter().map(|p| crate::xmp::sidecar_path(dir, &p.name)).collect();
+        Ok(self.open_photos(photos, sidecars))
+    }
+
+    /// Makes `photos` the open set, their stars and flags kept in `sidecars` (one each).
+    fn open_photos(&self, photos: Vec<Photo>, sidecars: Vec<PathBuf>) -> usize {
         let count = photos.len();
-        self.ratings.load(dir, &photos);
+        self.ratings.load_sidecars(sidecars);
         self.view.lock().unwrap().index = None;
         let _ = self.viewer.send(Command::Folder);
         self.jobs.set_photos(Arc::new(photos));
-        Ok(count)
+        count
+    }
+
+    /// Looks at a camera card (the DCIM folders under `card`) and plans copying it into
+    /// `dest_root`. Returns how many photos it has and how many aren't in the library yet.
+    /// Reads each photo's date from the card, so it takes a moment: call it off the UI thread.
+    pub fn import_scan(&self, card: &Path, dest_root: &Path) -> std::io::Result<(usize, usize)> {
+        let plan = import::plan(card, dest_root)?;
+        let counts = (plan.items.len(), plan.new_count());
+        *self.import_plan.lock().unwrap() = Some(Arc::new(plan));
+        Ok(counts)
+    }
+
+    /// Opens the scanned card as a set of photos in the order they were shot. Their stars and
+    /// flags go to the sidecars in the folders they'll be copied to, never to the card.
+    pub fn open_card(&self) -> Result<usize, String> {
+        let plan = self.import_plan.lock().unwrap().clone().ok_or("the card hasn't been scanned")?;
+        Ok(self.open_photos(plan.photos(), plan.sidecars()))
+    }
+
+    /// Starts copying the scanned card on its own thread. Progress and the end arrive as
+    /// `EVENT_IMPORT` events.
+    pub fn import_start(&self, options: import::Options) -> Result<(), String> {
+        let plan = self.import_plan.lock().unwrap().clone().ok_or("the card hasn't been scanned")?;
+        let mut running = self.import.lock().unwrap();
+        if running.as_ref().is_some_and(Import::is_running) {
+            return Err("an import is already running".into());
+        }
+        let events = self.events.clone();
+        *running = Some(Import::start(plan, options, Box::new(move |report| emit_import(&events, report))));
+        Ok(())
+    }
+
+    /// Stops the copy after the photo in progress's current piece; what's finished stays.
+    pub fn import_cancel(&self) {
+        if let Some(running) = &*self.import.lock().unwrap() {
+            running.cancel();
+        }
     }
 
     pub fn photos(&self) -> Arc<Vec<Photo>> {
@@ -267,4 +321,42 @@ impl Drop for Engine {
         jobs::shutdown(&self.jobs);
         self.ratings.finish();
     }
+}
+
+/// Reports a card import to the app as an `EVENT_IMPORT` event: `photo` files done, `width`
+/// files in all, `height` files that failed, `layer` the state (0 working, 1 done, 2 stopped),
+/// `progress` the share of bytes, `gpu_ms` and `cpu_ms` the bytes done and in all, `since_show_ms`
+/// the time taken. `text` is the file being copied, or at the end the summary (`Summary::text`).
+fn emit_import(events: &Mutex<EventSink>, report: import::Report) {
+    let (mut event, text) = match report {
+        import::Report::Progress(p) => (
+            FrameEvent {
+                photo: p.files_done as i32,
+                width: p.files_total as u32,
+                height: p.failed as u32,
+                progress: if p.bytes_total == 0 { 1.0 } else { (p.bytes_done as f64 / p.bytes_total as f64) as f32 },
+                since_show_ms: p.elapsed.as_secs_f64() * 1000.0,
+                gpu_ms: p.bytes_done as f64,
+                cpu_ms: p.bytes_total as f64,
+                ..Default::default()
+            },
+            p.current,
+        ),
+        import::Report::Finished(s) => (
+            FrameEvent {
+                layer: if s.cancelled { 2 } else { 1 },
+                height: s.failures.len() as u32,
+                progress: 1.0,
+                since_show_ms: s.elapsed.as_secs_f64() * 1000.0,
+                gpu_ms: s.bytes as f64,
+                cpu_ms: s.bytes as f64,
+                ..Default::default()
+            },
+            s.text(),
+        ),
+    };
+    let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    event.kind = viewer::EVENT_IMPORT;
+    event.text = wide.as_ptr() as usize;
+    (events.lock().unwrap_or_else(|p| p.into_inner()))(&event);
 }
