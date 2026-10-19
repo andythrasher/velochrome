@@ -3,8 +3,8 @@
   The Microsoft Store (MSIX) package. Only used by the packaged build (tools/package.ps1); the
   everyday build runs unpackaged.
 
-  BEFORE SUBMITTING, replace the three PLACEHOLDER values below with the ones from Partner Center
-  (Product management > Product identity). They must match it exactly:
+  The identity below is Velochrome's from Partner Center (Product management > Product identity),
+  and must keep matching it exactly:
     Identity Name            ->  "Package/Identity/Name"
     Identity Publisher       ->  "Package/Identity/Publisher"   (a "CN=..." string)
     PublisherDisplayName     ->  "Package/Properties/PublisherDisplayName"
@@ -18,13 +18,13 @@
   IgnorableNamespaces="uap uap3 rescap">
 
   <Identity
-    Name="PLACEHOLDER.Velochrome"
-    Publisher="CN=PLACEHOLDER-PUBLISHER-ID"
+    Name="AndyThrasher.Velochrome"
+    Publisher="CN=0BF2785B-78A5-4726-A59C-2322EBED4C78"
     Version="1.0.0.0" />
 
   <Properties>
     <DisplayName>Velochrome</DisplayName>
-    <PublisherDisplayName>PLACEHOLDER Publisher Display Name</PublisherDisplayName>
+    <PublisherDisplayName>Andy Thrasher</PublisherDisplayName>
     <Logo>Assets\Package\StoreLogo.png</Logo>
   </Properties>
 
