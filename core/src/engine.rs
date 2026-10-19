@@ -10,6 +10,7 @@ use std::thread::JoinHandle;
 
 use crate::jobs::{self, Focus, Jobs};
 use crate::library::{self, Photo};
+use crate::developed::{self, Cache};
 use crate::ratings::Ratings;
 use crate::develop::{self, Edit};
 use crate::masks::{DabWalker, Masks, Stroke};
@@ -24,7 +25,7 @@ pub struct Engine {
     gpu_thread: Option<JoinHandle<()>>,
     pub info: GpuInfo,
     view: Mutex<ViewState>,
-    ratings: Ratings,
+    ratings: Arc<Ratings>,
     next_export: AtomicU32,
     /// The sink the app gave us: shared, because the card import reports from its own thread.
     events: Arc<Mutex<EventSink>>,
@@ -71,10 +72,24 @@ impl Engine {
         let viewer_events: EventSink = Box::new(move |event| (for_viewer.lock().unwrap_or_else(|p| p.into_inner()))(event));
         let (tx, rx) = channel();
         let ready = tx.clone();
-        let jobs = Jobs::new(Box::new(move |index, kind| {
-            let _ = ready.send(Command::Ready(index, kind));
-        }));
-        let (gpu_thread, info) = match viewer::spawn(jobs.clone(), viewer_events, tx.clone(), rx) {
+        // Counting the cache and trimming it to its limit lists a directory: off this thread.
+        let cache = Arc::new(Cache::new(developed::default_dir(), developed::CACHE_LIMIT));
+        let counting = cache.clone();
+        std::thread::Builder::new()
+            .name("windedit cache".into())
+            .spawn(move || {
+                crate::sys::set_background(true);
+                counting.evict();
+            })
+            .map_err(|e| e.to_string())?;
+        let jobs = Jobs::new(
+            Box::new(move |index, kind| {
+                let _ = ready.send(Command::Ready(index, kind));
+            }),
+            cache,
+        );
+        let ratings = Arc::new(Ratings::new());
+        let (gpu_thread, info) = match viewer::spawn(jobs.clone(), ratings.clone(), viewer_events, tx.clone(), rx) {
             Ok(started) => started,
             Err(e) => {
                 jobs::shutdown(&jobs);
@@ -86,7 +101,7 @@ impl Engine {
             viewer: tx,
             gpu_thread: Some(gpu_thread),
             info,
-            ratings: Ratings::new(),
+            ratings,
             next_export: AtomicU32::new(1),
             events,
             import_plan: Mutex::new(None),
@@ -117,6 +132,8 @@ impl Engine {
         self.view.lock().unwrap().index = None;
         let _ = self.viewer.send(Command::Folder);
         self.jobs.set_photos(Arc::new(photos));
+        // Which photos are edited, and have a developed preview in the cache already.
+        self.jobs.set_developed_all(self.ratings.all().iter().map(developed::fingerprint_of).collect());
         count
     }
 
@@ -223,7 +240,19 @@ impl Engine {
         if ok && self.view.lock().unwrap().index == Some(index) {
             let _ = self.viewer.send(Command::SetEdit(edit));
         }
+        if ok && commit {
+            self.edit_committed(index);
+        }
         ok
+    }
+
+    /// A photo's edit has been committed: its developed preview is out of date. (The photo in view
+    /// renders its new one when things are quiet; any other is queued for the background.)
+    fn edit_committed(&self, index: usize) {
+        let fingerprint = self.ratings.get(index).as_ref().and_then(developed::fingerprint_of);
+        if self.jobs.set_developed(index, fingerprint) && self.view.lock().unwrap().index == Some(index) {
+            let _ = self.viewer.send(Command::Committed(index));
+        }
     }
 
     /// Changes a photo's masks, like [`set_edit`](Self::set_edit): `commit` false while a handle or
@@ -234,6 +263,9 @@ impl Engine {
             let _ = self.viewer.send(Command::SetMasks(Box::new(masks)));
             // A brush component that is gone takes its strokes with it.
             let _ = self.viewer.send(Command::SetStrokes(self.ratings.strokes(index).unwrap_or_default()));
+        }
+        if ok && commit {
+            self.edit_committed(index);
         }
         ok
     }
@@ -274,6 +306,9 @@ impl Engine {
         if ok && self.view.lock().unwrap().index == Some(index) {
             let _ = self.viewer.send(Command::SetStrokes(self.ratings.strokes(index).unwrap_or_default()));
         }
+        if ok {
+            self.edit_committed(index);
+        }
         ok
     }
 
@@ -290,6 +325,7 @@ impl Engine {
             let _ = self.viewer.send(Command::SetMasks(Box::new(masks)));
             let _ = self.viewer.send(Command::SetStrokes(strokes));
         }
+        self.edit_committed(index);
         Some((edit, masks))
     }
 

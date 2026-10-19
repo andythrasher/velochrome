@@ -21,20 +21,26 @@
                             <RowDefinition />
                             <RowDefinition Height="16" />
                         </Grid.RowDefinitions>
-                        <Image Source="{x:Bind Thumbnail, Mode=OneWay}" Opacity="{x:Bind Dimming, Mode=OneWay}" Stretch="Uniform" />
+                        <!-- The Image sizes itself to its picture, so the badge sits on the picture's corner, not the cell's. -->
+                        <Grid HorizontalAlignment="Center" VerticalAlignment="Center">
+                            <Image Source="{x:Bind Thumbnail, Mode=OneWay}" Opacity="{x:Bind Dimming, Mode=OneWay}" Stretch="Uniform" />
+                            <Border Visibility="{x:Bind EditedVisibility, Mode=OneWay}" HorizontalAlignment="Right" VerticalAlignment="Bottom"
+                                    Margin="0,0,5,5" Width="20" Height="20" CornerRadius="10" Background="#B3000000"
+                                    ToolTipService.ToolTip="Edited">
+                                <FontIcon Glyph="&#xE9E9;" FontSize="11" Foreground="White" />
+                            </Border>
+                        </Grid>
                         <Grid Grid.Row="1" ColumnSpacing="4" Opacity="{x:Bind Dimming, Mode=OneWay}">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="Auto" />
                                 <ColumnDefinition />
                                 <ColumnDefinition Width="Auto" />
                                 <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
                             <Ellipse Width="9" Height="9" Fill="{x:Bind LabelBrush, Mode=OneWay}" VerticalAlignment="Center" />
                             <TextBlock Grid.Column="1" Text="{x:Bind Name}" FontSize="11" Opacity="0.7" TextTrimming="CharacterEllipsis" />
                             <TextBlock Grid.Column="2" Text="{x:Bind Stars, Mode=OneWay}" FontSize="10" Foreground="{ThemeResource SystemFillColorCautionBrush}" />
-                            <FontIcon Grid.Column="3" Glyph="{x:Bind EditedGlyph, Mode=OneWay}" FontSize="11" Opacity="0.8" />
-                            <FontIcon Grid.Column="4" Glyph="{x:Bind FlagGlyph, Mode=OneWay}" FontSize="11" />
+                            <FontIcon Grid.Column="3" Glyph="{x:Bind FlagGlyph, Mode=OneWay}" FontSize="11" />
                         </Grid>
                     </Grid>
                 </Border>

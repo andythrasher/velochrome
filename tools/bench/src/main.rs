@@ -12,6 +12,7 @@ mod detail;
 mod hsl;
 mod lens;
 mod masks;
+mod previews;
 mod vignette;
 mod wb;
 
@@ -56,6 +57,10 @@ fn main() {
         "lensscan" => lens::lens_scan(rest),
         "lenstags" => lens::lens_tags(&files),
         "vignette" => lens::bench_vignette(&files),
+        "previews" => previews::bench_previews(&files),
+        "livecheck" => previews::live_check(rest),
+        "backlog" => previews::bench_backlog(rest),
+        "editsidecars" => previews::make_edits(rest),
         "cull" => bench_cull(&rest.iter().map(PathBuf::from).collect::<Vec<_>>()),
         _ => {
             eprintln!("unknown command {cmd}");
@@ -353,7 +358,7 @@ fn bench_cull(files: &[PathBuf]) {
         frames
     };
     let first_with = |frames: &[FrameEvent], min_layer: u32| frames.iter().find(|f| f.layer >= min_layer).map(|f| f.since_show_ms);
-    let layer_name = |l: u32| ["none", "quick", "loupe", "full", "raw"][l as usize];
+    let layer_name = |l: u32| ["none", "quick", "loupe", "full", "raw", "developed"][l as usize];
     let summary = |label: &str, v: &mut Vec<f64>, of: usize| {
         if v.is_empty() {
             println!("  {label}: never (0 of {of})");

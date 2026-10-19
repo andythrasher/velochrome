@@ -24,6 +24,8 @@ pub enum Source {
     Embedded,
     /// The camera's JPEG beside the raw.
     CameraJpeg,
+    /// Our own render of the edited photo (developed.rs), already cropped.
+    Developed,
 }
 
 /// Which preview to load.
@@ -112,6 +114,7 @@ pub fn load(photo: &Photo, want: Want) -> Result<Preview, DecodeError> {
         let bytes = match source {
             Source::Embedded => read_jpeg_at(photo.raw.as_ref().unwrap(), offset),
             Source::CameraJpeg => std::fs::read(photo.jpeg.as_ref().unwrap()).map_err(|e| DecodeError(e.to_string())),
+            Source::Developed => unreachable!("the candidates are the camera's JPEGs"),
         };
         match bytes.and_then(|b| jpeg::decode(&b, decode_edge).map_err(|e| DecodeError(e.to_string()))) {
             Ok(pixels) => {

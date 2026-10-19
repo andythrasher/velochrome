@@ -18,6 +18,7 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Device;
 use windows::core::Interface;
 
 use crate::decode::{self, RawFrame};
+use crate::developed::PreviewRenderer;
 use crate::export::{self, Encoded, Request, Strip, TileRenderer};
 use crate::geometry;
 use crate::gpu::Gpu;
@@ -27,6 +28,10 @@ use crate::masks::{Masks, Stroke, Strokes};
 use crate::pipeline::{Edit, Image, ImageMemory, Layer, MaskInput, PreviewTexture, Slot, Target, Zoom, render_masked, warm_up};
 use crate::present::Presenter;
 use crate::preview::Preview;
+use crate::ratings::Ratings;
+
+mod previews;
+use previews::{Pending, WriterJob, spawn_writer};
 
 pub enum Command {
     /// Show this photo (index into the folder).
@@ -34,6 +39,9 @@ pub enum Command {
     Zoom(Zoom),
     /// The adjustments of the photo in view.
     SetEdit(Edit),
+    /// A change to the photo's edit was committed (a slider let go, a crop done, a stroke ended):
+    /// its developed preview, and its thumbnail meanwhile, are due.
+    Committed(usize),
     /// The masks of the photo in view.
     SetMasks(Box<Masks>),
     /// The brush strokes of the photo in view, by brush id.
@@ -96,7 +104,8 @@ pub struct FrameEvent {
     /// `EVENT_FRAME`, `EVENT_THUMBNAIL` or `EVENT_EXPORT`.
     pub kind: u32,
     pub photo: i32,
-    /// What was drawn: 1 quick preview, 2 loupe preview, 3 full-size preview, 4 the raw.
+    /// What was drawn: 1 quick preview, 2 loupe preview, 3 full-size preview, 4 the raw, 5 the
+    /// developed preview (our render of an edited photo).
     pub layer: u32,
     /// The size in photo pixels of what the view shows: the crop, or in crop mode the whole frame
     /// (the raw's once it's decoded, before that its biggest JPEG's): what fractions in
@@ -177,6 +186,7 @@ pub fn layer_code(kind: Kind) -> u32 {
         Kind::Loupe => 2,
         Kind::Full => 3,
         Kind::Raw => 4,
+        Kind::Developed => 5,
         Kind::Thumb => 0,
     }
 }
@@ -201,6 +211,7 @@ pub struct GpuInfo {
 /// Starts the GPU thread. Returns once the GPU is set up and warmed up.
 pub fn spawn(
     jobs: Arc<Jobs>,
+    ratings: Arc<Ratings>,
     events: EventSink,
     tx: Sender<Command>,
     rx: Receiver<Command>,
@@ -225,7 +236,7 @@ pub fn spawn(
             };
             let allocator = spawn_allocator(&gpu, tx.clone());
             let _ = ready_tx.send(Ok(GpuInfo { adapter_name: gpu.adapter_name.clone(), uma: gpu.uma, warm_up_ms }));
-            Viewer::new(gpu, jobs, events, allocator, tx).run(rx);
+            Viewer::new(gpu, jobs, ratings, events, allocator, tx).run(rx);
         })
         .map_err(|e| e.to_string())?;
     let info = ready_rx.recv().map_err(|_| "the GPU thread stopped".to_string())??;
@@ -262,6 +273,15 @@ fn spawn_allocator(gpu: &Gpu, viewer: Sender<Command>) -> Sender<(u32, u32)> {
 struct Viewer {
     gpu: Gpu,
     jobs: Arc<Jobs>,
+    ratings: Arc<Ratings>,
+    /// Encodes and files developed previews off this thread.
+    writer: Sender<WriterJob>,
+    full_renderer: PreviewRenderer,
+    live_renderer: PreviewRenderer,
+    /// The photo in view has a committed edit whose preview isn't made yet.
+    pending: Option<Pending>,
+    /// When the user last did something (a key, a slider), which the background waits out.
+    last_activity: Instant,
     events: EventSink,
     allocator: Sender<(u32, u32)>,
     allocating: HashSet<(u32, u32)>,
@@ -289,11 +309,11 @@ struct Viewer {
     edit_mode: bool,
     crop_mode: bool,
     crop_center: (f32, f32),
-    /// Previews on the GPU, one per tier (quick, loupe, full size). Separate, so moving between
+    /// Previews on the GPU, one per tier (quick, loupe, full size, developed). Separate, so moving between
     /// tiers (sharpening up, zooming in and out) never swaps one texture between two sizes,
     /// which would reallocate it each time (50–170 ms on some laptops). Each is reused for the
     /// next photo, as a camera's previews are all the same size.
-    previews: [PreviewSlot; 3],
+    previews: [PreviewSlot; 4],
     /// The developed raw on the GPU, and which photo it is.
     image: Option<(usize, Image)>,
     dirty: bool,
@@ -301,10 +321,17 @@ struct Viewer {
 }
 
 impl Viewer {
-    fn new(gpu: Gpu, jobs: Arc<Jobs>, events: EventSink, allocator: Sender<(u32, u32)>, commands: Sender<Command>) -> Viewer {
+    fn new(gpu: Gpu, jobs: Arc<Jobs>, ratings: Arc<Ratings>, events: EventSink, allocator: Sender<(u32, u32)>, commands: Sender<Command>) -> Viewer {
+        let writer = spawn_writer(jobs.clone());
         Viewer {
             gpu,
             jobs,
+            ratings,
+            writer,
+            full_renderer: PreviewRenderer::new(),
+            live_renderer: PreviewRenderer::new(),
+            pending: None,
+            last_activity: Instant::now(),
             events,
             allocator,
             allocating: HashSet::new(),
@@ -356,13 +383,11 @@ impl Viewer {
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
-            } else if self.full_preview_to_upload().is_some() {
-                match rx.recv_timeout(Duration::from_millis(150)) {
+            } else if let Some(wait) = self.idle_wait() {
+                match rx.recv_timeout(wait) {
                     Ok(command) => command,
                     Err(RecvTimeoutError::Timeout) => {
-                        if let Err(e) = self.upload_full_preview() {
-                            eprintln!("windedit: uploading a preview failed: {e}");
-                        }
+                        self.idle_work();
                         continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -393,6 +418,13 @@ impl Viewer {
     }
 
     fn handle(&mut self, command: Command) {
+        // What the user does holds the background work off; what the engine's threads report doesn't.
+        if !matches!(
+            command,
+            Command::Ready(..) | Command::Allocated(_) | Command::ExportDecoded(..) | Command::ExportFinished(..) | Command::Snapshot(_) | Command::Prepare(..)
+        ) {
+            self.last_activity = Instant::now();
+        }
         match command {
             Command::Show(index) => {
                 if self.focus != Some(index) {
@@ -430,6 +462,7 @@ impl Viewer {
                     self.dirty = true;
                 }
             }
+            Command::Committed(index) => self.committed(index),
             Command::MaskOverlay(index) => {
                 if index != self.mask_overlay {
                     self.mask_overlay = index;
@@ -437,6 +470,10 @@ impl Viewer {
                 }
             }
             Command::EditMode(on) => {
+                // Back to the Cull view: its fitted picture is the developed preview, so make it now.
+                if !on && self.edit_mode {
+                    self.develop_pending();
+                }
                 self.edit_mode = on;
                 self.dirty = true;
             }
@@ -490,6 +527,7 @@ impl Viewer {
                     a.detached = true;
                 }
                 self.focus = None;
+                self.pending = None;
                 self.image = None;
                 for slot in &mut self.previews {
                     slot.of = None;
@@ -531,9 +569,13 @@ impl Viewer {
         if self.edit_mode || self.crop_mode {
             return &[Kind::Raw, Kind::Full, Kind::Loupe, Kind::Fast];
         }
+        // An edited photo's camera JPEG shows none of the edit: fitted, our own render stands in
+        // for it (the JPEG until that exists), and at 100% the raw is developed live.
+        let edited = self.is_edited();
         match self.zoom {
+            Zoom::Fit if edited => &[Kind::Developed, Kind::Loupe, Kind::Full, Kind::Fast],
             Zoom::Fit => &[Kind::Loupe, Kind::Full, Kind::Fast],
-            Zoom::Actual { .. } if self.has_full_size_jpeg(index) => &[Kind::Full, Kind::Raw, Kind::Loupe, Kind::Fast],
+            Zoom::Actual { .. } if !edited && self.has_full_size_jpeg(index) => &[Kind::Full, Kind::Raw, Kind::Loupe, Kind::Fast],
             Zoom::Actual { .. } | Zoom::Region { .. } | Zoom::Frame { .. } => &[Kind::Raw, Kind::Full, Kind::Loupe, Kind::Fast],
         }
     }
@@ -570,6 +612,11 @@ impl Viewer {
             return Ok(());
         }
         let Some(photo_size) = self.photo_size(index) else { return Ok(()) };
+        // An edited photo whose developed preview is being read from the cache: wait for it, so the
+        // unedited camera JPEG never flashes up first.
+        if !self.edit_mode && !self.crop_mode && matches!(self.zoom, Zoom::Fit) && self.is_edited() && self.jobs.developed_loading(index) {
+            return Ok(());
+        }
 
         // The best layer that's ready, put on the GPU if it isn't already.
         let mut open_ms = 0.0;
@@ -607,6 +654,13 @@ impl Viewer {
             None => Layer::Raw(&self.image.as_ref().unwrap().1),
             Some(s) => Layer::Preview(self.previews[s].texture.as_ref().unwrap()),
         };
+        // A developed preview is the edited photo already, cropped and turned: drawn whole, with
+        // none of the edit applied again. Its picture is the size of the crop, not of the photo.
+        let developed = kind == Kind::Developed;
+        let drawn_size = match (developed, slot) {
+            (true, Some(s)) => self.previews[s].texture.as_ref().map_or(photo_size, |t| (t.width, t.height)),
+            _ => photo_size,
+        };
         let (raw_width, raw_height) = self.jobs.raw(index).map_or((0, 0), |r| (r.width, r.height));
         let edit = self.edit;
         let masks = self.masks;
@@ -614,6 +668,7 @@ impl Viewer {
             eprintln!("windedit: brush layers failed: {e}");
         }
         let mask_input = MaskInput { masks: &masks, overlay: self.mask_overlay, brush: Some(&self.brush) };
+        let (draw_edit, draw_mask_input) = if developed { (Edit::default(), MaskInput::NONE) } else { (edit, mask_input) };
         let zoom = self.view_zoom();
         // What the view shows: the crop, or in crop mode the whole frame, and where on the view.
         let frame = geometry::frame_size(photo_size, edit.rotation);
@@ -626,13 +681,13 @@ impl Viewer {
             [m.origin[0], m.origin[1], m.step_x[0], m.step_x[1], m.step_y[0], m.step_y[1]]
         });
         let timings = match &mut self.presenter {
-            Some(p) => p.present(&mut self.gpu, |gpu, target| render_masked(gpu, layer, &edit, &mask_input, zoom, photo_size, target))?,
+            Some(p) => p.present(&mut self.gpu, |gpu, target| render_masked(gpu, layer, &draw_edit, &draw_mask_input, zoom, drawn_size, target))?,
             None => {
                 let target = self.offscreen.as_ref().unwrap();
                 let start = Instant::now();
                 self.gpu.begin()?;
                 let a = self.gpu.timestamp();
-                render_masked(&self.gpu, layer, &edit, &mask_input, zoom, photo_size, target);
+                render_masked(&self.gpu, layer, &draw_edit, &draw_mask_input, zoom, drawn_size, target);
                 let b = self.gpu.timestamp();
                 let ts = self.gpu.submit()?;
                 let gpu_ms = ts[b as usize] - ts[a as usize];
@@ -669,11 +724,13 @@ impl Viewer {
 }
 
 const FULL: usize = 2;
+const DEVELOPED: usize = 3;
 
 fn slot_for(kind: Kind) -> usize {
     match kind {
         Kind::Fast => 0,
         Kind::Loupe => 1,
+        Kind::Developed => DEVELOPED,
         _ => FULL,
     }
 }

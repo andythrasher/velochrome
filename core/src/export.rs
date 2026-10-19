@@ -185,24 +185,37 @@ impl TileRenderer {
 
     /// Records copying the top-left `w` × `h` of the target into the readback buffer.
     fn copy_to_readback(&self, gpu: &Gpu, w: u32, h: u32) {
-        let (uav, src_state) = (D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        gpu.transition(&self.target.texture, 0, uav, src_state);
-        unsafe {
-            let dst = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&self.readback),
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: self.footprint },
-            };
-            let src = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&self.target.texture),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-            };
-            let region = D3D12_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
-            gpu.list.CopyTextureRegion(&dst, 0, 0, 0, &src, Some(&region));
-        }
-        gpu.transition(&self.target.texture, 0, src_state, uav);
+        copy_to_readback(gpu, &self.target.texture, &self.readback, &self.footprint, w, h);
     }
+}
+
+/// Records copying the top-left `w` × `h` of a target texture into a readback buffer laid out as
+/// `footprint` says (the texture's whole footprint).
+pub(crate) fn copy_to_readback(
+    gpu: &Gpu,
+    texture: &ID3D12Resource,
+    readback: &ID3D12Resource,
+    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    w: u32,
+    h: u32,
+) {
+    let (uav, src_state) = (D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    gpu.transition(texture, 0, uav, src_state);
+    unsafe {
+        let dst = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(readback),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
+        };
+        let src = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(texture),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let region = D3D12_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
+        gpu.list.CopyTextureRegion(&dst, 0, 0, 0, &src, Some(&region));
+    }
+    gpu.transition(texture, 0, src_state, uav);
 }
 
 /// What the encoder thread made.

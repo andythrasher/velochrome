@@ -479,7 +479,8 @@ pub fn prepare(gpu: &Gpu, image: &Image, edit: &Edit, view: &ViewMap, out: (u32,
     let bounds = view_bounds(view, out, texture, lens.as_ref())?;
 
     // The level the view samples; an export tile always works at level 0.
-    let tile = matches!(zoom, Zoom::Region { .. });
+    // A developed preview is a Region too, but a shrunk one, and is made like the fitted view.
+    let tile = matches!(zoom, Zoom::Region { scale, .. } if scale >= 1.0);
     let mut level = if tile { 0 } else { (view.lod.floor() as u32).min(image.levels - 1) };
     // A view near 100% needs its level exactly; a zoomed-out one is fine a level coarser if the
     // region would be much bigger than the screen (a fitted 24-megapixel photo on a 1440p view).

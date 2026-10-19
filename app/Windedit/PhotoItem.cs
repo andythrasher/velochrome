@@ -45,7 +45,7 @@ public sealed partial class PhotoItem(int index, string name) : INotifyPropertyC
             Changed(nameof(FlagGlyph));
             Changed(nameof(LabelBrush));
             Changed(nameof(Dimming));
-            Changed(nameof(EditedGlyph));
+            Changed(nameof(EditedVisibility));
         }
     }
 
@@ -67,8 +67,8 @@ public sealed partial class PhotoItem(int index, string name) : INotifyPropertyC
 
     public Brush LabelBrush => metadata.Label is >= 1 and <= 6 ? LabelBrushes[metadata.Label - 1] : Transparent;
 
-    /// <summary>A pencil when the photo has adjustments.</summary>
-    public string EditedGlyph => metadata.Edited != 0 ? Glyph(0xE70F) : "";
+    /// <summary>The badge on the thumbnail (sliders on a dark disc) when the photo has adjustments.</summary>
+    public Visibility EditedVisibility => metadata.Edited != 0 ? Visibility.Visible : Visibility.Collapsed;
 
     /// <summary>Rejected photos fade back, as in Lightroom.</summary>
     public double Dimming => metadata.Pick == -1 ? 0.35 : 1.0;

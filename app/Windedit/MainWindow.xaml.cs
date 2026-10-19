@@ -17,7 +17,7 @@ namespace Windedit;
 /// </summary>
 public sealed partial class MainWindow : Window
 {
-    static readonly string[] LayerNames = ["", "quick preview", "loupe preview", "full-size preview", "raw"];
+    static readonly string[] LayerNames = ["", "quick preview", "loupe preview", "full-size preview", "raw", "developed preview"];
     static readonly string[] LabelNames = ["", "Red", "Yellow", "Green", "Blue", "Purple", "label"];
     static readonly string AppData = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Windedit");
