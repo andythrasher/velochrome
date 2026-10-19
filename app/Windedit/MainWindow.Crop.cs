@@ -467,11 +467,13 @@ public sealed partial class MainWindow
                 fe.Height = Math.Max(0, h);
             }
         }
-        // Darken the frame around the box: above and below it, then left and right.
-        Place(dim[0], f.X, f.Y, f.Width, r.Y - f.Y);
-        Place(dim[1], f.X, r.Bottom, f.Width, f.Bottom - r.Bottom);
-        Place(dim[2], f.X, r.Y, r.X - f.X, r.Height);
-        Place(dim[3], r.Right, r.Y, f.Right - r.Right, r.Height);
+        // Darken everything around the box: above and below it, then left and right. The whole view,
+        // not just the frame, since a turned photo's corners reach past the frame.
+        var all = new Rect(0, 0, CropCanvas.ActualWidth, CropCanvas.ActualHeight);
+        Place(dim[0], all.X, all.Y, all.Width, r.Y - all.Y);
+        Place(dim[1], all.X, r.Bottom, all.Width, all.Bottom - r.Bottom);
+        Place(dim[2], all.X, r.Y, r.X - all.X, r.Height);
+        Place(dim[3], r.Right, r.Y, all.Right - r.Right, r.Height);
         Place(cropBorder, r.X, r.Y, r.Width, r.Height);
         double[] xs = [r.X, r.X + r.Width / 2, r.Right], ys = [r.Y, r.Y + r.Height / 2, r.Bottom];
         var n = 0;

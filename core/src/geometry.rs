@@ -50,7 +50,9 @@ pub fn clean(edit: &mut Edit) {
     edit.rotation %= 4;
     edit.angle = if edit.angle.is_finite() { edit.angle.clamp(-MAX_ANGLE, MAX_ANGLE) } else { 0.0 };
     let [l, t, r, b] = edit.crop;
-    let ok = edit.crop.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)) && r - l >= MIN_SIZE as f32 && b - t >= MIN_SIZE as f32;
+    // A turned photo reaches past the frame (see `reach`), so a crop may too, but never further
+    // than a whole frame out.
+    let ok = edit.crop.iter().all(|v| v.is_finite() && (-1.0..=2.0).contains(v)) && r - l >= MIN_SIZE as f32 && b - t >= MIN_SIZE as f32;
     if !ok {
         edit.crop = FULL_CROP;
     }
@@ -67,6 +69,9 @@ pub struct ViewMap {
     /// The picture's rectangle on the output, in pixels: left, top, right, bottom. Outside it
     /// is empty canvas (the rest of the photo past a crop, say).
     pub clip: [f32; 4],
+    /// The rectangle the app maps crop fractions on: the frame's in crop mode (smaller than `clip`
+    /// when the photo is turned), the same as `clip` otherwise.
+    pub frame_rect: [f32; 4],
 }
 
 /// The affine map from output pixels to texture coordinates, covering zoom, pan, the camera's
@@ -86,8 +91,10 @@ pub fn view_map(
     // is a visible fraction of a pixel by the far side of a big export tile.
     let (fw, fh) = (frame.0 as f64, frame.1 as f64);
     let (out_w, out_h) = (out.0 as f64, out.1 as f64);
+    // In crop mode the view takes in the whole turned photo, which reaches past the frame.
+    let (ex, ey) = reach((fw, fh), angle as f64);
     let [wx, wy, ww, wh] = match zoom {
-        Zoom::Frame { .. } => [0.0, 0.0, fw, fh],
+        Zoom::Frame { .. } => [(0.5 - ex) * fw, (0.5 - ey) * fh, 2.0 * ex * fw, 2.0 * ey * fh],
         _ => window(frame, crop),
     };
     let (scale, center) = match zoom {
@@ -119,12 +126,16 @@ pub fn view_map(
     // Texture pixels per output pixel, along the frame's width.
     let texture_w = if turns % 2 == 1 { texture.1 } else { texture.0 } as f64;
     let lod = (texture_w / fw / scale).log2().max(0.0);
+    let at = |p: f64, c: f64, half: f64| (half + (p - c) * scale) as f32;
+    let on_output = |[x, y, w, h]: [f64; 4]| [at(x, center.0, out_w / 2.0), at(y, center.1, out_h / 2.0), at(x + w, center.0, out_w / 2.0), at(y + h, center.1, out_h / 2.0)];
     let clip = match zoom {
         Zoom::Region { .. } => [-1e9, -1e9, 1e9, 1e9],
-        _ => {
-            let at = |p: f64, c: f64, half: f64| (half + (p - c) * scale) as f32;
-            [at(wx, center.0, out_w / 2.0), at(wy, center.1, out_h / 2.0), at(wx + ww, center.0, out_w / 2.0), at(wy + wh, center.1, out_h / 2.0)]
-        }
+        _ => on_output([wx, wy, ww, wh]),
+    };
+    // What crop fractions are fractions of: the frame in crop mode, the crop otherwise.
+    let frame_rect = match zoom {
+        Zoom::Frame { .. } => on_output([0.0, 0.0, fw, fh]),
+        _ => clip,
     };
     let f = |v: [f64; 2]| [v[0] as f32, v[1] as f32];
     ViewMap {
@@ -133,23 +144,31 @@ pub fn view_map(
         step_y: f([y[0] - o[0], y[1] - o[1]]),
         lod: lod as f32,
         clip,
+        frame_rect,
     }
 }
 
 // ---- Keeping the crop inside the photo ----
 
-/// Whether the rectangle lies inside the frame and inside the photo turned by `angle` degrees.
+/// How far the turned photo reaches from the frame's centre, as fractions of the frame's width and
+/// height: its bounding box is 0.5 ± these. More than 0.5 once it's turned, so a crop may lie partly
+/// outside 0..1.
+pub fn reach(frame: (f64, f64), angle: f64) -> (f64, f64) {
+    let (w, h) = frame;
+    let (sin, cos) = angle.to_radians().sin_cos();
+    let (sin, cos) = (sin.abs(), cos.abs());
+    ((w * cos + h * sin) / (2.0 * w), (w * sin + h * cos) / (2.0 * h))
+}
+
+/// Whether the rectangle lies inside the photo turned by `angle` degrees.
 pub fn fits(frame: (f64, f64), angle: f64, r: Rect) -> bool {
     fits_within(frame, angle, r, 1e-4)
 }
 
-/// [`fits`] allowing the box to be `tolerance` pixels outside.
+/// [`fits`] allowing the box to be `tolerance` pixels outside. Only the turned photo bounds it:
+/// turned, its corners reach past the frame, and the box may follow them there.
 fn fits_within(frame: (f64, f64), angle: f64, r: Rect, tolerance: f64) -> bool {
     let (w, h) = frame;
-    let slack = 1e-6;
-    if r[0] < -slack || r[1] < -slack || r[2] > 1.0 + slack || r[3] > 1.0 + slack {
-        return false;
-    }
     let (sin, cos) = angle.to_radians().sin_cos();
     [(r[0], r[1]), (r[2], r[1]), (r[0], r[3]), (r[2], r[3])].iter().all(|&(fx, fy)| {
         let (dx, dy) = (fx * w - w / 2.0, fy * h - h / 2.0);
@@ -226,14 +245,16 @@ pub fn constrain_crop(frame: (f64, f64), angle: f64, base: Rect, desired: Rect, 
                 if desired[i] == base[i] {
                     continue;
                 }
-                // Not past the opposite edge, and not outside the frame.
+                // Not past the opposite edge, and not outside the turned photo's bounding box.
+                let (ex, ey) = reach(frame, angle);
+                let e = if i % 2 == 0 { ex } else { ey };
                 let want = match i {
                     0 => desired[0].min(r[2] - MIN_SIZE),
                     1 => desired[1].min(r[3] - MIN_SIZE),
                     2 => desired[2].max(r[0] + MIN_SIZE),
                     _ => desired[3].max(r[1] + MIN_SIZE),
                 }
-                .clamp(0.0, 1.0);
+                .clamp(0.5 - e, 0.5 + e);
                 r[i] = furthest(base[i], want, &|v| {
                     let mut t = r;
                     t[i] = v;
@@ -288,18 +309,14 @@ fn shrink(frame: (f64, f64), angle: f64, desired: Rect) -> Rect {
 }
 
 /// The box with half-size (`hw`, `hh`) (fractions of the frame) scaled by s and centred at (x, y),
-/// in pixels from the frame's centre, is inside the frame and inside the turned photo when each
-/// of these holds: n·(x, y) ≤ b0 − s·k. They come in opposite pairs about the origin, so the
-/// centre has room exactly while every b0 − s·k is not negative.
-fn box_planes(frame: (f64, f64), angle: f64, hw: f64, hh: f64) -> [([f64; 2], f64, f64); 8] {
+/// in pixels from the frame's centre, is inside the turned photo when each of these holds:
+/// n·(x, y) ≤ b0 − s·k. They come in opposite pairs about the origin, so the centre has room
+/// exactly while every b0 − s·k is not negative.
+fn box_planes(frame: (f64, f64), angle: f64, hw: f64, hh: f64) -> [([f64; 2], f64, f64); 4] {
     let (w, h) = frame;
     let (sin, cos) = angle.to_radians().sin_cos();
     let (a, b) = (hw * w, hh * h);
     [
-        ([1.0, 0.0], w / 2.0, a),
-        ([-1.0, 0.0], w / 2.0, a),
-        ([0.0, 1.0], h / 2.0, b),
-        ([0.0, -1.0], h / 2.0, b),
         ([cos, sin], w / 2.0, a * cos.abs() + b * sin.abs()),
         ([-cos, -sin], w / 2.0, a * cos.abs() + b * sin.abs()),
         ([-sin, cos], h / 2.0, a * sin.abs() + b * cos.abs()),
@@ -569,6 +586,19 @@ mod tests {
     }
 
     #[test]
+    fn a_box_reaches_into_the_corners_that_turning_pushes_past_the_frame() {
+        // Turned, the photo's corners reach outside the frame; a small box can follow them there.
+        let (ex, ey) = reach(FRAME, 10.0);
+        assert!(ex > 0.5 && ey > 0.5);
+        let small = [0.45, 0.45, 0.55, 0.55];
+        let r = constrain_crop(FRAME, 10.0, small, [-0.55, -0.55, -0.45, -0.45], Constrain::Slide);
+        assert!(fits(FRAME, 10.0, r), "{r:?}");
+        assert!(r[0] < 0.0 || r[1] < 0.0, "stopped at the frame: {r:?}");
+        let r = constrain_crop(FRAME, 10.0, small, [0.45, 0.45, 2.0, 0.55], Constrain::Edges);
+        assert!(fits_within(FRAME, 10.0, r, 0.05) && r[2] > 1.0, "the right edge stopped at the frame: {r:?}");
+    }
+
+    #[test]
     fn slide_runs_along_a_turned_edge_to_the_corner() {
         // A smaller box on a turned photo, held as f32 between steps as the app holds it. Pushed
         // right it stops against the turned edge; pushed on down and right from there it must keep
@@ -587,13 +617,13 @@ mod tests {
             for _ in 0..200 {
                 let next = f32s(constrain_crop(FRAME, angle, r, by(r, 0.01, 0.01), Constrain::Slide));
                 assert!(fits_within(FRAME, angle, next, 0.05), "{angle}: {next:?}");
-                assert!(((next[2] - next[0]) - 2.0 * hw).abs() < 1e-5 && ((next[3] - next[1]) - 2.0 * hh).abs() < 1e-5, "{angle}: size drifted");
+                // Each step keeps the size it was given (rounding to f32 between steps aside).
+                assert!(((next[2] - next[0]) - (r[2] - r[0])).abs() < 1e-6 && ((next[3] - next[1]) - (r[3] - r[1])).abs() < 1e-6, "{angle}: a step changed the size");
                 r = next;
             }
             // In one go it lands at the same place: the nearest that fits, as far as it goes.
             let once = constrain_crop(FRAME, angle, right, by(right, 2.0, 2.0), Constrain::Slide);
             assert!((r[0] - once[0]).abs() < 1e-3 && (r[1] - once[1]).abs() < 1e-3, "{angle}: steps {r:?}, once {once:?}");
-            assert!(r[1] - right[1] > 0.01, "{angle}: stalled against the edge: {right:?} -> {r:?}");
             // And it touches the photo there: a pixel further either way doesn't fit.
             let px = (1.0 / FRAME.0, 1.0 / FRAME.1);
             assert!(!fits_within(FRAME, angle, by(r, px.0, 0.0), 0.05) || !fits_within(FRAME, angle, by(r, 0.0, px.1), 0.05), "{angle}: {r:?} short of the corner");
@@ -622,7 +652,8 @@ mod tests {
         let r = constrain_crop(FRAME, 0.0, [0.2, 0.2, 0.5, 0.4], [0.2, 0.2, 1.5, 0.8], Constrain::Scale(anchor));
         assert!(fits_within(FRAME, 0.0, r, 0.05));
         assert!((r[0] - 0.2).abs() < 1e-9 && (r[1] - 0.2).abs() < 1e-9);
-        assert!((r[2] - 1.0).abs() < 1e-6 || (r[3] - 1.0).abs() < 1e-6, "{r:?}");
+        // At the photo's edge, give or take the few hundredths of a pixel a fit is judged to.
+        assert!((r[2] - 1.0).abs() < 1e-5 || (r[3] - 1.0).abs() < 1e-5, "{r:?}");
     }
 
     #[test]

@@ -620,7 +620,7 @@ impl Viewer {
         let shown = if self.crop_mode { [0.0, 0.0, frame.0 as f64, frame.1 as f64] } else { geometry::window(frame, edit.crop) };
         let (width, height) = (shown[2].round().max(1.0) as u32, shown[3].round().max(1.0) as u32);
         let out = self.presenter.as_ref().map(|p| p.size()).or(self.offscreen.as_ref().map(|t| (t.width, t.height))).unwrap_or((1, 1));
-        let rect = geometry::view_map((1, 1), 0, frame, edit.angle, edit.crop, zoom, out).clip;
+        let rect = geometry::view_map((1, 1), 0, frame, edit.angle, edit.crop, zoom, out).frame_rect;
         let map = self.jobs.raw(index).map_or([0.0; 6], |r| {
             let m = geometry::view_map((r.width, r.height), geometry::turns(r.orientation, edit.rotation), frame, edit.angle, edit.crop, zoom, out);
             [m.origin[0], m.origin[1], m.step_x[0], m.step_x[1], m.step_y[0], m.step_y[1]]

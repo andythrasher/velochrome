@@ -51,11 +51,11 @@ impl Default for Request {
     }
 }
 
-/// A rectangle of the frame, in pixels.
+/// A rectangle of the frame, in pixels (it may start left of or above the frame when the photo is turned).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Window {
-    pub x: u32,
-    pub y: u32,
+    pub x: i32,
+    pub y: i32,
     pub width: u32,
     pub height: u32,
 }
@@ -65,13 +65,16 @@ pub struct Window {
 /// that size, and the angle is applied by the render, not here.
 pub fn window(photo: (u32, u32), edit: &Edit) -> Window {
     let frame = geometry::frame_size(photo, edit.rotation);
-    let edge = |from: f32, to: f32, size: u32| {
-        let a = (from * size as f32).round().clamp(0.0, size as f32 - 1.0) as u32;
-        let b = (to * size as f32).round().clamp(a as f32 + 1.0, size as f32) as u32;
-        (a, b - a)
+    // A turned photo reaches past the frame, and so may its crop: within its bounding box.
+    let (ex, ey) = geometry::reach((frame.0 as f64, frame.1 as f64), edit.angle as f64);
+    let edge = |from: f32, to: f32, size: u32, e: f64| {
+        let (lo, hi) = (((0.5 - e) * size as f64).floor() as f32, ((0.5 + e) * size as f64).ceil() as f32);
+        let a = (from * size as f32).round().clamp(lo, hi - 1.0) as i32;
+        let b = (to * size as f32).round().clamp(a as f32 + 1.0, hi) as i32;
+        (a, (b - a) as u32)
     };
     let [l, t, r, b] = edit.crop;
-    let ((x, width), (y, height)) = (edge(l, r, frame.0), edge(t, b, frame.1));
+    let ((x, width), (y, height)) = (edge(l, r, frame.0, ex), edge(t, b, frame.1, ey));
     Window { x, y, width, height }
 }
 
@@ -144,7 +147,7 @@ impl TileRenderer {
         // The target may be bigger than this tile (at the right and bottom edges); the pass
         // only runs over the part that's used.
         let view = Target { texture: self.target.texture.clone(), width: tile_w, height: tile_h };
-        let zoom = Zoom::Region { x: (w.x + left) as f32, y: (w.y + top) as f32, scale: 1.0 };
+        let zoom = Zoom::Region { x: (w.x + left as i32) as f32, y: (w.y + top as i32) as f32, scale: 1.0 };
         gpu.begin()?;
         let a = gpu.timestamp();
         // Masks are in frame coordinates, so a tile needs nothing of them but the same set.
@@ -302,6 +305,9 @@ mod tests {
         // The frame is the turned photo: a quarter turn swaps the sides.
         let edit = Edit { rotation: 1, crop: [0.0, 0.0, 0.5, 1.0], ..Default::default() };
         assert_eq!(window((6000, 4000), &edit), Window { x: 0, y: 0, width: 2000, height: 6000 });
+        // Straightened, the crop may start left of the frame, into the turned photo's corner.
+        let edit = Edit { angle: 10.0, crop: [-0.02, 0.3, 0.2, 0.5], ..Default::default() };
+        assert_eq!(window((1000, 1000), &edit), Window { x: -20, y: 300, width: 220, height: 200 });
     }
 
     #[test]
