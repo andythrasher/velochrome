@@ -217,7 +217,7 @@ public sealed partial class MainWindow
             pair.Children.Add(slider);
             row.Children.Add(pair);
         }
-        Setting("Size", 1, 100, () => brushSize, v => brushSize = v, "How big the brush is: [ and ] change it");
+        Setting("Size", 1, 100, () => brushSize, v => brushSize = v, "How big the brush is: [ and ] or the mouse wheel change it");
         Setting("Feather", 0, 100, () => brushFeather, v => brushFeather = v, "How much of the brush, from its edge in, is soft");
         Setting("Flow", 1, 100, () => brushFlow, v => brushFlow = v, "How much each dab adds: low flow builds up as you paint over a spot");
         Setting("Density", 1, 100, () => brushDensity, v => brushDensity = v, "The most a stroke can add");
@@ -229,7 +229,7 @@ public sealed partial class MainWindow
             FocusKeys();
         };
         // Second line: the hint on the left, Erase on the right.
-        var hint = new TextBlock { Text = "Alt: erase · [ ]: size", FontSize = 11, Opacity = 0.6, VerticalAlignment = VerticalAlignment.Center };
+        var hint = new TextBlock { Text = "Alt: erase · [ ] or wheel: size", FontSize = 11, Opacity = 0.6, VerticalAlignment = VerticalAlignment.Center };
         eraseSwitch.HorizontalAlignment = HorizontalAlignment.Right;
         var second = new Grid { Margin = new Thickness(0, -4, 0, 0) };
         second.Children.Add(hint);
@@ -242,6 +242,31 @@ public sealed partial class MainWindow
     }
 
     readonly List<Action> brushRefresh = [];
+
+    /// <summary>The brush size the wheel is working toward. The slider holds whole numbers, so a high-resolution
+    /// wheel's small steps are kept here until they add up to one.</summary>
+    double wheelSize = 25;
+
+    /// <summary>The wheel over the photo with a brush selected: up for bigger, down for smaller, a tenth of the size
+    /// for every notch (120) so that it feels the same at any size.</summary>
+    void MaskPointerWheel(object sender, PointerRoutedEventArgs e)
+    {
+        if (!BrushActive)
+            return;
+        var p = e.GetCurrentPoint(MaskCanvas);
+        if (!MapReady(out var picture) || !picture.Contains(p.Position) || p.Properties.MouseWheelDelta == 0)
+            return;
+        e.Handled = true;
+        // Something else (the slider, [ and ]) has moved the size since the last turn: start from there.
+        if (Math.Round(wheelSize) != brushSize)
+            wheelSize = brushSize;
+        wheelSize = Math.Clamp(wheelSize * Math.Pow(1.1, p.Properties.MouseWheelDelta / 120.0), 1, 100);
+        brushSize = Math.Round(wheelSize);
+        brushHover = p.Position;
+        foreach (var refresh in brushRefresh)
+            refresh();
+        UpdateMaskOverlay();
+    }
 
     /// <summary>[ and ] make the brush smaller and bigger.</summary>
     void NudgeBrushSize(int direction)
@@ -723,6 +748,7 @@ public sealed partial class MainWindow
         MaskCanvas.PointerMoved += MaskPointerMoved;
         MaskCanvas.PointerReleased += MaskPointerReleased;
         MaskCanvas.PointerCaptureLost += (_, _) => EndMaskDrag();
+        MaskCanvas.PointerWheelChanged += MaskPointerWheel;
         MaskCanvas.PointerExited += (_, _) =>
         {
             if (mkGrab == Grab.None && brushHover != null)
