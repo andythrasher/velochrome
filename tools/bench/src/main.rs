@@ -569,7 +569,7 @@ fn xmp_check(files: &[PathBuf]) {
             let new_lines: Vec<&str> = out.lines().filter(|l| !old.contains(l)).collect();
             let foreign: Vec<&&str> = new_lines
                 .iter()
-                .filter(|l| !(l.contains("xmp:Rating") || l.contains("xmp:Label") || l.contains("windedit:") || l.contains("xmlns:windedit")))
+                .filter(|l| !(l.contains("xmp:Rating") || l.contains("xmp:Label") || l.contains("velochrome:") || l.contains("windedit:") || l.contains("xmlns:velochrome") || l.contains("xmlns:windedit")))
                 .collect();
             // At most one foreign line may change: the tag whose `>` our attributes now precede.
             if foreign.len() > 1 || out.lines().count() > text.lines().count() + 3 {

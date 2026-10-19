@@ -306,7 +306,7 @@ pub extern "C" fn we_lens_info(handle: *const Handle, index: i32, distortion: *m
 }
 
 /// The camera profiles available for photo `index`: writes up to `cap` profile ids (`Edit::profile`)
-/// into `ids` (always starting with `0` for "Windedit") and returns how many there are.
+/// into `ids` (always starting with `0` for "Velochrome") and returns how many there are.
 #[unsafe(no_mangle)]
 pub extern "C" fn we_photo_profiles(handle: *const Handle, index: i32, ids: *mut u32, cap: i32) -> i32 {
     guard(handle, |e| {
@@ -320,13 +320,13 @@ pub extern "C" fn we_photo_profiles(handle: *const Handle, index: i32, ids: *mut
     })
 }
 
-/// The display name of profile `id` (`0` is `"Windedit"`).
+/// The display name of profile `id` (`0` is `"Velochrome"`).
 #[unsafe(no_mangle)]
 pub extern "C" fn we_profile_name(id: u32, buf: *mut u16, len: u32) -> u32 {
-    // Profile 0 is Windedit's own look: it has no name in the registry (nothing goes in the
+    // Profile 0 is Velochrome's own look: it has no name in the registry (nothing goes in the
     // sidecar for it), but the app shows it by this one.
     match (id, crate::profile::name_of(id)) {
-        (0, _) => write_wide("Windedit", buf, len),
+        (0, _) => write_wide("Velochrome", buf, len),
         (_, Some(name)) => write_wide(&name, buf, len),
         (_, None) => 0,
     }

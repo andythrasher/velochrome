@@ -366,7 +366,7 @@ impl Engine {
     }
 
     /// The camera profiles available for photo `index`: `(id, name)` pairs starting with
-    /// `(0, "Windedit")`. Reads the camera make and model from the decoded raw if ready, or from
+    /// `(0, "Velochrome")`. Reads the camera make and model from the decoded raw if ready, or from
     /// the raw file's EXIF header.
     pub fn profiles(&self, index: usize) -> Vec<(u32, String)> {
         if let Some(raw) = self.jobs.raw(index) {
@@ -378,7 +378,7 @@ impl Engine {
         {
             return crate::profile::profiles_for_camera(&make, &model);
         }
-        vec![(0, "Windedit".into())]
+        vec![(0, "Velochrome".into())]
     }
 
     /// Creates or resizes the swap chain (physical pixels; `scale` is the view's DPI scale) and

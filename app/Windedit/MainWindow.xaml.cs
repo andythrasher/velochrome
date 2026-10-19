@@ -19,8 +19,7 @@ public sealed partial class MainWindow : Window
 {
     static readonly string[] LayerNames = ["", "quick preview", "loupe preview", "full-size preview", "raw", "developed preview"];
     static readonly string[] LabelNames = ["", "Red", "Yellow", "Green", "Blue", "Purple", "label"];
-    static readonly string AppData = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Windedit");
+    static readonly string AppData = DataFolder.Local;
     // Sensor sizes seen, so the next launch can allocate GPU memory for them before it's needed.
     static readonly string SizesFile = Path.Combine(AppData, "sizes.txt");
     static readonly string RecentFile = Path.Combine(AppData, "recent.txt");
@@ -54,6 +53,9 @@ public sealed partial class MainWindow : Window
     public MainWindow(string? startPath, string? fakeCard = null, string? fakeDest = null)
     {
         InitializeComponent();
+        var icon = Path.Combine(AppContext.BaseDirectory, "Assets", "Velochrome.ico");
+        if (File.Exists(icon))
+            AppWindow.SetIcon(icon);
         AppWindow.Resize(new Windows.Graphics.SizeInt32(1700, 1100));
         ui = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
         engine = new Engine();
@@ -131,7 +133,7 @@ public sealed partial class MainWindow : Window
             all[i] = new PhotoItem(i, engine.PhotoName(i)) { Metadata = metadata[i] };
         if (!isCard)
             RememberRecent(path);
-        Title = $"{(isCard ? cardLabel : Path.GetFileName(path))} – Windedit";
+        Title = $"{(isCard ? cardLabel : Path.GetFileName(path))} – Velochrome";
         position = -1;
         ApplyFilters(photoPath != null ? engine.FindPhoto(photoPath) : -1);
     }
@@ -423,7 +425,7 @@ public sealed partial class MainWindow : Window
                 break;
             case VirtualKey.F12:
                 // Diagnostic: what the engine drew, to compare with the screen.
-                engine.SaveSnapshot(Path.Combine(Path.GetTempPath(), "windedit-snapshot.png"));
+                engine.SaveSnapshot(Path.Combine(Path.GetTempPath(), "velochrome-snapshot.png"));
                 break;
             default:
                 return;

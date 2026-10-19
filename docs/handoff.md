@@ -1,13 +1,12 @@
 # Handoff (2026-10-18)
 
-Where Windedit stands, how the work has been run, and what comes next. Conventions and build
+Where Velochrome stands, how the work has been run, and what comes next. Conventions and build
 commands are in [AGENTS.md](../AGENTS.md).
 
 ## The user and their setup
 
-- Shoots an **OM System OM-5 Mark II** (ORF) and a **Lumix S1** (RW2); an **S9** too. Library in
-  `C:\Users\Andy\Pictures\2026\<yyyy-MM-dd>\` (read-only for us). Uses Lightroom today and wants
-  Windedit to match its look and beat its speed.
+- Shoots an **OM System OM-5 Mark II** (ORF) and a **Lumix S1** (RW2); an **S9** too. Library in  the user's photo library, in dated folders (read-only for us). Uses Lightroom today and wants
+  Velochrome to match its look and beat its speed.
 - Desktop: i7-14700F, RTX 5060 Ti, 4K monitor at 150%. Laptop: Core Ultra 7 256V, Arc 140V
   (16 GB shared), which runs the published build in `artifacts\windedit-phase0`.
 - Unsigned builds copied to other PCs are blocked by Smart App Control (signing is a later item).
@@ -64,7 +63,7 @@ findings and what the exports will settle.
 
 Paste this to start:
 
-> You're picking up Windedit, a GPL-3.0 Lightroom-style raw photo editor for Windows (Rust +
+> You're picking up Velochrome, a GPL-3.0 Lightroom-style raw photo editor for Windows (Rust +
 > Direct3D 12 engine in `core/`, C# WinUI 3 app in `app/Windedit/`) at `C:\dev\windedit`.
 > Read `AGENTS.md` and `docs/handoff.md` first, then `docs/camera-profiles.md`, which is the
 > next milestone. Before writing code, read the parts of the develop pass the design touches
@@ -75,7 +74,7 @@ Paste this to start:
 > with tests on the real files under `C:\ProgramData\Adobe\CameraRaw\CameraProfiles`, the
 > renderer in the develop pass (default profile bit-identical and no slower, checked with
 > `bench`), the profile registry, the `Edit` field and sidecar, the drop-down in the Edit panel,
-> and the previews' fingerprint. Never write into `C:\Users\Andy\Pictures\2026`; use scratch
+> and the previews' fingerprint. Never write into the user's photo library; use scratch
 > copies. Don't commit until I say so. When done, report what you built, how closely Camera
 > Natural and Camera Vivid match Lightroom on a few OM-5 Mark II and S1 photos, timings, and
 > screenshots in both themes.

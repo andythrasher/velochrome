@@ -144,7 +144,7 @@ public sealed unsafe partial class Engine : IDisposable
         public float HueRed, HueOrange, HueYellow, HueGreen, HueAqua, HueBlue, HuePurple, HueMagenta;
         public float SaturationRed, SaturationOrange, SaturationYellow, SaturationGreen, SaturationAqua, SaturationBlue, SaturationPurple, SaturationMagenta;
         public float LuminanceRed, LuminanceOrange, LuminanceYellow, LuminanceGreen, LuminanceAqua, LuminanceBlue, LuminancePurple, LuminanceMagenta;
-        /// <summary>The camera profile id from the registry (0 is Windedit's default look).</summary>
+        /// <summary>The camera profile id from the registry (0 is Velochrome's default look).</summary>
         public uint Profile;
 
         public const int MixerFields = 24;
@@ -352,7 +352,7 @@ public sealed unsafe partial class Engine : IDisposable
     public (bool Distortion, bool ChromaticAberration)? LensInfo(int index) =>
         Check(we_lens_info(handle, index, out var d, out var c)) == 1 ? (d != 0, c != 0) : null;
 
-    /// <summary>The camera profiles available for a photo, starting with (0, "Windedit").</summary>
+    /// <summary>The camera profiles available for a photo, starting with (0, "Velochrome").</summary>
     public (uint Id, string Name)[] PhotoProfiles(int index)
     {
         var ids = stackalloc uint[64];

@@ -9,7 +9,7 @@ functions.
 ## How it was measured
 
 - **The reference shots.** The user took screenshots of three photos (an S1 RW2, two OM-5 II
-  ORFs) in Lightroom and in Windedit, at each tone slider's ±50 and ±100 and Exposure ±2: 118
+  ORFs) in Lightroom and in Velochrome, at each tone slider's ±50 and ±100 and Exposure ±2: 118
   screenshots, listed in `slider training photos/manifest.csv` (the images themselves stay
   out of git).
 - **`tools/tonefit`** does the measuring:

@@ -50,19 +50,19 @@ reference JPEGs from Lightroom; tonefit already compares renders with screenshot
 
 ## Data, storage, UI
 
-- **Registry**: on startup, scan the Adobe folders (if present) and Windedit's own profile
-  folders (`<app>\Profiles`, `%APPDATA%\Windedit\Profiles`), reading each DCP's
+- **Registry**: on startup, scan the Adobe folders (if present) and Velochrome's own profile
+  folders (`<app>\Profiles`, `%APPDATA%\Velochrome\Profiles`), reading each DCP's
   `UniqueCameraModel` and `ProfileName`. Match a photo by its camera model (the EXIF make/model
   mapped to Adobe's naming: "OM Digital Solutions OM-5 Mark II", "Panasonic DC-S1"). Parse
   lazily, cache parsed tables.
-- **Edit**: a `profile` field that is default-safe when zeroed (0 = Windedit's default look),
+- **Edit**: a `profile` field that is default-safe when zeroed (0 = Velochrome's default look),
   holding an id from the registry; the sidecar stores the profile's **name** (as Lightroom's
-  `crs:CameraProfile`, e.g. "Camera Natural", plus our own `windedit:Profile`), so it survives
+  `crs:CameraProfile`, e.g. "Camera Natural", plus our own `velochrome:Profile`), so it survives
   a different registry order and reads Lightroom's choice when present.
 - **Developed previews**: the fingerprint (`developed.rs`) must include the profile, and
   `RENDER_VERSION` bumps when the renderer's look changes.
 - **UI**: a Profile drop-down at the top of the Edit panel's first group, as Lightroom's:
-  Windedit default, then Camera Matching (this camera's), then Adobe Standard, then our own
+  Velochrome default, then Camera Matching (this camera's), then Adobe Standard, then our own
   looks; hovering an entry previews it live (the GPU makes this cheap). Later an Amount slider
   for creative looks.
 - **Auto camera match** (step 2): the raw records the picture mode (Olympus maker notes

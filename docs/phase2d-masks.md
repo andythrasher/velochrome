@@ -68,7 +68,7 @@ unchanged.
   keeps them engine-side (see below).
 - Engine/FFI: `set_masks(index, &Masks, commit)` alongside `set_edit`; the undo history keeps
   `(Edit, Masks)` pairs so undo covers both; `show` sends both.
-- **Sidecar**: written only when there are masks, in Windedit's own namespace (as other
+- **Sidecar**: written only when there are masks, in Velochrome's own namespace (as other
   non-Lightroom fields are), one element per mask with its components and non-default
   sliders. Reading Lightroom's `crs:MaskGroupBasedCorrections` is later.
 - **GPU**: the masks go in their own structured buffer (a new SRV, t6), not the tone

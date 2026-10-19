@@ -291,9 +291,28 @@ public sealed partial class MainWindow
         group.Children.Add(row);
     }
 
+    const string BetaProfileTip = "Beta: this profile's brightness doesn't match Lightroom yet (it renders 0.3–0.8 stops darker).";
+
+    /// <summary>The camera-matching and Adobe Standard profiles read from Adobe's files; a profile the user added is not beta.</summary>
+    static bool IsBetaProfile(uint id, string name) =>
+        id != 0 && (name.StartsWith("Camera ", StringComparison.Ordinal) || name == "Adobe Standard");
+
+    /// <summary>The profile's name with a small "Beta" tag after it.</summary>
+    static DataTemplate? betaProfileTemplate;
+    static DataTemplate BetaProfileTemplate => betaProfileTemplate ??= (DataTemplate)Microsoft.UI.Xaml.Markup.XamlReader.Load(
+        "<DataTemplate xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\">" +
+        "<StackPanel Orientation=\"Horizontal\" Spacing=\"8\"><TextBlock Text=\"{Binding}\" VerticalAlignment=\"Center\"/>" +
+        "<Border CornerRadius=\"4\" Padding=\"5,1,5,2\" VerticalAlignment=\"Center\" Background=\"{ThemeResource ControlFillColorSecondaryBrush}\">" +
+        "<TextBlock Text=\"Beta\" FontSize=\"10\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\"/></Border></StackPanel></DataTemplate>");
+
     void AddProfileItem(uint id, string name)
     {
         var item = new ComboBoxItem { Content = name, Tag = id };
+        if (IsBetaProfile(id, name))
+        {
+            item.ContentTemplate = BetaProfileTemplate;
+            ToolTipService.SetToolTip(item, BetaProfileTip);
+        }
         item.PointerEntered += (_, _) =>
         {
             if (!profileBox.IsDropDownOpen || CurrentPhoto is not { } p)
@@ -348,6 +367,9 @@ public sealed partial class MainWindow
             }
         }
         profileBox.SelectedIndex = index;
+        var chosenItem = profileBox.Items[index] as ComboBoxItem;
+        var beta = chosenItem is { Tag: uint chosenId, Content: string chosenName } && IsBetaProfile(chosenId, chosenName);
+        ToolTipService.SetToolTip(profileBox, beta ? "Camera profile (beta). " + BetaProfileTip : "Camera profile");
     }
 
     /// <summary>The photo whose lens data the switches were set from, or -1 until it is known.</summary>

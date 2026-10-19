@@ -23,7 +23,7 @@ What [the Phase 1 plan](phase1-plan.md) asked of 1b, and what was built and meas
   Bridge and Photo Mechanic read the same file.
 - **Stars and labels** use the standard `xmp:Rating` and `xmp:Label`, with Lightroom's label
   names.
-- **Picks and rejects** go in our own namespace, `urn:windedit:1.0` (`windedit:Pick` = 1 or −1).
+- **Picks and rejects** go in our own namespace, `urn:velochrome:1.0` (`velochrome:Pick` = 1 or −1).
   There's no standard field: Lightroom keeps flags only in its catalog. It's a URN so it claims
   no web domain while the app's name is provisional. Bridge's "rating −1 means rejected" is read,
   but never written, since it would lose the stars.

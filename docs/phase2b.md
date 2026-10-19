@@ -173,7 +173,7 @@ doesn't), Texture and Clarity (a band-pass step would slot in before `sharpen`).
 
 ### Edit fields
 
-Eight, as offsets from the defaults (C# struct matching): `windedit:SharpenAmount/Radius/Detail/Masking`,
+Eight, as offsets from the defaults (C# struct matching): `velochrome:SharpenAmount/Radius/Detail/Masking`,
 `NoiseLuminance`, `NoiseLuminanceDetail`, `NoiseColor`, `NoiseColorDetail`, written only when not default;
 `Edit::detail()` / `set_detail()`. The develop constants stay 60 words (the three spare words in the matrix
 rows carry the detail rectangle). Panel: a Detail group after Presence with the zoom note.
@@ -208,7 +208,7 @@ Texture and Clarity (`bench partb <raw>` runs the checks; crops and screenshots 
 ### Edit fields and panel
 
 `Edit.texture` and `Edit.clarity`, −100 to 100, default 0, so no offset is needed (zeroed `Edit` is the default); the C#
-struct has them after `NoiseColorDetail`. Sidecar: `windedit:Texture` and `windedit:Clarity`, written only when not
+struct has them after `NoiseColorDetail`. Sidecar: `velochrome:Texture` and `velochrome:Clarity`, written only when not
 zero (round trips, damaged values and "defaults leave nothing" tested in `xmp.rs` and `develop.rs`). The panel has
 Texture and Clarity in Presence, above Vibrance. `Detail::texture` makes a non-zero Texture count as "not neutral", so
 Texture alone starts the detail pass.

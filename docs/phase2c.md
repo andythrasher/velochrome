@@ -71,7 +71,7 @@ in that order (`HueRed` … `LuminanceMagenta`), with `GetMixer`/`WithMixer` by 
 
 ## Sidecar
 
-`windedit:HueRed` … `windedit:HueMagenta`, `windedit:SaturationRed` …, `windedit:LuminanceRed` …, written only when not
+`velochrome:HueRed` … `velochrome:HueMagenta`, `velochrome:SaturationRed` …, `velochrome:LuminanceRed` …, written only when not
 zero; damaged values are put in range (`clean_mixer`). Tests: each of the 24 alone, all together into a new sidecar and into
 the Lightroom sample, zeros write nothing, damage, and back-to-zero removes them. `bench xmpcheck` on the Lightroom
 Imports sidecars: 271 update cleanly, 0 don't.

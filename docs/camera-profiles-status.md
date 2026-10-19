@@ -34,12 +34,12 @@ About 700 lines added to existing files, plus the two new files.
   `get(make, model, id)` resolves a name for a camera. `id_for_lightroom_name` maps Lightroom's
   names ("Adobe Color" → 0). `profiles_for_camera` maps EXIF make/model to Adobe's naming. It
   finds 11 profiles for the OM-5 Mark II and 13 for the DC-S1. Test
-  `registry_discovers_camera_profiles`. Windedit's own folders (`<app>\Profiles`,
-  `%APPDATA%\Windedit\Profiles`) are **not** scanned yet.
+  `registry_discovers_camera_profiles`. Velochrome's own folders (`<app>\Profiles`,
+  `%APPDATA%\Velochrome\Profiles`) are **not** scanned yet.
 - **`exif.rs`**: `camera_make_model(path)` reads Make/Model from the first 64 KB.
-- **Edit field**: `Edit::profile: u32` (0 = Windedit's look, so a zeroed field is safe), mirrored
+- **Edit field**: `Edit::profile: u32` (0 = Velochrome's look, so a zeroed field is safe), mirrored
   in `Engine.cs`.
-- **Sidecar** (`xmp.rs`): writes `windedit:Profile="<name>"` only when the profile isn't the
+- **Sidecar** (`xmp.rs`): writes `velochrome:Profile="<name>"` only when the profile isn't the
   default. On reading it falls back to Lightroom's `crs:CameraProfile`. Test
   `profile_round_trips_and_reads_lightroom_crs`. It does **not** write `crs:CameraProfile`. The
   design mentions both; decide whether we should write Lightroom's attribute too.
@@ -93,7 +93,7 @@ About 700 lines added to existing files, plus the two new files.
 2. **Camera Natural and Vivid probably don't match yet**, especially Vivid on the S1.
    - Numbers below: brightness RMS in stops over the 5th–98th percentiles, then mean OkLab ΔE.
 
-   | Photo | vs | Windedit | Adobe Std | Natural | Vivid |
+   | Photo | vs | Velochrome | Adobe Std | Natural | Vivid |
    |---|---|---|---|---|---|
    | PA150285 (OM) | camera JPEG | 0.58 / .043 | 0.55 / .036 | 0.64 / .055 | 0.62 / .054 |
    | P6140518 (OM) | camera JPEG | 0.29 / .029 | 0.29 / .027 | 0.29 / .035 | 0.26 / .034 |
@@ -102,7 +102,7 @@ About 700 lines added to existing files, plus the two new files.
    | P1018088 (S1, LR used Natural) | camera JPEG | 0.15 / .068 | 0.14 / .069 | 0.31 / .075 | **0.75 / .108** |
    | P1018129 (S1, LR used Vivid) | camera JPEG | 0.25 / .037 | 0.22 / .036 | 0.33 / .046 | **0.80 / .094** |
 
-   - Adobe Standard comes out about as close as Windedit's own look, which is a good sign for the
+   - Adobe Standard comes out about as close as Velochrome's own look, which is a good sign for the
      matrices and the HueSatMap.
    - Natural and Vivid should land *closer* to the camera JPEG than Adobe Standard, since that's
      what Adobe fitted them to. Here they're further away. Vivid on the S1 is off by about
@@ -122,7 +122,7 @@ About 700 lines added to existing files, plus the two new files.
    the user to export JPEGs from Lightroom with Camera Natural and with Camera Vivid at default
    sliders (OM-5 II: PA150285, P6140518, P5280801; S1: P1020780, P1018088, P1018129). The bench
    then needs a small change to compare against those exports. The Lightroom sidecars that use
-   these profiles are in `C:\Users\Andy\Pictures\Lightroom Imports\`; treat that folder as
+   these profiles are in the user's Lightroom imports folder; treat that folder as
    read-only too.
 
 ## Review (2026-10-19)
@@ -179,14 +179,14 @@ About 700 lines added to existing files, plus the two new files.
     camera for "Camera" profiles, or confirm the rule for applying `BaselineExposureOffset`.
 
 - **App** (driven on scratch copies, both themes):
-  - The drop-down lists Windedit, then the camera's profiles, then Adobe Standard, correctly per
+  - The drop-down lists Velochrome, then the camera's profiles, then Adobe Standard, correctly per
     camera.
   - Hover previews and Esc reverts. A click commits, with undo; the sidecar gets
-    `windedit:Profile` and loses it again at the default.
+    `velochrome:Profile` and loses it again at the default.
   - Edited previews regenerate.
   - Three UI bugs were fixed in `MainWindow.Edit.cs` and `MainWindow.xaml.cs`: clicking an entry
     never committed, Esc also left the loupe, and the default entry was blank. For the blank
-    entry, `we_profile_name(0)` now returns "Windedit".
+    entry, `we_profile_name(0)` now returns "Velochrome".
   - Keyboard selection in the open list is untested.
 
 ## Not done (before the review)
@@ -200,14 +200,14 @@ About 700 lines added to existing files, plus the two new files.
   - that the sidecar is written;
   - that edited previews regenerate when the profile changes;
   - screenshots in the light and dark themes.
-- The drop-down order the design asks for is Windedit, then Camera Matching, then Adobe Standard.
+- The drop-down order the design asks for is Velochrome, then Camera Matching, then Adobe Standard.
   Check that it does this.
-- Windedit's own profile folders in the registry.
+- Velochrome's own profile folders in the registry.
 - A real 4K timing for the profile kernels (problem 1).
 
 ## Prompt for the next session
 
-> You're reviewing and finishing step 1 of Windedit's camera profiles milestone at
+> You're reviewing and finishing step 1 of Velochrome's camera profiles milestone at
 > `C:\dev\windedit`. Read `AGENTS.md`, `docs/handoff.md`, `docs/camera-profiles.md` and then
 > `docs/camera-profiles-status.md`, which describes the uncommitted work from the previous session
 > and its known problems. Review the diff (`git diff`, plus the new `core/src/profile.rs` and
@@ -215,5 +215,5 @@ About 700 lines added to existing files, plus the two new files.
 > in `bench profiles` and measure the profile path honestly. Find out why Camera Natural and
 > especially Camera Vivid (S1) render about 0.3–0.8 stops off the camera JPEGs. Keep the default
 > profile bit-identical (`bench masks` hashes). Then build and drive the app on scratch copies and
-> take screenshots in both themes. Never write into `C:\Users\Andy\Pictures\2026` or
-> `Lightroom Imports`. Don't commit until I say so.
+> take screenshots in both themes. Never write into the user's photo library or
+> Lightroom imports folder. Don't commit until I say so.

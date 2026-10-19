@@ -5,5 +5,12 @@ obj/
 .vs/
 /artifacts
 
-# Lightroom comparison screenshots (hundreds of MB; kept locally)
-/slider training photos/*/
+
+# Calibration screenshots and their manifest (paths into the author's own library)
+/slider training photos/
+
+# Store packages and the test signing certificate (see tools/package.ps1)
+*.msix
+*.msixupload
+*.pfx
+*.cer

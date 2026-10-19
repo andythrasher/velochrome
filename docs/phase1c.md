@@ -42,8 +42,8 @@ per photo, for the session. A pencil on a thumbnail marks a photo with adjustmen
 
 ## Saved in the sidecar
 
-Adjustments go in the same `.xmp` as the ratings, in our namespace: `windedit:Exposure`,
-`windedit:Temperature` and `windedit:Tint` (only for a custom white balance), and so on. Only
+Adjustments go in the same `.xmp` as the ratings, in our namespace: `velochrome:Exposure`,
+`velochrome:Temperature` and `velochrome:Tint` (only for a custom white balance), and so on. Only
 values that differ from as shot are written, rounded to two decimals; one file per photo. All
 271 Lightroom sidecars still update cleanly with them.
 

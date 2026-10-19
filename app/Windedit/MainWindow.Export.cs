@@ -52,13 +52,13 @@ public sealed partial class MainWindow
         $"quality={exportQuality}",
     ]);
 
-    /// <summary>Where exports go unless another folder is chosen: Windedit Exports in Pictures (which may be redirected).</summary>
+    /// <summary>Where exports go unless another folder is chosen: Velochrome Exports in Pictures (which may be redirected).</summary>
     static string DefaultChosenFolder()
     {
         var pictures = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures);
         if (string.IsNullOrEmpty(pictures))
             pictures = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Pictures");
-        return Path.Combine(pictures, "Windedit Exports");
+        return Path.Combine(pictures, "Velochrome Exports");
     }
 
     /// <summary>A long path with its middle left out, so the ends (drive and folder) show.</summary>

@@ -1,7 +1,7 @@
 # Lens correction
 
 Micro Four Thirds and Lumix S cameras record distortion (and, for OM System, lateral chromatic
-aberration) correction values in the raw file and expect the converter to apply them. Windedit
+aberration) correction values in the raw file and expect the converter to apply them. Velochrome
 reads them and applies them in the develop pass. The camera's own JPEG is already corrected, so
 it's the reference for checking (`bench lens`). The code is `core/src/lens.rs`; the maths follows
 darktable's embedded-metadata lens correction (`src/iop/lens.cc`, `src/common/exif.cc`, GPL-3.0),

@@ -4,13 +4,13 @@ namespace Windedit;
 
 public partial class App : Application
 {
-    static readonly string CrashLog = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Windedit", "crash.log");
+    static readonly string CrashLog = Path.Combine(DataFolder.Local, "crash.log");
 
     MainWindow? window;
 
     public App()
     {
+        DataFolder.MigrateFromWindedit();
         InitializeComponent();
         // Record crashes, but still crash: nothing here marks them handled.
         UnhandledException += (_, e) => LogCrash("XAML", e.Exception);

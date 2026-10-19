@@ -32,7 +32,7 @@ Unedited photos are unchanged: the camera's JPEG is the fast path and stays it.
     for this are dropped from the cache right after.
   - Undo, a pasted or reset edit, or a sidecar changed elsewhere all just make the cached one
     stale (see the key below), so it's re-rendered by the same rules.
-- **Cache**: `%LOCALAPPDATA%\Windedit\Previews\`. File name: a hash of the raw's path, size and
+- **Cache**: `%LOCALAPPDATA%\Velochrome\Previews\`. File name: a hash of the raw's path, size and
   modified time, plus a fingerprint of everything that changes the render (the `Edit`, the
   `Masks`, the brush strokes, the camera profile when that comes, and a render version number
   bumped whenever the pipeline's look changes). So an entry is valid exactly while its

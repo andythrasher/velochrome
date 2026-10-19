@@ -13,7 +13,7 @@ sliders do:
 - `crop`: left, top, right, bottom, as fractions of the frame (defined below). The default,
   [0, 0, 1, 1], is no crop.
 
-In the sidecar: `windedit:Rotation`, `windedit:CropAngle`, `windedit:CropLeft`, `CropTop`,
+In the sidecar: `velochrome:Rotation`, `velochrome:CropAngle`, `velochrome:CropLeft`, `CropTop`,
 `CropRight` and `CropBottom`, written only when they differ from the default, like the
 sliders.
 
@@ -69,7 +69,7 @@ space after that, so the crop works on the corrected photo.
 
 ## Later
 
-- Reading Lightroom's `crs:Crop*` when there's no Windedit crop.
+- Reading Lightroom's `crs:Crop*` when there's no Velochrome crop.
 - Cropped and rotated thumbnails.
 - A straighten ruler (draw along a horizon).
 - Auto-straighten.

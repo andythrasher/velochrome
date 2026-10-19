@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The Microsoft Store (MSIX) package. Only used by the packaged build (tools/package.ps1); the
+  everyday build runs unpackaged.
+
+  BEFORE SUBMITTING, replace the three PLACEHOLDER values below with the ones from Partner Center
+  (Product management > Product identity). They must match it exactly:
+    Identity Name            ->  "Package/Identity/Name"
+    Identity Publisher       ->  "Package/Identity/Publisher"   (a "CN=..." string)
+    PublisherDisplayName     ->  "Package/Properties/PublisherDisplayName"
+  Raise Version for every submission (the last part must stay 0 for the Store).
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap3 rescap">
+
+  <Identity
+    Name="PLACEHOLDER.Velochrome"
+    Publisher="CN=PLACEHOLDER-PUBLISHER-ID"
+    Version="1.0.0.0" />
+
+  <Properties>
+    <DisplayName>Velochrome</DisplayName>
+    <PublisherDisplayName>PLACEHOLDER Publisher Display Name</PublisherDisplayName>
+    <Logo>Assets\Package\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <!-- Windows 11 and later, as the project's TargetPlatformMinVersion. -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-US" />
+  </Resources>
+
+  <Applications>
+    <Application Id="App" Executable="$targetnametoken$.exe" EntryPoint="$targetentrypoint$">
+      <uap:VisualElements
+        DisplayName="Velochrome"
+        Description="A fast raw photo editor: cull, develop and export your raw photos, with GPU-accelerated editing."
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Package\Square150x150Logo.png"
+        Square44x44Logo="Assets\Package\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Package\Wide310x150Logo.png"
+                         Square310x310Logo="Assets\Package\LargeTile.png"
+                         Square71x71Logo="Assets\Package\SmallTile.png" />
+        <uap:SplashScreen Image="Assets\Package\SplashScreen.png" BackgroundColor="#1B2030" />
+      </uap:VisualElements>
+      <Extensions>
+        <!-- "Open with > Velochrome" for the raw formats it is tested with; the path arrives on the command line. -->
+        <uap3:Extension Category="windows.fileTypeAssociation">
+          <uap3:FileTypeAssociation Name="velochrome.raw" Parameters="&quot;%1&quot;">
+            <uap:DisplayName>Raw photo</uap:DisplayName>
+            <uap:SupportedFileTypes>
+              <uap:FileType>.orf</uap:FileType>
+              <uap:FileType>.rw2</uap:FileType>
+            </uap:SupportedFileTypes>
+          </uap3:FileTypeAssociation>
+        </uap3:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- A regular desktop app: it reads and writes photo folders anywhere the user opens. -->
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

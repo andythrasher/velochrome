@@ -172,5 +172,5 @@ a few raw files, and from a terminal in that folder run:
 ```
 bench.exe decode <folder of raws>
 bench.exe gpu <folder of raws>
-Windedit.exe <a raw file>
+Velochrome.exe <a raw file>
 ```

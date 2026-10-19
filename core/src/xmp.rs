@@ -22,7 +22,9 @@ use crate::geometry;
 pub const NS_RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 pub const NS_XMP: &str = "http://ns.adobe.com/xap/1.0/";
 pub const NS_CRS: &str = "http://ns.adobe.com/camera-raw-settings/1.0/";
-/// Our namespace. A URN, so it claims no web domain; the app's name is still provisional.
+/// Our namespace. A URN, so it claims no web domain.
+pub const NS_VELOCHROME: &str = "urn:velochrome:1.0";
+/// The namespace from when the app was called Windedit. Still read, and moved to ours on the next write.
 pub const NS_WINDEDIT: &str = "urn:windedit:1.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -40,13 +42,13 @@ pub struct Metadata {
     /// Lightroom's label names: Red, Yellow, Green, Blue, Purple.
     pub label: Option<String>,
     pub pick: Pick,
-    /// The adjustments, saved in our namespace (`windedit:Exposure` and so on). Only those
+    /// The adjustments, saved in our namespace (`velochrome:Exposure` and so on). Only those
     /// that differ from the photo as shot are written.
     pub edit: Edit,
-    /// The local adjustments (docs/phase2d-masks.md), `windedit:Masks` as one line of text
+    /// The local adjustments (docs/phase2d-masks.md), `velochrome:Masks` as one line of text
     /// (`masks::to_text`). None when there are none; never Some of an empty set.
     pub masks: Option<Arc<crate::masks::Masks>>,
-    /// The brush strokes of the masks brush components, `windedit:Strokes` (`masks::strokes_to_text`).
+    /// The brush strokes of the masks brush components, `velochrome:Strokes` (`masks::strokes_to_text`).
     /// None when there are none.
     pub strokes: Option<crate::masks::Strokes>,
 }
@@ -62,7 +64,13 @@ pub fn read(path: &Path) -> Metadata {
 }
 
 pub fn parse(text: &str) -> Option<Metadata> {
-    let scan = scan(text).ok()?;
+    let mut scan = scan(text).ok()?;
+    // A sidecar from the Windedit days has its values in the old namespace; ours win where both are present.
+    for (now, old) in scan.props.iter_mut().zip(scan.legacy.iter_mut()) {
+        if now.is_none() {
+            *now = old.take();
+        }
+    }
     let mut meta = Metadata::default();
     let rating: i32 = scan.props[RATING].as_ref().and_then(|p| p.value.trim().parse().ok()).unwrap_or(0);
     meta.rating = rating.clamp(0, 5) as u8;
@@ -139,11 +147,11 @@ pub fn new_sidecar(meta: &Metadata) -> String {
         }
     }
     format!(
-        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Windedit\">\n \
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Velochrome\">\n \
          <rdf:RDF xmlns:rdf=\"{NS_RDF}\">\n  \
          <rdf:Description rdf:about=\"\"\n    \
          xmlns:xmp=\"{NS_XMP}\"\n    \
-         xmlns:windedit=\"{NS_WINDEDIT}\"{attrs}/>\n \
+         xmlns:velochrome=\"{NS_VELOCHROME}\"{attrs}/>\n \
          </rdf:RDF>\n</x:xmpmeta>\n"
     )
 }
@@ -158,13 +166,19 @@ fn pick_value(pick: Pick) -> Option<&'static str> {
 
 /// `text` with our values changed to `meta`'s and nothing else touched.
 pub fn update(text: &str, meta: &Metadata) -> Result<String, String> {
-    let scan = scan(text)?;
+    let mut scan = scan(text)?;
     let first = scan.descriptions.first().ok_or("no rdf:Description to put the rating in")?;
 
     // Leave a zero rating out unless the file already has one (Lightroom writes 0).
     let wanted = values(meta, scan.props[RATING].is_some());
 
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    // Old-namespace values are dropped; whatever they held is written again in ours below.
+    for old in scan.legacy.iter_mut() {
+        if let Some(old) = old.take() {
+            edits.push((old.whole.clone(), String::new()));
+        }
+    }
     let mut insert = String::new();
     let mut declare: Vec<(&str, &str)> = Vec::new();
     for (i, want) in wanted.iter().enumerate() {
@@ -209,64 +223,64 @@ const FIRST_EDIT: usize = 3;
 const PROPS: [(&str, &str, &str); 36 + MIXER_FIELDS] = [
     (NS_XMP, "xmp", "Rating"),
     (NS_XMP, "xmp", "Label"),
-    (NS_WINDEDIT, "windedit", "Pick"),
-    (NS_WINDEDIT, "windedit", "Exposure"),
-    (NS_WINDEDIT, "windedit", "Temperature"),
-    (NS_WINDEDIT, "windedit", "Tint"),
-    (NS_WINDEDIT, "windedit", "Contrast"),
-    (NS_WINDEDIT, "windedit", "Highlights"),
-    (NS_WINDEDIT, "windedit", "Shadows"),
-    (NS_WINDEDIT, "windedit", "Whites"),
-    (NS_WINDEDIT, "windedit", "Blacks"),
-    (NS_WINDEDIT, "windedit", "Vibrance"),
-    (NS_WINDEDIT, "windedit", "Saturation"),
-    (NS_WINDEDIT, "windedit", "CropAngle"),
-    (NS_WINDEDIT, "windedit", "CropLeft"),
-    (NS_WINDEDIT, "windedit", "CropTop"),
-    (NS_WINDEDIT, "windedit", "CropRight"),
-    (NS_WINDEDIT, "windedit", "CropBottom"),
-    (NS_WINDEDIT, "windedit", "Rotation"),
-    (NS_WINDEDIT, "windedit", "VignetteAmount"),
-    (NS_WINDEDIT, "windedit", "VignetteMidpoint"),
-    (NS_WINDEDIT, "windedit", "LensDistortion"),
-    (NS_WINDEDIT, "windedit", "LensChromaticAberration"),
-    (NS_WINDEDIT, "windedit", "SharpenAmount"),
-    (NS_WINDEDIT, "windedit", "SharpenRadius"),
-    (NS_WINDEDIT, "windedit", "SharpenDetail"),
-    (NS_WINDEDIT, "windedit", "SharpenMasking"),
-    (NS_WINDEDIT, "windedit", "NoiseLuminance"),
-    (NS_WINDEDIT, "windedit", "NoiseLuminanceDetail"),
-    (NS_WINDEDIT, "windedit", "NoiseColor"),
-    (NS_WINDEDIT, "windedit", "NoiseColorDetail"),
-    (NS_WINDEDIT, "windedit", "Texture"),
-    (NS_WINDEDIT, "windedit", "Clarity"),
-    (NS_WINDEDIT, "windedit", "HueRed"),
-    (NS_WINDEDIT, "windedit", "HueOrange"),
-    (NS_WINDEDIT, "windedit", "HueYellow"),
-    (NS_WINDEDIT, "windedit", "HueGreen"),
-    (NS_WINDEDIT, "windedit", "HueAqua"),
-    (NS_WINDEDIT, "windedit", "HueBlue"),
-    (NS_WINDEDIT, "windedit", "HuePurple"),
-    (NS_WINDEDIT, "windedit", "HueMagenta"),
-    (NS_WINDEDIT, "windedit", "SaturationRed"),
-    (NS_WINDEDIT, "windedit", "SaturationOrange"),
-    (NS_WINDEDIT, "windedit", "SaturationYellow"),
-    (NS_WINDEDIT, "windedit", "SaturationGreen"),
-    (NS_WINDEDIT, "windedit", "SaturationAqua"),
-    (NS_WINDEDIT, "windedit", "SaturationBlue"),
-    (NS_WINDEDIT, "windedit", "SaturationPurple"),
-    (NS_WINDEDIT, "windedit", "SaturationMagenta"),
-    (NS_WINDEDIT, "windedit", "LuminanceRed"),
-    (NS_WINDEDIT, "windedit", "LuminanceOrange"),
-    (NS_WINDEDIT, "windedit", "LuminanceYellow"),
-    (NS_WINDEDIT, "windedit", "LuminanceGreen"),
-    (NS_WINDEDIT, "windedit", "LuminanceAqua"),
-    (NS_WINDEDIT, "windedit", "LuminanceBlue"),
-    (NS_WINDEDIT, "windedit", "LuminancePurple"),
-    (NS_WINDEDIT, "windedit", "LuminanceMagenta"),
-    (NS_WINDEDIT, "windedit", "Masks"),
-    (NS_WINDEDIT, "windedit", "Strokes"),
-    (NS_WINDEDIT, "windedit", "Profile"),
+    (NS_VELOCHROME, "velochrome", "Pick"),
+    (NS_VELOCHROME, "velochrome", "Exposure"),
+    (NS_VELOCHROME, "velochrome", "Temperature"),
+    (NS_VELOCHROME, "velochrome", "Tint"),
+    (NS_VELOCHROME, "velochrome", "Contrast"),
+    (NS_VELOCHROME, "velochrome", "Highlights"),
+    (NS_VELOCHROME, "velochrome", "Shadows"),
+    (NS_VELOCHROME, "velochrome", "Whites"),
+    (NS_VELOCHROME, "velochrome", "Blacks"),
+    (NS_VELOCHROME, "velochrome", "Vibrance"),
+    (NS_VELOCHROME, "velochrome", "Saturation"),
+    (NS_VELOCHROME, "velochrome", "CropAngle"),
+    (NS_VELOCHROME, "velochrome", "CropLeft"),
+    (NS_VELOCHROME, "velochrome", "CropTop"),
+    (NS_VELOCHROME, "velochrome", "CropRight"),
+    (NS_VELOCHROME, "velochrome", "CropBottom"),
+    (NS_VELOCHROME, "velochrome", "Rotation"),
+    (NS_VELOCHROME, "velochrome", "VignetteAmount"),
+    (NS_VELOCHROME, "velochrome", "VignetteMidpoint"),
+    (NS_VELOCHROME, "velochrome", "LensDistortion"),
+    (NS_VELOCHROME, "velochrome", "LensChromaticAberration"),
+    (NS_VELOCHROME, "velochrome", "SharpenAmount"),
+    (NS_VELOCHROME, "velochrome", "SharpenRadius"),
+    (NS_VELOCHROME, "velochrome", "SharpenDetail"),
+    (NS_VELOCHROME, "velochrome", "SharpenMasking"),
+    (NS_VELOCHROME, "velochrome", "NoiseLuminance"),
+    (NS_VELOCHROME, "velochrome", "NoiseLuminanceDetail"),
+    (NS_VELOCHROME, "velochrome", "NoiseColor"),
+    (NS_VELOCHROME, "velochrome", "NoiseColorDetail"),
+    (NS_VELOCHROME, "velochrome", "Texture"),
+    (NS_VELOCHROME, "velochrome", "Clarity"),
+    (NS_VELOCHROME, "velochrome", "HueRed"),
+    (NS_VELOCHROME, "velochrome", "HueOrange"),
+    (NS_VELOCHROME, "velochrome", "HueYellow"),
+    (NS_VELOCHROME, "velochrome", "HueGreen"),
+    (NS_VELOCHROME, "velochrome", "HueAqua"),
+    (NS_VELOCHROME, "velochrome", "HueBlue"),
+    (NS_VELOCHROME, "velochrome", "HuePurple"),
+    (NS_VELOCHROME, "velochrome", "HueMagenta"),
+    (NS_VELOCHROME, "velochrome", "SaturationRed"),
+    (NS_VELOCHROME, "velochrome", "SaturationOrange"),
+    (NS_VELOCHROME, "velochrome", "SaturationYellow"),
+    (NS_VELOCHROME, "velochrome", "SaturationGreen"),
+    (NS_VELOCHROME, "velochrome", "SaturationAqua"),
+    (NS_VELOCHROME, "velochrome", "SaturationBlue"),
+    (NS_VELOCHROME, "velochrome", "SaturationPurple"),
+    (NS_VELOCHROME, "velochrome", "SaturationMagenta"),
+    (NS_VELOCHROME, "velochrome", "LuminanceRed"),
+    (NS_VELOCHROME, "velochrome", "LuminanceOrange"),
+    (NS_VELOCHROME, "velochrome", "LuminanceYellow"),
+    (NS_VELOCHROME, "velochrome", "LuminanceGreen"),
+    (NS_VELOCHROME, "velochrome", "LuminanceAqua"),
+    (NS_VELOCHROME, "velochrome", "LuminanceBlue"),
+    (NS_VELOCHROME, "velochrome", "LuminancePurple"),
+    (NS_VELOCHROME, "velochrome", "LuminanceMagenta"),
+    (NS_VELOCHROME, "velochrome", "Masks"),
+    (NS_VELOCHROME, "velochrome", "Strokes"),
+    (NS_VELOCHROME, "velochrome", "Profile"),
 ];
 
 /// The edit's fields, in PROPS order from FIRST_EDIT.
@@ -439,6 +453,8 @@ struct Scan {
     /// Lightroom's crs:Preset, are left alone.
     descriptions: Vec<Description>,
     props: Vec<Option<Found>>,
+    /// The same values found under the old windedit: namespace.
+    legacy: Vec<Option<Found>>,
     crs_profile: Option<String>,
 }
 
@@ -447,9 +463,9 @@ fn scan(text: &str) -> Result<Scan, String> {
     let mut scopes: Vec<HashMap<String, String>> = vec![HashMap::new()];
     // (namespace, local name, index of the top-level Description it's in, if any)
     let mut stack: Vec<(String, String, Option<usize>)> = Vec::new();
-    let mut result = Scan { descriptions: Vec::new(), props: PROPS.iter().map(|_| None).collect(), crs_profile: None };
+    let mut result = Scan { descriptions: Vec::new(), props: PROPS.iter().map(|_| None).collect(), legacy: PROPS.iter().map(|_| None).collect(), crs_profile: None };
     // An element-form value being read: (prop, start of its whitespace, start of content).
-    let mut open_prop: Option<(usize, usize, usize, usize)> = None;
+    let mut open_prop: Option<(usize, bool, usize, usize, usize)> = None;
 
     for token in &tokens {
         match token {
@@ -473,26 +489,26 @@ fn scan(text: &str) -> Result<Scan, String> {
                     result.descriptions.push(Description { prefixes: scope.clone(), attrs_end: *attrs_end });
                     for a in attrs.iter().filter(|a| !a.name.starts_with("xmlns")) {
                         let (ans, alocal) = resolve(&a.name, &scope, false);
-                        if let Some(i) = prop_index(&ans, &alocal)
-                            && result.props[i].is_none()
+                        if let Some((i, old)) = prop_slot(&ans, &alocal)
+                            && result.slot(i, old).is_none()
                         {
-                            result.props[i] =
+                            *result.slot(i, old) =
                                 Some(Found { value: a.value.clone(), value_range: a.value_range.clone(), whole: a.whole.clone() });
                         } else if ans == NS_CRS && alocal == "CameraProfile" && result.crs_profile.is_none() {
                             result.crs_profile = Some(a.value.clone());
                         }
                     }
                 } else if parent.is_some_and(|p| p.2.is_some() && is_description(p))
-                    && let Some(i) = prop_index(&ns, &local)
-                    && result.props[i].is_none()
+                    && let Some((i, old)) = prop_slot(&ns, &local)
+                    && result.slot(i, old).is_none()
                 {
                     // Element form, e.g. <xmp:Rating>3</xmp:Rating>, directly in a Description.
                     let ws_start = text[..range.start].trim_end_matches([' ', '\t', '\r', '\n']).len();
                     if *empty {
-                        result.props[i] =
+                        *result.slot(i, old) =
                             Some(Found { value: String::new(), value_range: range.clone(), whole: ws_start..range.end });
                     } else {
-                        open_prop = Some((i, ws_start, range.end, stack.len()));
+                        open_prop = Some((i, old, ws_start, range.end, stack.len()));
                     }
                 }
 
@@ -502,11 +518,11 @@ fn scan(text: &str) -> Result<Scan, String> {
                 }
             }
             Token::End { range } => {
-                if let Some((i, ws_start, content_start, depth)) = open_prop
+                if let Some((i, old, ws_start, content_start, depth)) = open_prop
                     && stack.len() == depth + 1
                 {
                     let content = content_start..range.start;
-                    result.props[i] = Some(Found {
+                    *result.slot(i, old) = Some(Found {
                         value: unescape(&text[content.clone()]),
                         value_range: content,
                         whole: ws_start..range.end,
@@ -525,8 +541,17 @@ fn is_description(entry: &(String, String, Option<usize>)) -> bool {
     entry.0 == NS_RDF && entry.1 == "Description"
 }
 
-fn prop_index(ns: &str, local: &str) -> Option<usize> {
-    PROPS.iter().position(|&(pns, _, plocal)| pns == ns && plocal == local)
+impl Scan {
+    fn slot(&mut self, i: usize, old: bool) -> &mut Option<Found> {
+        if old { &mut self.legacy[i] } else { &mut self.props[i] }
+    }
+}
+
+/// The index of the property for this name, and whether it's in the old Windedit namespace.
+fn prop_slot(ns: &str, local: &str) -> Option<(usize, bool)> {
+    let old = ns == NS_WINDEDIT;
+    let ns = if old { NS_VELOCHROME } else { ns };
+    PROPS.iter().position(|&(pns, _, plocal)| pns == ns && plocal == local).map(|i| (i, old))
 }
 
 /// (namespace URI, local name). Unprefixed attributes have no namespace; unprefixed elements
@@ -709,9 +734,9 @@ mod tests {
         assert_eq!(
             changed,
             vec![
-                "    xmlns:windedit=\"urn:windedit:1.0\"".to_string(),
+                "    xmlns:velochrome=\"urn:velochrome:1.0\"".to_string(),
                 "   crs:Exposure2012=\"+0.35\"".to_string(), // the tag's `>` moved after our new attributes
-                "   windedit:Pick=\"1\">".to_string(),
+                "   velochrome:Pick=\"1\">".to_string(),
                 "   xmp:Label=\"Red\"".to_string(),
                 "   xmp:Rating=\"4\"".to_string(),
             ]
@@ -725,7 +750,7 @@ mod tests {
         let expected = LIGHTROOM.replace(
             "crs:Exposure2012=\"+0.35\">",
             "crs:Exposure2012=\"+0.35\"
-    xmlns:windedit=\"urn:windedit:1.0\">",
+    xmlns:velochrome=\"urn:velochrome:1.0\">",
         );
         assert_eq!(cleared, expected);
     }
@@ -762,13 +787,13 @@ mod tests {
         };
         let meta = Metadata { rating: 2, edit, ..Default::default() };
         let fresh = new_sidecar(&meta);
-        assert!(fresh.contains("windedit:Exposure=\"0.35\"") && !fresh.contains("Contrast"), "{fresh}");
+        assert!(fresh.contains("velochrome:Exposure=\"0.35\"") && !fresh.contains("Contrast"), "{fresh}");
         assert_eq!(parse(&fresh), Some(meta.clone()));
         // Into Lightroom's file too, and back out again: only defaults left, nothing written.
         let out = update(LIGHTROOM, &meta).unwrap();
         assert_eq!(parse(&out), Some(meta));
         let back = update(&out, &Metadata { rating: 2, ..Default::default() }).unwrap();
-        assert!(!back.contains("windedit:Exposure") && !back.contains("windedit:Temperature"));
+        assert!(!back.contains("velochrome:Exposure") && !back.contains("velochrome:Temperature"));
     }
 
     #[test]
@@ -776,8 +801,8 @@ mod tests {
         let edit = Edit { rotation: 3, angle: -2.35, crop: [0.0125, 0.1, 0.9, 0.87654], ..Default::default() };
         let meta = Metadata { edit, ..Default::default() };
         let fresh = new_sidecar(&meta);
-        assert!(fresh.contains("windedit:Rotation=\"3\"") && fresh.contains("windedit:CropAngle=\"-2.35\""), "{fresh}");
-        assert!(fresh.contains("windedit:CropLeft=\"0.0125\"") && fresh.contains("windedit:CropBottom=\"0.87654\""), "{fresh}");
+        assert!(fresh.contains("velochrome:Rotation=\"3\"") && fresh.contains("velochrome:CropAngle=\"-2.35\""), "{fresh}");
+        assert!(fresh.contains("velochrome:CropLeft=\"0.0125\"") && fresh.contains("velochrome:CropBottom=\"0.87654\""), "{fresh}");
         // The default edges are left out: only the left, top and bottom here.
         assert!(!fresh.contains("CropRight=\"1\""));
         assert_eq!(parse(&fresh), Some(meta.clone()));
@@ -790,7 +815,7 @@ mod tests {
         assert_eq!(read.crop, [0.0, 0.0, 1.0, 1.0]);
         assert!(read.is_default());
         // A damaged crop reads as none.
-        let bad = out.replace("windedit:CropLeft=\"0.0125\"", "windedit:CropLeft=\"0.95\"");
+        let bad = out.replace("velochrome:CropLeft=\"0.0125\"", "velochrome:CropLeft=\"0.95\"");
         assert_eq!(parse(&bad).unwrap().edit.crop, [0.0, 0.0, 1.0, 1.0]);
     }
 
@@ -799,8 +824,8 @@ mod tests {
         let edit = Edit { vignette_amount: -35.5, vignette_midpoint: 20.0, no_distortion: 1, no_chromatic_aberration: 1, ..Default::default() };
         let meta = Metadata { edit, ..Default::default() };
         let fresh = new_sidecar(&meta);
-        assert!(fresh.contains("windedit:VignetteAmount=\"-35.5\"") && fresh.contains("windedit:VignetteMidpoint=\"70\""), "{fresh}");
-        assert!(fresh.contains("windedit:LensDistortion=\"0\"") && fresh.contains("windedit:LensChromaticAberration=\"0\""), "{fresh}");
+        assert!(fresh.contains("velochrome:VignetteAmount=\"-35.5\"") && fresh.contains("velochrome:VignetteMidpoint=\"70\""), "{fresh}");
+        assert!(fresh.contains("velochrome:LensDistortion=\"0\"") && fresh.contains("velochrome:LensChromaticAberration=\"0\""), "{fresh}");
         assert_eq!(parse(&fresh), Some(meta.clone()));
         let out = update(LIGHTROOM, &meta).unwrap();
         assert_eq!(parse(&out), Some(meta));
@@ -822,7 +847,7 @@ mod tests {
         assert_eq!(parse(&bad).unwrap().edit.vignette_amount, 100.0);
         // Back to the defaults takes them out of the file.
         let back = update(&out, &Metadata::default()).unwrap();
-        assert!(!back.contains("windedit:Vignette") && !back.contains("windedit:Lens"));
+        assert!(!back.contains("velochrome:Vignette") && !back.contains("velochrome:Lens"));
     }
 
     #[test]
@@ -841,9 +866,9 @@ mod tests {
         });
         let meta = Metadata { edit, ..Default::default() };
         let fresh = new_sidecar(&meta);
-        assert!(fresh.contains("windedit:SharpenAmount=\"85\"") && fresh.contains("windedit:NoiseColor=\"0\""), "{fresh}");
-        assert!(fresh.contains("windedit:SharpenRadius=\"1.6\""), "{fresh}");
-        assert!(fresh.contains("windedit:Texture=\"-35\"") && fresh.contains("windedit:Clarity=\"60\""), "{fresh}");
+        assert!(fresh.contains("velochrome:SharpenAmount=\"85\"") && fresh.contains("velochrome:NoiseColor=\"0\""), "{fresh}");
+        assert!(fresh.contains("velochrome:SharpenRadius=\"1.6\""), "{fresh}");
+        assert!(fresh.contains("velochrome:Texture=\"-35\"") && fresh.contains("velochrome:Clarity=\"60\""), "{fresh}");
         assert_eq!(parse(&fresh).unwrap().edit.clarity, 60.0);
         assert_eq!(parse(&fresh).unwrap().edit.detail(), meta.edit.detail());
         let out = update(LIGHTROOM, &meta).unwrap();
@@ -874,7 +899,7 @@ mod tests {
         assert_eq!((d.amount, d.color_detail), (150.0, 50.0));
         // Back to the defaults takes them out of the file.
         let back = update(&out, &Metadata::default()).unwrap();
-        assert!(!back.contains("windedit:Sharpen") && !back.contains("windedit:Noise"));
+        assert!(!back.contains("velochrome:Sharpen") && !back.contains("velochrome:Noise"));
     }
 
     #[test]
@@ -885,9 +910,9 @@ mod tests {
         }
         let meta = Metadata { edit, ..Default::default() };
         let fresh = new_sidecar(&meta);
-        assert!(fresh.contains("windedit:HueOrange=\"37.5\"") && fresh.contains("windedit:HueYellow=\"-100\""), "{fresh}");
-        assert!(fresh.contains("windedit:SaturationRed=\"37.5\"") || fresh.contains("windedit:SaturationRed=\"-1\"") || fresh.contains("windedit:SaturationRed=\"100\""), "{fresh}");
-        assert!(!fresh.contains("windedit:HueRed"), "zero is not written: {fresh}");
+        assert!(fresh.contains("velochrome:HueOrange=\"37.5\"") && fresh.contains("velochrome:HueYellow=\"-100\""), "{fresh}");
+        assert!(fresh.contains("velochrome:SaturationRed=\"37.5\"") || fresh.contains("velochrome:SaturationRed=\"-1\"") || fresh.contains("velochrome:SaturationRed=\"100\""), "{fresh}");
+        assert!(!fresh.contains("velochrome:HueRed"), "zero is not written: {fresh}");
         assert_eq!(parse(&fresh), Some(meta.clone()));
         let out = update(LIGHTROOM, &meta).unwrap();
         assert_eq!(parse(&out), Some(meta));
@@ -897,7 +922,7 @@ mod tests {
             one.mixer[i] = if i % 2 == 0 { -42.0 } else { 71.0 };
             let m = Metadata { edit: one, ..Default::default() };
             let text = new_sidecar(&m);
-            assert_eq!(text.matches("windedit:").count() - 1, 1, "only one value: {text}"); // the namespace declaration is the other
+            assert_eq!(text.matches("velochrome:").count() - 1, 1, "only one value: {text}"); // the namespace declaration is the other
             assert_eq!(parse(&text), Some(m), "slider {i}");
         }
         // Zeros leave nothing in the file; a file without them reads as zeros.
@@ -910,7 +935,7 @@ mod tests {
         assert_eq!((e.mixer[1], e.mixer[2]), (100.0, 0.0));
         // Back to zero takes them out of the file.
         let back = update(&out, &Metadata::default()).unwrap();
-        assert!(!back.contains("windedit:Hue") && !back.contains("windedit:Saturation") && !back.contains("windedit:Luminance"));
+        assert!(!back.contains("velochrome:Hue") && !back.contains("velochrome:Saturation") && !back.contains("velochrome:Luminance"));
     }
 
     #[test]
@@ -928,17 +953,17 @@ mod tests {
         masks.count = 1;
         let meta = Metadata { rating: 1, edit: Edit { exposure: 0.5, ..Default::default() }, masks: Some(Arc::new(masks)), ..Default::default() };
         let fresh = new_sidecar(&meta);
-        assert!(fresh.contains("windedit:Masks=\"amount=70 exposure=-0.75 contrast=30 | L+ 0.1 0.1 0.4 0.5 | R- 0.5 0.3 0.2 0.1 0.4 25 1\""), "{fresh}");
+        assert!(fresh.contains("velochrome:Masks=\"amount=70 exposure=-0.75 contrast=30 | L+ 0.1 0.1 0.4 0.5 | R- 0.5 0.3 0.2 0.1 0.4 25 1\""), "{fresh}");
         assert_eq!(parse(&fresh), Some(meta.clone()));
         // Into Lightroom's file, and back out: gone again, with everything else of ours.
         let out = update(LIGHTROOM, &meta).unwrap();
         assert_eq!(parse(&out), Some(meta.clone()));
         let back = update(&out, &Metadata { rating: 1, ..Default::default() }).unwrap();
-        assert!(!back.contains("windedit:Masks") && !back.contains("windedit:Exposure"), "{back}");
+        assert!(!back.contains("velochrome:Masks") && !back.contains("velochrome:Exposure"), "{back}");
         // Masks alone make an edited photo's sidecar; no masks write nothing, and damage reads as none.
         let plain = new_sidecar(&Metadata { rating: 1, ..Default::default() });
         assert!(!plain.contains("Masks") && parse(&plain).unwrap().masks.is_none());
-        let bad = fresh.replace("windedit:Masks=\"", "windedit:Masks=\"zz | ");
+        let bad = fresh.replace("velochrome:Masks=\"", "velochrome:Masks=\"zz | ");
         assert_eq!(parse(&bad).unwrap().masks.unwrap().masks[0].count, 2);
         assert!(parse(&fresh.replace("amount=70 exposure=-0.75 contrast=30 | L+ 0.1 0.1 0.4 0.5 | R- 0.5 0.3 0.2 0.1 0.4 25 1", "")).unwrap().masks.is_none());
     }
@@ -953,7 +978,7 @@ mod tests {
     fn new_sidecar_round_trips() {
         let meta = Metadata { rating: 3, label: Some("Green".into()), pick: Pick::Rejected, ..Default::default() };
         assert_eq!(parse(&new_sidecar(&meta)), Some(meta.clone()));
-        let path = std::env::temp_dir().join(format!("windedit-xmp-test-{}.xmp", std::process::id()));
+        let path = std::env::temp_dir().join(format!("velochrome-xmp-test-{}.xmp", std::process::id()));
         let _ = std::fs::remove_file(&path);
         write(&path, &meta).unwrap();
         assert_eq!(read(&path), meta);
@@ -967,7 +992,7 @@ mod tests {
         let id = crate::profile::id_for_name("Camera Natural");
         let meta = Metadata { edit: Edit { profile: id, ..Default::default() }, ..Default::default() };
         let fresh = new_sidecar(&meta);
-        assert!(fresh.contains("windedit:Profile=\"Camera Natural\""), "{fresh}");
+        assert!(fresh.contains("velochrome:Profile=\"Camera Natural\""), "{fresh}");
         assert_eq!(parse(&fresh), Some(meta.clone()));
 
         // Default profile (0) writes nothing.
@@ -979,5 +1004,77 @@ mod tests {
         assert_eq!(parse(&lr_color).unwrap().edit.profile, 0);
         let lr_vivid = LIGHTROOM.replace("crs:Exposure2012=\"+0.35\"", "crs:CameraProfile=\"Camera Vivid\"");
         assert_eq!(parse(&lr_vivid).unwrap().edit.profile, crate::profile::id_for_name("Camera Vivid"));
+    }
+
+    /// A sidecar as Windedit wrote it, with Lightroom's own settings beside our values.
+    const OLD_WINDEDIT: &str = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Windedit">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:windedit="urn:windedit:1.0"
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+   xmp:Rating="3"
+   crs:Saturation="+5"
+   windedit:Exposure="0.5"
+   windedit:Contrast="12"
+   windedit:Masks="amount=70 exposure=-0.75 contrast=30 | L+ 0.1 0.1 0.4 0.5"
+   windedit:Profile="Camera Natural"/>
+ </rdf:RDF>
+</x:xmpmeta>
+"#;
+
+    #[test]
+    fn old_windedit_sidecar_is_read_and_migrated() {
+        let meta = parse(OLD_WINDEDIT).unwrap();
+        assert_eq!(meta.rating, 3);
+        assert_eq!(meta.edit.exposure, 0.5);
+        assert_eq!(meta.edit.contrast, 12.0);
+        assert!(meta.masks.is_some());
+        assert_eq!(meta.edit.profile, crate::profile::id_for_name("Camera Natural"));
+
+        // Rewriting moves every field to the new namespace and keeps Lightroom's.
+        let out = update(OLD_WINDEDIT, &meta).unwrap();
+        assert!(!out.contains("windedit:Exposure") && !out.contains("windedit:Masks") && !out.contains("windedit:Profile"), "{out}");
+        assert!(out.contains("velochrome:Exposure=\"0.5\"") && out.contains("velochrome:Contrast=\"12\""), "{out}");
+        assert!(out.contains("crs:Saturation=\"+5\"") && out.contains("xmp:Rating=\"3\""), "{out}");
+        assert_eq!(parse(&out), Some(meta.clone()));
+
+        // A value cleared in the meantime is gone from the file, not left behind in the old namespace.
+        let cleared = update(OLD_WINDEDIT, &Metadata { rating: 3, ..Default::default() }).unwrap();
+        assert!(!cleared.contains("windedit:Exposure") && !cleared.contains("velochrome:Exposure"), "{cleared}");
+        assert_eq!(parse(&cleared).unwrap().edit, Edit::default());
+    }
+
+    #[test]
+    fn new_velochrome_sidecar_round_trips() {
+        let meta = Metadata {
+            rating: 2,
+            pick: Pick::Picked,
+            edit: Edit { exposure: -0.4, shadows: 25.0, ..Default::default() },
+            ..Default::default()
+        };
+        let fresh = new_sidecar(&meta);
+        assert!(fresh.contains("xmlns:velochrome=\"urn:velochrome:1.0\"") && !fresh.to_lowercase().contains("windedit"), "{fresh}");
+        assert_eq!(parse(&fresh), Some(meta.clone()));
+        let again = update(&fresh, &Metadata { edit: Edit { exposure: 0.2, ..meta.edit }, ..meta.clone() }).unwrap();
+        assert!(again.contains("velochrome:Exposure=\"0.2\""), "{again}");
+        assert_eq!(parse(&again).unwrap().edit.exposure, 0.2);
+    }
+
+    #[test]
+    fn mixed_sidecar_prefers_the_new_namespace_and_drops_the_old() {
+        // Both namespaces, as if an old build had touched a newer file: the new value wins.
+        let mixed = OLD_WINDEDIT.replace(
+            "   windedit:Exposure=\"0.5\"",
+            "   xmlns:velochrome=\"urn:velochrome:1.0\"\n   velochrome:Exposure=\"0.9\"\n   windedit:Exposure=\"0.5\"",
+        );
+        let meta = parse(&mixed).unwrap();
+        assert_eq!(meta.edit.exposure, 0.9);
+        assert_eq!(meta.edit.contrast, 12.0, "still read from the old namespace");
+        let out = update(&mixed, &meta).unwrap();
+        assert!(!out.contains("windedit:Exposure") && !out.contains("windedit:Contrast"), "{out}");
+        assert_eq!(out.matches("velochrome:Exposure").count(), 1, "{out}");
+        assert!(out.contains("velochrome:Exposure=\"0.9\"") && out.contains("velochrome:Contrast=\"12\""), "{out}");
+        assert_eq!(parse(&out), Some(meta));
     }
 }

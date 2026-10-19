@@ -1,4 +1,4 @@
-//! The Windedit engine: decoding, color science and the GPU develop pipeline. Platform apps
+//! The Velochrome engine: decoding, color science and the GPU develop pipeline. Platform apps
 //! talk to it through the C interface in `ffi`; Rust tools (like the benchmark) use it directly.
 
 pub mod color;

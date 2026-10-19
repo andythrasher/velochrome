@@ -4,7 +4,7 @@
 //!    reference (`Profile::eval_pixel`) across Adobe Standard, Camera Natural and Camera Vivid.
 //! 2. Times the 4K Fit develop pass on the default path (`profile == 0`), Adobe Standard,
 //!    Camera Natural and Camera Vivid (with and without masks).
-//! 3. Compares Windedit's renders of Camera Natural, Camera Vivid and Adobe Standard against
+//! 3. Compares Velochrome's renders of Camera Natural, Camera Vivid and Adobe Standard against
 //!    Lightroom exports, Lightroom screenshots and the cameras' own JPEGs on OM-5 Mark II and
 //!    Panasonic DC-S1 photos, and writes comparison strips to `renders/profiles`.
 
@@ -390,11 +390,11 @@ pub fn bench_profiles(files: &[PathBuf]) {
         mask1.count = 1;
 
         let cases = [
-            ("Windedit (default)", Edit::default(), Masks::default()),
+            ("Velochrome (default)", Edit::default(), Masks::default()),
             ("Adobe Standard", Edit { profile: id_adobe, ..Edit::default() }, Masks::default()),
             ("Camera Natural", Edit { profile: id_nat, ..Edit::default() }, Masks::default()),
             ("Camera Vivid", Edit { profile: id_viv, ..Edit::default() }, Masks::default()),
-            ("Windedit + 1 mask", Edit::default(), mask1),
+            ("Velochrome + 1 mask", Edit::default(), mask1),
             ("Camera Natural + 1 mask", Edit { profile: id_nat, ..Edit::default() }, mask1),
         ];
         let times = time_4k(&mut gpu, &image, &cases, 60);
@@ -452,8 +452,8 @@ pub fn bench_profiles(files: &[PathBuf]) {
 
         println!("\n  Photo: {stem} ({} {})", image.make, image.model);
         let mut strip_tiles: Vec<(&str, Vec<u8>, u32, u32)> = Vec::new();
-        for p_label in ["Windedit", "Adobe Standard", "Camera Natural", "Camera Vivid"] {
-            let pid = if p_label == "Windedit" { 0 } else { find_id(p_label) };
+        for p_label in ["Velochrome", "Adobe Standard", "Camera Natural", "Camera Vivid"] {
+            let pid = if p_label == "Velochrome" { 0 } else { find_id(p_label) };
             let px = render_prof(&mut gpu, pid, &Edit::default());
             if let Some(ref cj) = cam_jpeg {
                 let (rms, de, ch, bias) = compare_renders_signed(&px, tw, th, cj);
@@ -467,9 +467,9 @@ pub fn bench_profiles(files: &[PathBuf]) {
 
         // Check if there is a Lightroom crop in target/tonefit/crops for this photo.
         let lr_crop_path = match stem.as_str() {
-            "PA150285" => Some(PathBuf::from(r"c:\dev\windedit\target\tonefit\crops\1_lightroom_none_0.png")),
-            "P1020780" | "P1020781" => Some(PathBuf::from(r"c:\dev\windedit\target\tonefit\crops\2_lightroom-library_none_0.png")),
-            "P6140518" => Some(PathBuf::from(r"c:\dev\windedit\target\tonefit\crops\3_lightroom-library_none_0.png")),
+            "PA150285" => Some(PathBuf::from(r"target\tonefit\crops\1_lightroom_none_0.png")),
+            "P1020780" | "P1020781" => Some(PathBuf::from(r"target\tonefit\crops\2_lightroom-library_none_0.png")),
+            "P6140518" => Some(PathBuf::from(r"target\tonefit\crops\3_lightroom-library_none_0.png")),
             _ => None,
         };
         if let Some(p) = lr_crop_path.filter(|p| p.exists())

@@ -13,7 +13,7 @@
 // The noise reduction follows the wavelet denoisers of darktable (denoise (profiled)) and
 // RawTherapee (wavelet noise reduction), both GPL-3: an à trous decomposition with the B3
 // spline, thresholds from a noise estimate, in a variance-stabilised space. This code is
-// written for Windedit's pipeline.
+// written for Velochrome's pipeline.
 
 #define DETAIL_ROOT_SIGNATURE \
     "RootConstants(num32BitConstants=32, b0)," \

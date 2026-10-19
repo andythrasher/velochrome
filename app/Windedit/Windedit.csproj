@@ -6,6 +6,12 @@
     <!-- Windows 11 and later. -->
     <TargetPlatformMinVersion>10.0.22000.0</TargetPlatformMinVersion>
     <RootNamespace>Windedit</RootNamespace>
+    <!-- The product is Velochrome; Windedit is the code's internal name (namespace, folder, engine DLL). -->
+    <AssemblyName>Velochrome</AssemblyName>
+    <Product>Velochrome</Product>
+    <Description>A fast raw photo editor for Windows.</Description>
+    <Version>1.0.0</Version>
+    <ApplicationIcon>Assets\Velochrome.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <RuntimeIdentifier>$(NETCoreSdkRuntimeIdentifier)</RuntimeIdentifier>
     <Nullable>enable</Nullable>
@@ -16,6 +22,7 @@
     <UseWinUI>true</UseWinUI>
     <WindowsPackageType>None</WindowsPackageType>
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <!-- Also what makes dotnet publish keep the .pri and compiled XAML of an unpackaged build. -->
     <EnableMsixTooling>true</EnableMsixTooling>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
 
@@ -24,12 +31,32 @@
     <EngineDir>$(MSBuildThisFileDirectory)..\..\target\release\</EngineDir>
   </PropertyGroup>
 
+  <!--
+    The Microsoft Store package (tools/package.ps1 passes -p:StorePackage=true). It uses the shared
+    Windows App SDK runtime package, which the Store installs alongside, instead of carrying its own
+    copy; .NET is included. The Store signs the package on submission; tools/package.ps1 signs a
+    copy with a test certificate for sideloading.
+  -->
+  <PropertyGroup Condition="'$(StorePackage)' == 'true'">
+    <WindowsPackageType>MSIX</WindowsPackageType>
+    <WindowsAppSDKSelfContained>false</WindowsAppSDKSelfContained>
+    <SelfContained>true</SelfContained>
+    <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
+    <AppxBundle>Never</AppxBundle>
+    <GenerateAppxPackageOnBuild>true</GenerateAppxPackageOnBuild>
+  </PropertyGroup>
+
   <Target Name="BuildEngine" BeforeTargets="BeforeBuild">
     <Exec Command="cargo build --release -p windedit-core" WorkingDirectory="$(MSBuildThisFileDirectory)..\.." />
   </Target>
 
   <ItemGroup>
-    <None Include="$(EngineDir)windedit_core.dll" Link="windedit_core.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+    <!-- Content, so the MSIX carries it too. -->
+    <Content Include="$(EngineDir)windedit_core.dll" Link="windedit_core.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+    <!-- Also loaded at runtime for the window icon. -->
+    <Content Include="Assets\Velochrome.ico" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Start menu, taskbar and Store logos; made by tools/make-assets.ps1. -->
+    <Content Include="Assets\Package\*.png" Condition="'$(StorePackage)' == 'true'" />
   </ItemGroup>
 
   <ItemGroup>

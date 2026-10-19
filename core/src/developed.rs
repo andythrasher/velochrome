@@ -128,14 +128,14 @@ fn is_key(stem: &str) -> bool {
 
 // ---- The cache ----
 
-/// The cache directory: `%LOCALAPPDATA%\Windedit\Previews`.
+/// The cache directory: `%LOCALAPPDATA%\Velochrome\Previews`.
 pub fn default_dir() -> PathBuf {
     // For measuring with an empty cache, or one somewhere else.
     if let Some(dir) = std::env::var_os("WINDEDIT_PREVIEW_CACHE") {
         return PathBuf::from(dir);
     }
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join("Windedit").join("Previews")
+    base.join("Velochrome").join("Previews")
 }
 
 /// The previews on disk. Each entry is two files: `<key>.jpg` (the preview) and `<key>.thumb.jpg`.

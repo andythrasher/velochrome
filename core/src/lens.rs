@@ -348,13 +348,26 @@ pub fn dump_tags(bytes: &[u8], olympus: bool) -> Vec<(u16, u16, usize, Vec<f32>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
-    const ORF: &str = r"C:\Users\Andy\Pictures\2026\2026-06-06\P6060001.ORF";
-    const RW2: &str = r"C:\Users\Andy\Pictures\2026\2026-06-08\P1070381.RW2";
+    // The real-file tests need Olympus and Panasonic raws. Point VELOCHROME_TEST_RAWS at a folder
+    // holding them (directly or in subfolders, such as one per day); without it they're skipped.
+    const ORF: &str = "P6060001.ORF";
+    const RW2: &str = "P1070381.RW2";
 
-    fn file(path: &str) -> Option<Vec<u8>> {
-        Path::new(path).exists().then(|| std::fs::read(path).unwrap())
+    fn file(name: &str) -> Option<Vec<u8>> {
+        let root = std::path::PathBuf::from(std::env::var_os("VELOCHROME_TEST_RAWS")?);
+        let mut folders = vec![root];
+        while let Some(dir) = folders.pop() {
+            for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    folders.push(path);
+                } else if path.file_name().is_some_and(|n| n.eq_ignore_ascii_case(name)) {
+                    return std::fs::read(path).ok();
+                }
+            }
+        }
+        None
     }
 
     #[test]

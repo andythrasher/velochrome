@@ -71,7 +71,7 @@ to the corners, which is what the user expects, so `r0` rises with the midpoint.
 
 All four are zero by default, so a zeroed struct (a C# `default`) is the default edit, as with the
 crop; `Edit::clean_lens` (called by `we_set_edit` and the sidecar reader) clamps them, and repairs a
-damaged sidecar. Sidecar names: `windedit:VignetteAmount`, `VignetteMidpoint` (written as the slider
+damaged sidecar. Sidecar names: `velochrome:VignetteAmount`, `VignetteMidpoint` (written as the slider
 shows it, 50 default), `LensDistortion` and `LensChromaticAberration` (written as `0` when off);
 each only when it differs from the default. Round trips are tested in `xmp.rs`.
 

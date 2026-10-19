@@ -755,10 +755,10 @@ struct Entry {
 }
 
 struct Registry {
-    /// Interned profile names: index 0 is `"Windedit"`, `1..` are profile names (`"Camera Natural"`, …).
+    /// Interned profile names: index 0 is `"Velochrome"`, `1..` are profile names (`"Camera Natural"`, …).
     names: Vec<String>,
     by_name: HashMap<String, u32>,
-    /// Custom profiles scanned once from `<exe>\Profiles` and `%APPDATA%\Windedit\Profiles`, keyed
+    /// Custom profiles scanned once from `<exe>\Profiles` and `%APPDATA%\Velochrome\Profiles`, keyed
     /// by normalized `UniqueCameraModel` (empty string for camera-agnostic look profiles).
     custom: HashMap<String, Vec<Entry>>,
     /// Discovered profiles per normalized camera model.
@@ -781,7 +781,7 @@ fn custom_dirs() -> Vec<PathBuf> {
         dirs.push(parent.join("Profiles"));
     }
     if let Some(appdata) = std::env::var_os("APPDATA") {
-        dirs.push(PathBuf::from(appdata).join("Windedit").join("Profiles"));
+        dirs.push(PathBuf::from(appdata).join("Velochrome").join("Profiles"));
     }
     dirs
 }
@@ -789,8 +789,8 @@ fn custom_dirs() -> Vec<PathBuf> {
 impl Registry {
     fn new() -> Registry {
         let mut reg = Registry {
-            names: vec!["Windedit".to_string()],
-            by_name: HashMap::from([("Windedit".to_string(), 0)]),
+            names: vec!["Velochrome".to_string()],
+            by_name: HashMap::from([("Velochrome".to_string(), 0)]),
             custom: HashMap::new(),
             by_camera: HashMap::new(),
             parsed: HashMap::new(),
@@ -803,7 +803,7 @@ impl Registry {
 
     fn intern(&mut self, name: &str) -> u32 {
         let trimmed = name.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("Windedit") {
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("Velochrome") || trimmed.eq_ignore_ascii_case("Windedit") {
             return 0;
         }
         if let Some(&id) = self.by_name.get(trimmed) {
@@ -922,7 +922,7 @@ fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
     f(&mut guard)
 }
 
-/// Returns the non-zero `u32` ID for a profile name (`0` for `"Windedit"` or `""`).
+/// Returns the non-zero `u32` ID for a profile name (`0` for `"Velochrome"` or `""`).
 pub fn id_for_name(name: &str) -> u32 {
     with_registry(|reg| reg.intern(name))
 }
@@ -941,7 +941,7 @@ pub fn id_for_lightroom_name(name: &str) -> u32 {
     with_registry(|reg| reg.by_name.get(trimmed).copied().unwrap_or(0))
 }
 
-/// Returns the profile name for a non-zero `id`, or `None` for `0` (the default Windedit look).
+/// Returns the profile name for a non-zero `id`, or `None` for `0` (the default Velochrome look).
 pub fn name_of(id: u32) -> Option<String> {
     if id == 0 {
         return None;
@@ -950,14 +950,14 @@ pub fn name_of(id: u32) -> Option<String> {
 }
 
 /// Lists the profiles available for `(make, model)` in drop-down order:
-/// `Windedit` (`0`), Camera Matching, `Adobe Standard`, and custom profiles.
+/// `Velochrome` (`0`), Camera Matching, `Adobe Standard`, and custom profiles.
 pub fn profiles_for_camera(make: &str, model: &str) -> Vec<(u32, String)> {
     let norm = normalize_camera_model(make, model);
     with_registry(|reg| {
         if !norm.is_empty() {
             reg.ensure_camera(&norm);
         }
-        let mut out = vec![(0u32, "Windedit".to_string())];
+        let mut out = vec![(0u32, "Velochrome".to_string())];
         if let Some(entries) = reg.by_camera.get(&norm) {
             for e in entries {
                 out.push((e.id, e.name.clone()));
@@ -1095,14 +1095,14 @@ mod tests {
         for model in ["OM-5 Mark II", "OM-5MarkII"] {
             let list = profiles_for_camera("OM Digital Solutions", model);
             let names: Vec<&str> = list.iter().map(|(_, n)| n.as_str()).collect();
-            assert_eq!(names[0], "Windedit");
+            assert_eq!(names[0], "Velochrome");
             assert_eq!(names[1], "Camera Natural");
             assert_eq!(names[2], "Camera Vivid");
             assert!(names.contains(&"Adobe Standard"));
         }
         let s1 = profiles_for_camera("Panasonic", "DC-S1");
         let s1_names: Vec<&str> = s1.iter().map(|(_, n)| n.as_str()).collect();
-        assert_eq!(s1_names[0], "Windedit");
+        assert_eq!(s1_names[0], "Velochrome");
         assert_eq!(s1_names[1], "Camera Standard");
         assert_eq!(s1_names[2], "Camera Natural");
         assert_eq!(s1_names[3], "Camera Vivid");
