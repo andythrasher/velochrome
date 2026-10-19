@@ -73,6 +73,8 @@ public sealed unsafe partial class Engine : IDisposable
     [LibraryImport(Dll)] private static partial int we_brush_end(IntPtr engine, int index);
     [LibraryImport(Dll)] private static partial int we_as_shot_white_balance(IntPtr engine, int index, out float kelvin, out float tint);
     [LibraryImport(Dll)] private static partial int we_lens_info(IntPtr engine, int index, out int distortion, out int chromaticAberration);
+    [LibraryImport(Dll)] private static partial int we_photo_profiles(IntPtr engine, int index, uint* ids, int cap);
+    [LibraryImport(Dll)] private static partial uint we_profile_name(uint id, char* buf, uint len);
     [LibraryImport(Dll)] private static partial int we_pick_white_balance(IntPtr engine, float x, float y, out float kelvin, out float tint);
     [LibraryImport(Dll)] private static partial int we_set_rating(IntPtr engine, int index, int rating);
     [LibraryImport(Dll)] private static partial int we_set_pick(IntPtr engine, int index, int pick);
@@ -142,6 +144,8 @@ public sealed unsafe partial class Engine : IDisposable
         public float HueRed, HueOrange, HueYellow, HueGreen, HueAqua, HueBlue, HuePurple, HueMagenta;
         public float SaturationRed, SaturationOrange, SaturationYellow, SaturationGreen, SaturationAqua, SaturationBlue, SaturationPurple, SaturationMagenta;
         public float LuminanceRed, LuminanceOrange, LuminanceYellow, LuminanceGreen, LuminanceAqua, LuminanceBlue, LuminancePurple, LuminanceMagenta;
+        /// <summary>The camera profile id from the registry (0 is Windedit's default look).</summary>
+        public uint Profile;
 
         public const int MixerFields = 24;
 
@@ -347,6 +351,24 @@ public sealed unsafe partial class Engine : IDisposable
     /// <summary>Which lens corrections the photo's raw has data for, once it is decoded.</summary>
     public (bool Distortion, bool ChromaticAberration)? LensInfo(int index) =>
         Check(we_lens_info(handle, index, out var d, out var c)) == 1 ? (d != 0, c != 0) : null;
+
+    /// <summary>The camera profiles available for a photo, starting with (0, "Windedit").</summary>
+    public (uint Id, string Name)[] PhotoProfiles(int index)
+    {
+        var ids = stackalloc uint[64];
+        var count = Math.Min(Check(we_photo_profiles(handle, index, ids, 64)), 64);
+        var result = new (uint Id, string Name)[count];
+        for (var i = 0; i < count; i++)
+            result[i] = (ids[i], ProfileName(ids[i]));
+        return result;
+    }
+
+    public static string ProfileName(uint id)
+    {
+        var buf = stackalloc char[260];
+        var len = we_profile_name(id, buf, 260);
+        return new string(buf, 0, (int)Math.Min(len, 259));
+    }
 
     /// <summary>
     /// The temperature (kelvin) and tint that make the spot at (x, y) on the view neutral, with

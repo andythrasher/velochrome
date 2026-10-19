@@ -21,6 +21,7 @@ use crate::geometry;
 
 pub const NS_RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 pub const NS_XMP: &str = "http://ns.adobe.com/xap/1.0/";
+pub const NS_CRS: &str = "http://ns.adobe.com/camera-raw-settings/1.0/";
 /// Our namespace. A URN, so it claims no web domain; the app's name is still provisional.
 pub const NS_WINDEDIT: &str = "urn:windedit:1.0";
 
@@ -99,6 +100,13 @@ pub fn parse(text: &str) -> Option<Metadata> {
     for (i, v) in e.mixer.iter_mut().enumerate() {
         *v = number(MIXER + i).unwrap_or(0.0);
     }
+    e.profile = if let Some(p) = &scan.props[PROFILE] {
+        crate::profile::id_for_name(&p.value)
+    } else if let Some(crs) = &scan.crs_profile {
+        crate::profile::id_for_lightroom_name(crs)
+    } else {
+        0
+    };
     geometry::clean(e);
     e.clean_lens();
     e.clean_detail();
@@ -198,7 +206,7 @@ const PICK: usize = 2;
 /// (namespace, the prefix to declare if the file has none for it, local name)
 const FIRST_EDIT: usize = 3;
 /// (namespace, the prefix to declare if the file has none for it, local name)
-const PROPS: [(&str, &str, &str); 35 + MIXER_FIELDS] = [
+const PROPS: [(&str, &str, &str); 36 + MIXER_FIELDS] = [
     (NS_XMP, "xmp", "Rating"),
     (NS_XMP, "xmp", "Label"),
     (NS_WINDEDIT, "windedit", "Pick"),
@@ -258,6 +266,7 @@ const PROPS: [(&str, &str, &str); 35 + MIXER_FIELDS] = [
     (NS_WINDEDIT, "windedit", "LuminanceMagenta"),
     (NS_WINDEDIT, "windedit", "Masks"),
     (NS_WINDEDIT, "windedit", "Strokes"),
+    (NS_WINDEDIT, "windedit", "Profile"),
 ];
 
 /// The edit's fields, in PROPS order from FIRST_EDIT.
@@ -365,6 +374,7 @@ fn values(meta: &Metadata, keep_zero_rating: bool) -> Vec<Option<String>> {
     }
     v.push(meta.masks.as_deref().filter(|m| !m.is_empty()).map(crate::masks::to_text));
     v.push(meta.strokes.as_deref().filter(|m| !m.is_empty()).map(crate::masks::strokes_to_text));
+    v.push(crate::profile::name_of(e.profile));
     v
 }
 
@@ -380,6 +390,9 @@ const MASKS: usize = MIXER + MIXER_FIELDS;
 
 /// Where the brush strokes sit in PROPS: after the masks.
 const STROKES: usize = MASKS + 1;
+
+/// Where the camera profile name sits in PROPS: after the strokes.
+const PROFILE: usize = STROKES + 1;
 
 /// The detail sliders, in PROPS order from DETAIL.
 fn detail_fields_mut(d: &mut Detail) -> [&mut f32; 9] {
@@ -426,6 +439,7 @@ struct Scan {
     /// Lightroom's crs:Preset, are left alone.
     descriptions: Vec<Description>,
     props: Vec<Option<Found>>,
+    crs_profile: Option<String>,
 }
 
 fn scan(text: &str) -> Result<Scan, String> {
@@ -433,7 +447,7 @@ fn scan(text: &str) -> Result<Scan, String> {
     let mut scopes: Vec<HashMap<String, String>> = vec![HashMap::new()];
     // (namespace, local name, index of the top-level Description it's in, if any)
     let mut stack: Vec<(String, String, Option<usize>)> = Vec::new();
-    let mut result = Scan { descriptions: Vec::new(), props: PROPS.iter().map(|_| None).collect() };
+    let mut result = Scan { descriptions: Vec::new(), props: PROPS.iter().map(|_| None).collect(), crs_profile: None };
     // An element-form value being read: (prop, start of its whitespace, start of content).
     let mut open_prop: Option<(usize, usize, usize, usize)> = None;
 
@@ -464,6 +478,8 @@ fn scan(text: &str) -> Result<Scan, String> {
                         {
                             result.props[i] =
                                 Some(Found { value: a.value.clone(), value_range: a.value_range.clone(), whole: a.whole.clone() });
+                        } else if ans == NS_CRS && alocal == "CameraProfile" && result.crs_profile.is_none() {
+                            result.crs_profile = Some(a.value.clone());
                         }
                     }
                 } else if parent.is_some_and(|p| p.2.is_some() && is_description(p))
@@ -944,5 +960,24 @@ mod tests {
         write(&path, &Metadata { rating: 1, ..meta.clone() }).unwrap();
         assert_eq!(read(&path).rating, 1);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn profile_round_trips_and_reads_lightroom_crs() {
+        let id = crate::profile::id_for_name("Camera Natural");
+        let meta = Metadata { edit: Edit { profile: id, ..Default::default() }, ..Default::default() };
+        let fresh = new_sidecar(&meta);
+        assert!(fresh.contains("windedit:Profile=\"Camera Natural\""), "{fresh}");
+        assert_eq!(parse(&fresh), Some(meta.clone()));
+
+        // Default profile (0) writes nothing.
+        let plain = new_sidecar(&Metadata::default());
+        assert!(!plain.contains("Profile"));
+
+        // Lightroom's crs:CameraProfile="Adobe Color" stays 0; "Camera Vivid" is picked up.
+        let lr_color = LIGHTROOM.replace("crs:Exposure2012=\"+0.35\"", "crs:CameraProfile=\"Adobe Color\"");
+        assert_eq!(parse(&lr_color).unwrap().edit.profile, 0);
+        let lr_vivid = LIGHTROOM.replace("crs:Exposure2012=\"+0.35\"", "crs:CameraProfile=\"Camera Vivid\"");
+        assert_eq!(parse(&lr_vivid).unwrap().edit.profile, crate::profile::id_for_name("Camera Vivid"));
     }
 }

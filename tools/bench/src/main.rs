@@ -13,6 +13,7 @@ mod hsl;
 mod lens;
 mod masks;
 mod previews;
+mod profiles;
 mod vignette;
 mod wb;
 
@@ -53,6 +54,7 @@ fn main() {
         "partb" => detail::bench_partb(&files),
         "hsl" => hsl::bench_hsl(&files),
         "masks" => masks::bench_masks(&files),
+        "profiles" => profiles::bench_profiles(&files),
         "noisescale" => detail::bench_noisescale(&files),
         "lensscan" => lens::lens_scan(rest),
         "lenstags" => lens::lens_tags(&files),

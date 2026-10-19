@@ -136,6 +136,8 @@ unsafe impl Send for Slot {}
 
 /// A photo ready to develop: demosaiced and on the GPU.
 pub struct Image {
+    pub make: String,
+    pub model: String,
     pub width: u32,
     pub height: u32,
     pub levels: u32,
@@ -144,6 +146,7 @@ pub struct Image {
     pub xyz_to_cam: Mat3,
     /// The white balance the camera recorded, which the demosaic applied.
     pub as_shot: [f32; 3],
+    pub as_shot_kelvin: f32,
     pub orientation: Orientation,
     /// Distortion and chromatic aberration correction, if the camera recorded any.
     pub lens: Option<LensCorrection>,
@@ -195,8 +198,9 @@ struct DownsampleConstants {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct DevelopConstants {
-    /// Camera RGB → linear Rec.2020, a row each, with the detail texture's rectangle (left and
-    /// top, then width and height, 16 bits each) and level + 1 (0 for none) in the spare words.
+    /// Camera RGB → linear Rec.2020 (or ProPhoto when a camera profile is in use), a row each, with
+    /// the detail texture's rectangle (left and top, then width and height, 16 bits each) and
+    /// level + 1 (0 for none) in the spare words.
     row0: [f32; 3],
     detail_origin: u32,
     row1: [f32; 3],
@@ -244,6 +248,26 @@ struct ToneParams {
 
 // tone.hlsli's ToneParams: 27 model numbers, 5 sliders, 5 fixed numbers and the mixer's 4 × 8.
 const _: () = assert!(size_of::<ToneParams>() == (37 + 32) * 4);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProfileParams {
+    hue_sat_dims: [u32; 3],
+    hue_sat_encoding: u32,
+    look_dims: [u32; 3],
+    look_encoding: u32,
+    has_tone_curve: u32,
+    exposure_gain: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ToneProfileParams {
+    base: ToneParams,
+    profile: ProfileParams,
+}
+
+const _: () = assert!(size_of::<ToneProfileParams>() == (37 + 32 + 10) * 4);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -365,6 +389,8 @@ impl Image {
             total_ms: start.elapsed().as_secs_f64() * 1000.0,
         };
         let image = Image {
+            make: frame.make.clone(),
+            model: frame.model.clone(),
             width,
             height,
             levels,
@@ -372,6 +398,7 @@ impl Image {
             cam_to_working: frame.cam_to_working,
             xyz_to_cam: frame.xyz_to_cam,
             as_shot: frame.wb,
+            as_shot_kelvin: develop::multipliers_to_temperature(&frame.xyz_to_cam, frame.wb).0,
             orientation: frame.orientation,
             lens: frame.lens,
             camera_offset: tone::camera_offset(&frame.make),
@@ -547,14 +574,45 @@ pub fn render_masked(gpu: &Gpu, layer: Layer, edit: &Edit, mask_input: &MaskInpu
         near_white: tone::NEAR_WHITE,
         mixer,
     };
-    gpu.set_params(&params);
+    let active_profile = match (edit.profile, layer) {
+        (0, _) | (_, Layer::Preview(_)) => None,
+        (id, Layer::Raw(image)) => crate::profile::get(&image.make, &image.model, id).map(|p| (image, p)),
+    };
+    let mut profile_temp = 5000.0;
+    if let Some((image, prof)) = &active_profile {
+        profile_temp = if edit.custom_white_balance != 0 { edit.temperature } else { image.as_shot_kelvin };
+        let exposure_gain = image.camera_offset + prof.baseline_exposure_offset + edit.exposure;
+        let tp = ToneProfileParams {
+            base: params,
+            profile: ProfileParams {
+                hue_sat_dims: prof.hue_sat_dims,
+                hue_sat_encoding: prof.hue_sat_encoding,
+                look_dims: prof.look_dims,
+                look_encoding: prof.look_encoding,
+                has_tone_curve: prof.tone_curve_lut.is_some() as u32,
+                exposure_gain,
+            },
+        };
+        gpu.set_params(&tp);
+    } else {
+        gpu.set_params(&params);
+    }
     let (rows, lum, mode, base, clarity) = match layer {
         Layer::Raw(image) => {
-            // White balance change, exposure, the camera's offset and the conversion to linear
-            // Rec.2020 in one matrix: camera RGB (as-shot white balance) → scene-referred light.
             let wb = develop::white_balance_change(edit, &image.xyz_to_cam, image.as_shot);
-            let gain = (image.camera_offset + edit.exposure).exp2();
-            let rows = image.cam_to_working.map(|r| [r[0] * wb[0] * gain, r[1] * wb[1] * gain, r[2] * wb[2] * gain, 0.0]);
+            let rows = if let Some((_, prof)) = &active_profile {
+                // Camera RGB (as-shot white balance) → linear ProPhoto RGB; exposure and
+                // baseline offset are applied between HueSatMap and LookTable in the shader.
+                let m = prof.cam_to_prophoto(profile_temp, &wb, &image.xyz_to_cam);
+                m.map(|r| [r[0], r[1], r[2], 0.0])
+            } else {
+                // White balance change, exposure, the camera's offset and the conversion to linear
+                // Rec.2020 in one matrix: camera RGB (as-shot white balance) → scene-referred light.
+                let gain = (image.camera_offset + edit.exposure).exp2();
+                image.cam_to_working.map(|r| [r[0] * wb[0] * gain, r[1] * wb[1] * gain, r[2] * wb[2] * gain, 0.0])
+            };
+            let profile_offset = active_profile.as_ref().map_or(0.0, |(_, p)| p.baseline_exposure_offset);
+            let gain = (image.camera_offset + profile_offset + edit.exposure).exp2();
             // The same matrix to brightness: Rec.709 luminance of the sRGB conversion.
             let to_srgb = color::mul(&color::REC2020_TO_SRGB, &image.cam_to_working);
             let lum = [0, 1, 2].map(|c| {
@@ -625,7 +683,11 @@ pub fn render_masked(gpu: &Gpu, layer: Layer, edit: &Edit, mask_input: &MaskInpu
         Layer::Raw(image) => gpu.srv_texture(&image.linear, LINEAR_FORMAT, 0, image.levels, SLOT_DEVELOP),
         Layer::Preview(p) => gpu.srv_texture(&p.texture, PREVIEW_FORMAT, 0, p.levels, SLOT_DEVELOP),
     }
-    gpu.srv_params::<ToneParams>(SLOT_DEVELOP + 1);
+    if active_profile.is_some() {
+        gpu.srv_params::<ToneProfileParams>(SLOT_DEVELOP + 1);
+    } else {
+        gpu.srv_params::<ToneParams>(SLOT_DEVELOP + 1);
+    }
     gpu.srv_texture(&gpu.tone.coefficients, DXGI_FORMAT_R32G32_FLOAT, 0, 1, SLOT_DEVELOP + 2);
     gpu.srv_buffer(&gpu.tone.stats, DXGI_FORMAT_R32_FLOAT, 2, SLOT_DEVELOP + 3);
     match &detail {
@@ -645,7 +707,12 @@ pub fn render_masked(gpu: &Gpu, layer: Layer, edit: &Edit, mask_input: &MaskInpu
         }
         None => gpu.srv_texture_array(None, DXGI_FORMAT_R16_UNORM, 1, SLOT_DEVELOP + 7),
     }
-    gpu.uav_texture(&target.texture, TARGET_FORMAT, 0, SLOT_DEVELOP + 8);
+    if let Some((_, prof)) = &active_profile {
+        gpu.srv_profile(prof, profile_temp, SLOT_DEVELOP + 8);
+        gpu.uav_texture(&target.texture, TARGET_FORMAT, 0, SLOT_DEVELOP + 11);
+    } else {
+        gpu.uav_texture(&target.texture, TARGET_FORMAT, 0, SLOT_DEVELOP + 8);
+    }
     let mut reads = vec![&gpu.tone.coefficients, &gpu.tone.stats];
     if clarity.is_some() {
         reads.push(&gpu.clarity.coefficients);
@@ -654,7 +721,12 @@ pub fn render_masked(gpu: &Gpu, layer: Layer, edit: &Edit, mask_input: &MaskInpu
     if mode == MODE_DEVELOP {
         reads.iter().for_each(|r| gpu.transition(r, 0, uav, srv));
     }
-    let kernel = if constants.mask_count != 0 { &gpu.kernels.develop_masks } else { &gpu.kernels.develop };
+    let kernel = match (active_profile.is_some(), constants.mask_count != 0) {
+        (false, false) => &gpu.kernels.develop,
+        (false, true) => &gpu.kernels.develop_masks,
+        (true, false) => &gpu.kernels.develop_profile,
+        (true, true) => &gpu.kernels.develop_profile_masks,
+    };
     gpu.dispatch(kernel, &constants, SLOT_DEVELOP, (target.width, target.height));
     if mode == MODE_DEVELOP {
         reads.iter().for_each(|r| gpu.transition(r, 0, srv, uav));
@@ -697,7 +769,7 @@ fn clarity_prepass(gpu: &Gpu, image: &Image, lum: [f32; 4], edit: &Edit) -> [f32
             edit.blacks.to_bits(),
             edit.vignette_amount.to_bits(),
             edit.vignette_midpoint.to_bits(),
-            edit.no_distortion,
+            edit.no_distortion | (edit.profile << 2),
             edit.no_chromatic_aberration,
             edit.custom_white_balance,
             edit.temperature.to_bits(),

@@ -57,6 +57,8 @@ pub struct Edit {
     /// The colour mixer (docs/phase2c.md), −100 to +100 each, 0 = none: hue for Red, Orange, Yellow,
     /// Green, Aqua, Blue, Purple, Magenta, then their saturations, then their luminances.
     pub mixer: [f32; MIXER_FIELDS],
+    /// Camera profile ID in `profile::Registry` (0 = the default Windedit look).
+    pub profile: u32,
 }
 
 /// Sliders in the colour mixer: three for each of the eight ranges.
@@ -97,6 +99,7 @@ impl Default for Edit {
             texture: 0.0,
             clarity: 0.0,
             mixer: [0.0; MIXER_FIELDS],
+            profile: 0,
         }
     }
 }

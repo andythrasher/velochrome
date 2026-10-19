@@ -28,14 +28,22 @@ fn main() {
     }
     // The develop pass again with the masks compiled in. It runs only when a photo has masks, so
     // the pass without them is exactly what it was (the mask code would cost it registers).
-    let dst = out.join("developmasks.dxil");
-    let status = Command::new(&dxc)
-        .args(["-nologo", "-T", "cs_6_0", "-E", "main", "-O3", "-Ishaders", "-DMASKS", "-Fo"])
-        .arg(&dst)
-        .arg("shaders/develop.hlsl")
-        .status()
-        .expect("failed to run dxc");
-    assert!(status.success(), "dxc failed on develop.hlsl with masks");
+    for (out_name, flags) in [
+        ("developmasks.dxil", &["-DMASKS"][..]),
+        ("developprofile.dxil", &["-DPROFILE"][..]),
+        ("developprofilemasks.dxil", &["-DPROFILE", "-DMASKS"][..]),
+    ] {
+        let dst = out.join(out_name);
+        let status = Command::new(&dxc)
+            .args(["-nologo", "-T", "cs_6_0", "-E", "main", "-O3", "-Ishaders"])
+            .args(flags)
+            .arg("-Fo")
+            .arg(&dst)
+            .arg("shaders/develop.hlsl")
+            .status()
+            .expect("failed to run dxc");
+        assert!(status.success(), "dxc failed on {out_name}");
+    }
 }
 
 /// The newest dxc.exe in the Windows SDK, which also signs the DXIL (dxil.dll sits beside it).

@@ -43,6 +43,11 @@ already on this PC (Camera Matching for the OM-5 Mark II, S1 and S9), render the
 pass per the DNG spec, add a profile drop-down, and later fit our own shippable profiles from
 calibration shots the user will take. Build step 1 first and check it against Lightroom.
 
+**Step 1 is built, reviewed and committed**, except that the camera profiles render 0.3–0.8 stops
+too dark. That is waiting on Lightroom exports of reference photos (Adobe Color, Camera Natural,
+Camera Vivid). See [camera-profiles-status.md](camera-profiles-status.md), "Review", for the
+findings and what the exports will settle.
+
 ## Known gaps (worth picking up)
 
 - Not yet tested on hardware: card import from a real card (and eject); masks' and previews'

@@ -365,6 +365,22 @@ impl Engine {
         Some(develop::multipliers_to_temperature(&raw.xyz_to_cam, raw.wb))
     }
 
+    /// The camera profiles available for photo `index`: `(id, name)` pairs starting with
+    /// `(0, "Windedit")`. Reads the camera make and model from the decoded raw if ready, or from
+    /// the raw file's EXIF header.
+    pub fn profiles(&self, index: usize) -> Vec<(u32, String)> {
+        if let Some(raw) = self.jobs.raw(index) {
+            return crate::profile::profiles_for_camera(&raw.make, &raw.model);
+        }
+        let photos = self.jobs.photos();
+        if let Some(raw_path) = photos.get(index).and_then(|p| p.raw.as_ref())
+            && let Some((make, model)) = crate::exif::camera_make_model(raw_path)
+        {
+            return crate::profile::profiles_for_camera(&make, &model);
+        }
+        vec![(0, "Windedit".into())]
+    }
+
     /// Creates or resizes the swap chain (physical pixels; `scale` is the view's DPI scale) and
     /// returns its IDXGISwapChain pointer, owned by the engine. Waits for the GPU thread.
     pub fn resize_view(&self, width: u32, height: u32, scale: f32) -> Result<usize, String> {

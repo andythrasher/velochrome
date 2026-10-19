@@ -29,3 +29,5 @@ pub mod masks;
 pub mod brushgpu;
 pub mod import;
 pub mod developed;
+pub mod profile;
+

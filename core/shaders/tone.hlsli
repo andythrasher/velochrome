@@ -29,12 +29,27 @@ struct MixerParams
     float luminance[8];  // -1..1
 };
 
+#ifdef PROFILE
+struct ProfileParams
+{
+    uint3 hueSatDims;
+    uint hueSatEncoding;
+    uint3 lookDims;
+    uint lookEncoding;
+    uint hasToneCurve;
+    float exposureGain;
+};
+#endif
+
 struct ToneParams
 {
     Model m;
     Sliders s;
     float n, log2Sigma, ymax, middle, nearWhite; // the base curve's fixed numbers
     MixerParams mixer;
+#ifdef PROFILE
+    ProfileParams profile;
+#endif
 };
 
 StructuredBuffer<ToneParams> params : register(t1);

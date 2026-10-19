@@ -11,11 +11,19 @@
 
 // Like the other kernels', but with more inputs: the image, the tone parameters, the guided
 // filter's coefficients, the statistics, the detail texture, Clarity's coefficients and the masks.
+#ifdef PROFILE
+#define DEVELOP_ROOT_SIGNATURE \
+    "RootConstants(num32BitConstants=62, b0)," \
+    "DescriptorTable(SRV(t0, numDescriptors=11), UAV(u0))," \
+    "StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR," \
+    " addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)"
+#else
 #define DEVELOP_ROOT_SIGNATURE \
     "RootConstants(num32BitConstants=62, b0)," \
     "DescriptorTable(SRV(t0, numDescriptors=8), UAV(u0))," \
     "StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR," \
     " addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)"
+#endif
 
 cbuffer Constants : register(b0)
 {
@@ -286,6 +294,150 @@ float3 srgbEncode(float3 c)
     return select(c <= 0.0031308, 12.92 * c, 1.055 * pow(c, 1.0 / 2.4) - 0.055);
 }
 
+#ifdef PROFILE
+// ---- Camera profiles (core/src/profile.rs is the reference; docs/camera-profiles.md) ----
+
+Buffer<float4> hueSatTable : register(t8);
+Buffer<float4> lookTable : register(t9);
+Buffer<float> toneCurveLut : register(t10);
+
+static const float3x3 PROPHOTO_TO_SRGB = float3x3(
+    2.0341945, -0.7274208, -0.3067737,
+    -0.2288112, 1.2317295, -0.0029183,
+    -0.0085652, -0.1532686, 1.1618338);
+
+float srgbEncodeScalar(float v)
+{
+    float x = max(v, 0.0);
+    return x <= 0.0031308 ? 12.92 * x : 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+}
+
+float srgbDecodeScalar(float v)
+{
+    float x = max(v, 0.0);
+    return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4);
+}
+
+float3 sampleHsvTable(Buffer<float4> tbl, uint3 dims, float h, float s, float v)
+{
+    float hDivs = (float)dims.x;
+    float hPos = h * (hDivs / 6.0);
+    hPos -= floor(hPos / hDivs) * hDivs;
+    uint h0 = ((uint)hPos) % dims.x;
+    uint h1 = (h0 + 1) % dims.x;
+    float fh = hPos - floor(hPos);
+
+    uint sMax = dims.y > 0 ? dims.y - 1 : 0;
+    float sPos = clamp(s * (float)sMax, 0.0, (float)sMax);
+    uint s0 = (uint)sPos;
+    uint s1 = min(s0 + 1, sMax);
+    float fs = sPos - (float)s0;
+
+    uint v0 = 0, v1 = 0;
+    float fv = 0.0;
+    if (dims.z > 1)
+    {
+        uint vMax = dims.z - 1;
+        float vPos = clamp(v * (float)vMax, 0.0, (float)vMax);
+        v0 = (uint)vPos;
+        v1 = min(v0 + 1, vMax);
+        fv = vPos - (float)v0;
+    }
+
+    uint strideV = dims.x * dims.y;
+    float3 c00 = lerp(tbl[v0 * strideV + h0 * dims.y + s0].xyz, tbl[v0 * strideV + h0 * dims.y + s1].xyz, fs);
+    float3 c01 = lerp(tbl[v0 * strideV + h1 * dims.y + s0].xyz, tbl[v0 * strideV + h1 * dims.y + s1].xyz, fs);
+    float3 c0 = lerp(c00, c01, fh);
+    if (v0 == v1)
+        return c0;
+    float3 c10 = lerp(tbl[v1 * strideV + h0 * dims.y + s0].xyz, tbl[v1 * strideV + h0 * dims.y + s1].xyz, fs);
+    float3 c11 = lerp(tbl[v1 * strideV + h1 * dims.y + s0].xyz, tbl[v1 * strideV + h1 * dims.y + s1].xyz, fs);
+    float3 c1 = lerp(c10, c11, fh);
+    return lerp(c0, c1, fv);
+}
+
+float3 hsvToRgb(float h, float s, float v)
+{
+    int i = (int)floor(h);
+    float f = h - (float)i;
+    float p = v * (1.0 - s);
+    float q = v * (1.0 - s * f);
+    float t = v * (1.0 - s * (1.0 - f));
+    int sector = ((i % 6) + 6) % 6;
+    if (sector == 0) return float3(v, t, p);
+    if (sector == 1) return float3(q, v, p);
+    if (sector == 2) return float3(p, v, t);
+    if (sector == 3) return float3(p, q, v);
+    if (sector == 4) return float3(t, p, v);
+    return float3(v, p, q);
+}
+
+float3 applyHsvTable(float3 rgb, Buffer<float4> tbl, uint3 dims, uint encoding)
+{
+    float3 c = max(rgb, 0.0);
+    float v = max(c.r, max(c.g, c.b));
+    float m = min(c.r, min(c.g, c.b));
+    float span = v - m;
+    if (span <= 1e-7 || v <= 1e-7)
+    {
+        if (dims.z <= 1)
+            return c;
+        float vEnc = encoding == 1 ? srgbEncodeScalar(v) : v;
+        float vs = sampleHsvTable(tbl, dims, 0.0, 0.0, saturate(vEnc)).z;
+        float vOut = encoding == 1 ? srgbDecodeScalar(vEnc * vs) : v * vs;
+        return c * (v > 0.0 ? vOut / v : 1.0);
+    }
+
+    float s = span / v;
+    float h;
+    if (c.r == v)
+        h = (c.g - c.b) / span;
+    else if (c.g == v)
+        h = 2.0 + (c.b - c.r) / span;
+    else
+        h = 4.0 + (c.r - c.g) / span;
+    if (h < 0.0)
+        h += 6.0;
+
+    float vEnc = encoding == 1 ? srgbEncodeScalar(v) : v;
+    float3 d = sampleHsvTable(tbl, dims, h, saturate(s), saturate(vEnc));
+    float hNew = h + d.x;
+    hNew -= floor(hNew / 6.0) * 6.0;
+    float sNew = saturate(s * d.y);
+    float vNew = encoding == 1 ? srgbDecodeScalar(vEnc * d.z) : max(v * d.z, 0.0);
+    return hsvToRgb(hNew, sNew, vNew);
+}
+
+float evalProfileCurve(float s)
+{
+    if (params[0].profile.hasToneCurve == 0)
+        return baseCurve(s);
+    if (s <= 0.0)
+        return toneCurveLut[0];
+    if (s >= 1.0)
+        return toneCurveLut[4095];
+    float pos = s * 4095.0;
+    uint i = (uint)pos;
+    float f = pos - (float)i;
+    return lerp(toneCurveLut[i], toneCurveLut[min(i + 1, 4095u)], f);
+}
+
+float3 profileToneRgb(float3 rgb)
+{
+    float3 c = max(rgb, 0.0);
+    float hi = max(c.r, max(c.g, c.b));
+    float lo = min(c.r, min(c.g, c.b));
+    if (hi <= lo)
+    {
+        float v = evalProfileCurve(hi);
+        return float3(v, v, v);
+    }
+    float hiOut = evalProfileCurve(hi);
+    float loOut = evalProfileCurve(lo);
+    return loOut + (hiOut - loOut) * (c - lo) / (hi - lo);
+}
+#endif
+
 #include "lens.hlsli"
 
 // The sensor-image position for a corrected-image position; ca is the colour's chromatic
@@ -394,12 +546,20 @@ void main(uint3 id : SV_DispatchThreadID)
     float satNow = saturation;
     float clarityNow = lum.w;
     float overlay = 0.0;
+#ifdef PROFILE
+    float maskExposure = 0.0;
+#endif
 #ifdef MASKS
     if (maskCount != 0)
     {
         float2 pm = uv_in * dims / max(dims.x, dims.y);
         MaskLocal ml = evalMasks(pm, uv_in);
+#ifdef PROFILE
+        cam *= exp2(ml.wbLog2);
+        maskExposure = ml.exposure;
+#else
         cam *= exp2(ml.exposure + ml.wbLog2);
+#endif
         sl.contrast = clamp(sl.contrast + ml.contrast, -1.0, 1.0);
         sl.highlights = clamp(sl.highlights + ml.highlights, -1.0, 1.0);
         sl.shadows = clamp(sl.shadows + ml.shadows, -1.0, 1.0);
@@ -411,10 +571,20 @@ void main(uint3 id : SV_DispatchThreadID)
             overlay = maskWeight(maskFlags >> 8, pm, uv_in);
     }
 #endif
+#ifdef PROFILE
+    float3 pro = float3(dot(row0, cam), dot(row1, cam), dot(row2, cam));
+    if (params[0].profile.hueSatDims.x > 0)
+        pro = applyHsvTable(pro, hueSatTable, params[0].profile.hueSatDims, params[0].profile.hueSatEncoding);
+    pro *= exp2(params[0].profile.exposureGain + maskExposure);
+    if (params[0].profile.lookDims.x > 0)
+        pro = applyHsvTable(pro, lookTable, params[0].profile.lookDims, params[0].profile.lookEncoding);
+    float x = log2(max(dot(lum.xyz, cam) * exp2(maskExposure), 1e-9));
+#else
     float3 wide = float3(dot(row0, cam), dot(row1, cam), dot(row2, cam));
     // Brightness in stops, moved by the sliders: the pixel's own for Contrast, Blacks and
     // Whites, and its surroundings' (the base) for Highlights and Shadows.
     float x = log2(max(dot(lum.xyz, cam), 1e-9));
+#endif
     float xg = toneGlobal(x, sl);
     float2 baseDims;
     baseCoefficients.GetDimensions(baseDims.x, baseDims.y);
@@ -430,7 +600,11 @@ void main(uint3 id : SV_DispatchThreadID)
         float2 ab2 = clarityCoefficients.SampleLevel(linearClamp, clamp(uv * vignette.zw, 0.5, claritySize - 0.5) / clarityDims, 0);
         shifted += clarityShift(xg, ab2.x * xg + ab2.y, clarityNow);
     }
+#ifdef PROFILE
+    float3 rgb = mul(PROPHOTO_TO_SRGB, profileToneRgb(pro * exp2(shifted - x)));
+#else
     float3 rgb = mul(REC2020_TO_SRGB, toneRgb(wide * exp2(shifted - x)));
+#endif
     if (canvas.w != 0.0) // set when any colour mixer slider is not zero
         rgb = mixer(rgb);
     rgb = saturate(presence(rgb, satNow));

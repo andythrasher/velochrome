@@ -254,7 +254,7 @@ fn save_comparison(dir: &str, tag: &str, bgra: &[u8], rgb: &[u8], w: usize, h: u
             let pa = [p[2], p[1], p[0]];
             a.put_pixel(x as u32, y as u32, image::Rgb(pa));
             b.put_pixel(x as u32, y as u32, image::Rgb([q[0], q[1], q[2]]));
-            let diff = [0, 1, 2].map(|c| (pa[c] as i32 - q[c] as i32));
+            let diff = [0, 1, 2].map(|c| pa[c] as i32 - q[c] as i32);
             for c in 0..3 {
                 signed[c] += diff[c] as f64;
             }

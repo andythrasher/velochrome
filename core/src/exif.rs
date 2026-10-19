@@ -345,6 +345,28 @@ pub fn capture_time(path: &Path) -> Option<Stamp> {
     decode::embedded_jpegs(&head).iter().find_map(|j| in_jpeg(&head[j.offset..]))
 }
 
+/// Reads `(Make, Model)` (`0x010F`, `0x0110`) from the start of a raw or JPEG file.
+pub fn camera_make_model(path: &Path) -> Option<(String, String)> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    std::fs::File::open(path).ok()?.take(64 << 10).read_to_end(&mut head).ok()?;
+    let tiff = if head.starts_with(&SOI) { find_exif(&head)? } else { &head };
+    let little = match tiff.get(0..2)? {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let t = Tiff { buf: tiff.to_vec(), little };
+    let tags0 = t.tags(t.u32_at(4)? as usize);
+    let ascii = |id: u16| -> Option<String> {
+        let x = tags0.iter().find(|x| x.tag == id && x.ty == 2)?;
+        Some(std::str::from_utf8(&x.data).ok()?.trim_end_matches('\0').trim().to_string())
+    };
+    let model = ascii(0x0110)?;
+    let make = ascii(0x010F).unwrap_or_default();
+    Some((make, model))
+}
+
 /// A raw-like file for tests: a TIFF whose Exif directory holds `date` as DateTimeOriginal.
 #[cfg(test)]
 pub fn test_tiff(date: &str) -> Vec<u8> {

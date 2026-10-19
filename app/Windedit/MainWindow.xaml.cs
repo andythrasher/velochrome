@@ -350,7 +350,7 @@ public sealed partial class MainWindow : Window
             return;
         }
         // Leave keys alone while a filter list or the folder search has focus.
-        if (focused is ComboBox or TextBox)
+        if (focused is ComboBox or TextBox || profileListOpen)
             return;
         // A focused slider keeps the keys that move it.
         if (focused is Slider && e.Key is VirtualKey.Left or VirtualKey.Right or VirtualKey.Up or VirtualKey.Down

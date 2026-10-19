@@ -88,7 +88,9 @@ pub fn photo_id(raw: &Path) -> Option<u64> {
 /// Everything that changes what a photo looks like: not its stars, label or pick.
 pub fn fingerprint(edit: &Edit, masks: &Masks, strokes: &StrokeMap) -> u128 {
     let mut h = Hasher128::new();
-    let _ = write!(h, "v{RENDER_VERSION}|{edit:?}|{:?}", masks.masks());
+    let base = Edit { profile: 0, ..*edit };
+    let prof = crate::profile::name_of(edit.profile);
+    let _ = write!(h, "v{RENDER_VERSION}|{base:?}|{prof:?}|{:?}", masks.masks());
     for (id, list) in strokes {
         let _ = write!(h, "|{id}");
         for s in list.iter() {

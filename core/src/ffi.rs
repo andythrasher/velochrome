@@ -305,6 +305,33 @@ pub extern "C" fn we_lens_info(handle: *const Handle, index: i32, distortion: *m
     })
 }
 
+/// The camera profiles available for photo `index`: writes up to `cap` profile ids (`Edit::profile`)
+/// into `ids` (always starting with `0` for "Windedit") and returns how many there are.
+#[unsafe(no_mangle)]
+pub extern "C" fn we_photo_profiles(handle: *const Handle, index: i32, ids: *mut u32, cap: i32) -> i32 {
+    guard(handle, |e| {
+        let list = e.profiles(index.max(0) as usize);
+        if !ids.is_null() && cap > 0 {
+            for (i, &(id, _)) in list.iter().take(cap as usize).enumerate() {
+                unsafe { *ids.add(i) = id };
+            }
+        }
+        Ok(list.len() as i32)
+    })
+}
+
+/// The display name of profile `id` (`0` is `"Windedit"`).
+#[unsafe(no_mangle)]
+pub extern "C" fn we_profile_name(id: u32, buf: *mut u16, len: u32) -> u32 {
+    // Profile 0 is Windedit's own look: it has no name in the registry (nothing goes in the
+    // sidecar for it), but the app shows it by this one.
+    match (id, crate::profile::name_of(id)) {
+        (0, _) => write_wide("Windedit", buf, len),
+        (_, Some(name)) => write_wide(&name, buf, len),
+        (_, None) => 0,
+    }
+}
+
 /// Picks a white balance from a click at (`view_x`, `view_y`) on the view (physical pixels), the
 /// way the view is drawn now (zoom, crop, straighten, rotation and lens included): writes the
 /// temperature and tint that make the spot neutral and returns 1. A spot that can't be used

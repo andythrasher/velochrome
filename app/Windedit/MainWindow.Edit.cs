@@ -36,6 +36,16 @@ public sealed partial class MainWindow
     readonly List<Adjustment> adjustments = [];
     Adjustment temperature = null!, tint = null!;
     TextBlock whiteBalanceText = null!;
+    ComboBox profileBox = null!;
+    int profilesKnownFor = -1;
+    uint committedProfile;
+    bool profilePreviewing;
+    // The item the pointer was released on, while the drop-down is open: the choice, as far as a click goes (see AddProfileItem).
+    uint? profileClicked;
+    // The item a press landed on since the drop-down opened. The release of the click that opened it must not count as a choice.
+    uint? profilePressed;
+    // True from the drop-down opening until its Closed event, which comes after the key that closes it has reached the window.
+    bool profileListOpen;
     /// <summary>The adjustments of the photo in view, as last sent to the engine.</summary>
     Engine.Edit edit = Engine.Edit.None;
     /// <summary>A slider moved since the last commit.</summary>
@@ -50,6 +60,7 @@ public sealed partial class MainWindow
         groupHost = EditControls;
 
         Header("White balance");
+        BuildProfileRow();
         whiteBalanceText = new TextBlock { Opacity = 0.6, FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
         pickerButton = new ToggleButton
         {
@@ -223,6 +234,122 @@ public sealed partial class MainWindow
         return toggle;
     }
 
+    void BuildProfileRow()
+    {
+        var row = new Grid { ColumnSpacing = 10, Margin = new Thickness(0, 2, 0, 8) };
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        row.Children.Add(new TextBlock { Text = "Profile", FontSize = 13, VerticalAlignment = VerticalAlignment.Center });
+        profileBox = new ComboBox { HorizontalAlignment = HorizontalAlignment.Stretch };
+        Grid.SetColumn(profileBox, 1);
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(profileBox, "Profile");
+        ToolTipService.SetToolTip(profileBox, "Camera profile");
+        profileBox.DropDownOpened += (_, _) =>
+        {
+            profileListOpen = true;
+            committedProfile = edit.Profile;
+            profilePreviewing = false;
+            profileClicked = null;
+            profilePressed = null;
+        };
+        profileBox.SelectionChanged += (_, _) =>
+        {
+            if (updatingSliders || profileBox.SelectedItem is not ComboBoxItem { Tag: uint chosen })
+                return;
+            profilePreviewing = false;
+            committedProfile = chosen;
+            Change(e => e with { Profile = chosen }, commit: true);
+            FocusKeys();
+        };
+        profileBox.DropDownClosed += (_, _) =>
+        {
+            profileListOpen = false;
+            // A click on an entry that the preview had already selected raises no SelectionChanged, so the
+            // choice is committed here. Closing any other way (Esc, a click elsewhere) gives the preview up.
+            if (profileClicked is { } clicked)
+            {
+                profileClicked = null;
+                profilePreviewing = false;
+                if (clicked != committedProfile)
+                {
+                    committedProfile = clicked;
+                    Change(e => e with { Profile = clicked }, commit: true);
+                }
+            }
+            if (profilePreviewing)
+            {
+                profilePreviewing = false;
+                if (CurrentPhoto is { } p && edit.Profile != committedProfile)
+                {
+                    edit = edit with { Profile = committedProfile };
+                    engine.SetEdit(p.Index, edit, commit: false);
+                }
+            }
+            FocusKeys();
+        };
+        row.Children.Add(profileBox);
+        group.Children.Add(row);
+    }
+
+    void AddProfileItem(uint id, string name)
+    {
+        var item = new ComboBoxItem { Content = name, Tag = id };
+        item.PointerEntered += (_, _) =>
+        {
+            if (!profileBox.IsDropDownOpen || CurrentPhoto is not { } p)
+                return;
+            if (edit.Profile != id)
+            {
+                profilePreviewing = true;
+                edit = edit with { Profile = id };
+                engine.SetEdit(p.Index, edit, commit: false);
+            }
+        };
+        item.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, _) => profilePressed = id), true);
+        item.AddHandler(UIElement.PointerReleasedEvent, new PointerEventHandler((_, _) =>
+        {
+            if (profilePressed == id)
+                profileClicked = id;
+        }), true);
+        profileBox.Items.Add(item);
+    }
+
+    void UpdateProfileBox()
+    {
+        if (CurrentPhoto is not { } p)
+        {
+            profilesKnownFor = -1;
+            return;
+        }
+        if (profilesKnownFor != p.Index)
+        {
+            profilesKnownFor = p.Index;
+            var list = engine.PhotoProfiles(p.Index);
+            profileBox.Items.Clear();
+            foreach (var (id, name) in list)
+                AddProfileItem(id, name);
+        }
+        var index = 0;
+        for (var i = 0; i < profileBox.Items.Count; i++)
+        {
+            if (profileBox.Items[i] is ComboBoxItem { Tag: uint id } && id == edit.Profile)
+            {
+                index = i;
+                break;
+            }
+        }
+        if (index == 0 && edit.Profile != 0)
+        {
+            var extra = Engine.ProfileName(edit.Profile);
+            if (extra.Length > 0)
+            {
+                AddProfileItem(edit.Profile, extra);
+                index = profileBox.Items.Count - 1;
+            }
+        }
+        profileBox.SelectedIndex = index;
+    }
+
     /// <summary>The photo whose lens data the switches were set from, or -1 until it is known.</summary>
     int lensKnownFor = -1;
 
@@ -376,6 +503,8 @@ public sealed partial class MainWindow
     void LoadEdit()
     {
         CommitEdit();
+        profilesKnownFor = -1;
+        lensKnownFor = -1;
         edit = CurrentPhoto is { } p ? engine.GetEdit(p.Index) : Engine.Edit.None;
         LoadMasks();
         ShowEdit();
@@ -387,6 +516,7 @@ public sealed partial class MainWindow
     {
         SyncIntended();
         updatingSliders = true;
+        UpdateProfileBox();
         foreach (var a in adjustments)
         {
             if (a == temperature || a == tint)

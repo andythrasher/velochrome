@@ -26,6 +26,10 @@ pub struct Kernels {
     pub develop: Kernel,
     /// The develop pass with masks (`MASKS` in develop.hlsl).
     pub develop_masks: Kernel,
+    /// The develop pass with a camera profile (`PROFILE` in develop.hlsl).
+    pub develop_profile: Kernel,
+    /// The develop pass with both a camera profile and masks.
+    pub develop_profile_masks: Kernel,
     pub tone_small: Kernel,
     pub tone_guide: Kernel,
     pub tone_stats: Kernel,
@@ -78,12 +82,69 @@ pub struct Gpu {
     pub clarity_key: std::cell::Cell<Option<(u64, [u32; 10])>>,
     /// The detail pass (detail.rs): its memory and what its texture holds.
     pub detail: std::cell::RefCell<crate::detail::DetailState>,
+    /// Upload buffers for the active DCP camera profile (allocated on first profile use).
+    pub profile: std::cell::RefCell<Option<ProfileGpu>>,
 }
 
 /// Room for the tone parameters.
 const PARAMS_BYTES: u64 = 512;
 /// Room for the masks (`masks::GpuMaskSet::masks`, 3584 bytes).
 const MASKS_BYTES: u64 = 4096;
+
+/// Persistent upload buffers for a DCP profile's `HueSatMap` (t8), `LookTable` (t9) and
+/// `ProfileToneCurve` (t10). `LookTable` and `ProfileToneCurve` are uploaded once when the profile
+/// changes; `HueSatMap` is interpolated and uploaded when the profile or white balance temperature
+/// changes.
+pub struct ProfileGpu {
+    huesat: ID3D12Resource,
+    huesat_ptr: *mut [f32; 4],
+    huesat_cap: usize,
+    huesat_key: Option<(usize, u32)>,
+    look: ID3D12Resource,
+    look_ptr: *mut [f32; 4],
+    look_cap: usize,
+    look_key: Option<usize>,
+    curve: ID3D12Resource,
+    curve_ptr: *mut f32,
+}
+
+impl ProfileGpu {
+    fn new(device: &ID3D12Device, hs_cap: usize, lk_cap: usize) -> Result<ProfileGpu> {
+        unsafe {
+            let hs_cap = hs_cap.max(90 * 30 * 4);
+            let lk_cap = lk_cap.max(90 * 16 * 16);
+            let huesat = new_buffer(device, (hs_cap * 16) as u64, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+            let mut huesat_ptr = std::ptr::null_mut();
+            huesat.Map(0, Some(&D3D12_RANGE::default()), Some(&mut huesat_ptr))?;
+
+            let look = new_buffer(device, (lk_cap * 16) as u64, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+            let mut look_ptr = std::ptr::null_mut();
+            look.Map(0, Some(&D3D12_RANGE::default()), Some(&mut look_ptr))?;
+
+            let curve = new_buffer(
+                device,
+                (crate::profile::TONE_CURVE_LUT_LEN * 4) as u64,
+                D3D12_HEAP_TYPE_UPLOAD,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            )?;
+            let mut curve_ptr = std::ptr::null_mut();
+            curve.Map(0, Some(&D3D12_RANGE::default()), Some(&mut curve_ptr))?;
+
+            Ok(ProfileGpu {
+                huesat,
+                huesat_ptr: huesat_ptr as *mut [f32; 4],
+                huesat_cap: hs_cap,
+                huesat_key: None,
+                look,
+                look_ptr: look_ptr as *mut [f32; 4],
+                look_cap: lk_cap,
+                look_key: None,
+                curve,
+                curve_ptr: curve_ptr as *mut f32,
+            })
+        }
+    }
+}
 
 /// Textures and a buffer for the tone pre-pass, which reduces the photo to a copy about
 /// `BASE_EDGE` pixels across. All stay in the unordered access state, except while the develop
@@ -181,6 +242,11 @@ impl Gpu {
                 downsample: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/downsample.dxil")))?,
                 develop: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/develop.dxil")))?,
                 develop_masks: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/developmasks.dxil")))?,
+                develop_profile: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/developprofile.dxil")))?,
+                develop_profile_masks: kernel(
+                    &device,
+                    include_bytes!(concat!(env!("OUT_DIR"), "/developprofilemasks.dxil")),
+                )?,
                 tone_small: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/tonesmall.dxil")))?,
                 tone_guide: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/toneguide.dxil")))?,
                 tone_stats: kernel(&device, include_bytes!(concat!(env!("OUT_DIR"), "/tonestats.dxil")))?,
@@ -227,6 +293,7 @@ impl Gpu {
                 clarity,
                 clarity_key: Default::default(),
                 detail: Default::default(),
+                profile: Default::default(),
             })
         }
     }
@@ -443,6 +510,42 @@ impl Gpu {
             },
         };
         unsafe { self.device.CreateShaderResourceView(resource, Some(&desc), self.cpu_handle(slot)) };
+    }
+
+    /// Uploads (when changed) and binds a DCP profile's `HueSatMap` (`slot`), `LookTable`
+    /// (`slot + 1`) and `ProfileToneCurve` (`slot + 2`).
+    pub fn srv_profile(&self, prof: &std::sync::Arc<crate::profile::Profile>, temp_k: f32, slot: u32) {
+        let mut cell = self.profile.borrow_mut();
+        let need_hs = prof.hue_sat_data1.len();
+        let need_lk = prof.look_data.len();
+        if cell.as_ref().is_none_or(|pg| need_hs > pg.huesat_cap || need_lk > pg.look_cap) {
+            *cell = ProfileGpu::new(&self.device, need_hs, need_lk).ok();
+        }
+        let Some(pg) = cell.as_mut() else { return };
+        let key_ptr = std::sync::Arc::as_ptr(prof) as usize;
+
+        if pg.look_key != Some(key_ptr) {
+            if !prof.look_data.is_empty() {
+                unsafe { std::ptr::copy_nonoverlapping(prof.look_data.as_ptr(), pg.look_ptr, prof.look_data.len()) };
+            }
+            if let Some(lut) = &prof.tone_curve_lut {
+                unsafe { std::ptr::copy_nonoverlapping(lut.as_ptr(), pg.curve_ptr, crate::profile::TONE_CURVE_LUT_LEN) };
+            }
+            pg.look_key = Some(key_ptr);
+        }
+
+        let hs_key = (key_ptr, (temp_k * 10.0).round() as u32);
+        if pg.huesat_key != Some(hs_key) {
+            if !prof.hue_sat_data1.is_empty() {
+                let hs = prof.interpolated_hue_sat(temp_k);
+                unsafe { std::ptr::copy_nonoverlapping(hs.as_ptr(), pg.huesat_ptr, hs.len()) };
+            }
+            pg.huesat_key = Some(hs_key);
+        }
+
+        self.srv_buffer(&pg.huesat, DXGI_FORMAT_R32G32B32A32_FLOAT, need_hs.max(1) as u32, slot);
+        self.srv_buffer(&pg.look, DXGI_FORMAT_R32G32B32A32_FLOAT, need_lk.max(1) as u32, slot + 1);
+        self.srv_buffer(&pg.curve, DXGI_FORMAT_R32_FLOAT, crate::profile::TONE_CURVE_LUT_LEN as u32, slot + 2);
     }
 
     pub fn uav_texture(&self, resource: &ID3D12Resource, format: DXGI_FORMAT, mip: u32, slot: u32) {
