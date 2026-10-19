@@ -212,6 +212,7 @@ public sealed partial class MainWindow
         engine.SetCropMode(true);
         CropCanvas.Visibility = Visibility.Visible;
         cropButton.Content = "Done  (Enter)";
+        UpdateTools();
         UpdateCropOverlay();
         FocusKeys();
     }
@@ -243,6 +244,7 @@ public sealed partial class MainWindow
         engine.SetCropMode(false);
         CropCanvas.Visibility = Visibility.Collapsed;
         cropButton.Content = "Crop  (R)";
+        UpdateTools();
         ShowEdit();
         FocusKeys();
     }

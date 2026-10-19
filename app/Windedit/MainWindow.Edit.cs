@@ -45,7 +45,9 @@ public sealed partial class MainWindow
 
     void BuildEditPanel()
     {
+        groupHost = CropControls;
         BuildCropGroup();
+        groupHost = EditControls;
 
         Header("White balance");
         whiteBalanceText = new TextBlock { Opacity = 0.6, FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
@@ -151,6 +153,9 @@ public sealed partial class MainWindow
         });
     }
 
+    /// <summary>Where <see cref="Header"/> puts the groups being built: the Edit panel, or the Crop tool's.</summary>
+    StackPanel groupHost = null!;
+
     /// <summary>The panel of the group being built: <see cref="Add"/> puts sliders in it.</summary>
     StackPanel group = null!;
 
@@ -165,7 +170,7 @@ public sealed partial class MainWindow
             HorizontalAlignment = HorizontalAlignment.Stretch,
             HorizontalContentAlignment = HorizontalAlignment.Left,
             Padding = new Thickness(4, 6, 4, 6),
-            Margin = new Thickness(0, EditControls.Children.Count == 0 ? 0 : 8, 0, 0),
+            Margin = new Thickness(0, groupHost.Children.Count == 0 ? 0 : 8, 0, 0),
             Content = new StackPanel
             {
                 Orientation = Orientation.Horizontal,
@@ -191,8 +196,8 @@ public sealed partial class MainWindow
             SetLayout(text, open);
             FocusKeys();
         };
-        EditControls.Children.Add(button);
-        EditControls.Children.Add(body);
+        groupHost.Children.Add(button);
+        groupHost.Children.Add(body);
     }
 
     ToggleSwitch distortionSwitch = null!, aberrationSwitch = null!;

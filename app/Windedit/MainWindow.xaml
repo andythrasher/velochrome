@@ -185,11 +185,6 @@
                         </Flyout>
                     </AppBarButton.Flyout>
                 </AppBarButton>
-                <AppBarToggleButton x:Name="MasksToggle" Label="Masks" Click="Masks_Click" ToolTipService.ToolTip="Masks: local adjustments (Shift+W)">
-                    <AppBarToggleButton.Icon>
-                        <FontIcon Glyph="&#xE91B;" />
-                    </AppBarToggleButton.Icon>
-                </AppBarToggleButton>
                 <AppBarToggleButton x:Name="EditToggle" Label="Edit" Click="Edit_Click" ToolTipService.ToolTip="Edit: the developed raw (D, F8)">
                     <AppBarToggleButton.Icon>
                         <FontIcon Glyph="&#xE70F;" />
@@ -285,11 +280,13 @@
                            VerticalAlignment="Top" IsHitTestVisible="False" />
             </Grid>
 
-            <Grid x:Name="CanvasHost" Grid.Column="1">
+            <!-- A CursorGrid so the hand cursor of panning a zoomed photo can be set over the swap chain panel. -->
+            <local:CursorGrid x:Name="CanvasHost" Grid.Column="1">
                 <SwapChainPanel x:Name="Panel"
                                 SizeChanged="Panel_SizeChanged"
                                 CompositionScaleChanged="Panel_CompositionScaleChanged"
-                                PointerPressed="Panel_PointerPressed" />
+                                PointerPressed="Panel_PointerPressed" PointerMoved="Panel_PointerMoved"
+                                PointerReleased="Panel_PointerReleased" PointerCaptureLost="Panel_PointerCaptureLost" />
                 <!-- Crop mode's overlay (MainWindow.Crop.cs): follows the panel's size, so it follows the window and the side panels. -->
                 <local:CursorCanvas x:Name="CropCanvas" Visibility="Collapsed" Background="Transparent" />
                 <!-- The Masks panel's handles on the photo (MainWindow.Masks.cs). -->
@@ -318,16 +315,51 @@
                 </ScrollViewer>
                 <TextBlock x:Name="EmptyText" HorizontalAlignment="Center" VerticalAlignment="Center"
                            Opacity="0.6" TextAlignment="Center" TextWrapping="Wrap" MaxWidth="420" />
-            </Grid>
+            </local:CursorGrid>
 
-            <ScrollViewer x:Name="EditPanel" Grid.Column="2" Width="300" Visibility="Collapsed"
-                          BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1,0,0,0">
-                <StackPanel>
-                    <StackPanel x:Name="EditControls" Padding="16,10,16,16" Spacing="2" />
-                    <!-- The Masks panel (MainWindow.Masks.cs) takes the place of the Edit groups while it is open. -->
-                    <StackPanel x:Name="MaskControls" Padding="16,10,16,16" Spacing="2" Visibility="Collapsed" />
-                </StackPanel>
-            </ScrollViewer>
+            <!-- The Edit panel: a tool strip that stays put (MainWindow.Tools.cs), and under it whichever tool's panel is showing. -->
+            <Grid x:Name="EditPanel" Grid.Column="2" Width="300" Visibility="Collapsed"
+                  BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1,0,0,0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition />
+                </Grid.RowDefinitions>
+                <Border BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="0,0,0,1" Padding="12,8">
+                    <StackPanel Orientation="Horizontal" Spacing="4" HorizontalAlignment="Left">
+                        <StackPanel.Resources>
+                            <Style TargetType="ToggleButton" BasedOn="{StaticResource DefaultToggleButtonStyle}">
+                                <Setter Property="Width" Value="44" />
+                                <Setter Property="Height" Value="36" />
+                                <Setter Property="Padding" Value="0" />
+                            </Style>
+                        </StackPanel.Resources>
+                        <ToggleButton x:Name="EditTool" Click="EditTool_Click" ToolTipService.ToolTip="Edit: the adjustments"
+                                      AutomationProperties.Name="Edit">
+                            <FontIcon Glyph="&#xE9E9;" FontSize="18" />
+                        </ToggleButton>
+                        <ToggleButton x:Name="CropTool" Click="CropTool_Click" ToolTipService.ToolTip="Crop and straighten (R)"
+                                      AutomationProperties.Name="Crop">
+                            <FontIcon Glyph="&#xE7A8;" FontSize="18" />
+                        </ToggleButton>
+                        <ToggleButton x:Name="MaskTool" Click="MaskTool_Click" ToolTipService.ToolTip="Masks: local adjustments (Shift+W)"
+                                      AutomationProperties.Name="Masks">
+                            <FontIcon Glyph="&#xEA3A;" FontSize="18" />
+                        </ToggleButton>
+                    </StackPanel>
+                </Border>
+                <ScrollViewer x:Name="EditScroller" Grid.Row="1">
+                    <StackPanel>
+                        <!-- Crop has its handles on the photo; this says what they do. -->
+                        <TextBlock x:Name="CropHelp" Visibility="Collapsed" Margin="20,12,16,0" FontSize="12" Opacity="0.6" TextWrapping="Wrap"
+                                   Text="Drag corners or edges to resize · drag inside to move · drag outside to rotate&#10;Enter: done · Esc: cancel" />
+                        <!-- The Crop group, shown instead of the Edit groups while the Crop tool is on. -->
+                        <StackPanel x:Name="CropControls" Padding="16,10,16,16" Spacing="2" Visibility="Collapsed" />
+                        <StackPanel x:Name="EditControls" Padding="16,10,16,16" Spacing="2" />
+                        <!-- The Masks panel (MainWindow.Masks.cs) takes the place of the Edit groups while it is open. -->
+                        <StackPanel x:Name="MaskControls" Padding="16,10,16,16" Spacing="2" Visibility="Collapsed" />
+                    </StackPanel>
+                </ScrollViewer>
+            </Grid>
         </Grid>
 
         <!-- Filmstrip (loupe only) -->

@@ -426,20 +426,11 @@ public sealed partial class MainWindow
 
     // ---- Entering and leaving ----
 
-    void Masks_Click(object sender, RoutedEventArgs e)
-    {
-        if (MasksToggle.IsChecked == true)
-            EnterMasks();
-        else
-            ExitMasks();
-        FocusKeys();
-    }
-
     void EnterMasks()
     {
         if (CurrentPhoto == null || gridMode)
         {
-            MasksToggle.IsChecked = false;
+            UpdateTools();
             return;
         }
         if (masking)
@@ -450,10 +441,10 @@ public sealed partial class MainWindow
             SetEditMode(true);
         CommitEdit();
         masking = true;
-        MasksToggle.IsChecked = true;
         EditControls.Visibility = Visibility.Collapsed;
         MaskControls.Visibility = Visibility.Visible;
         MaskCanvas.Visibility = Visibility.Visible;
+        UpdateTools();
         selMask = masks.Count > 0 ? Math.Clamp(selMask, 0, (int)masks.Count - 1) : -1;
         selComp = selMask >= 0 && masks.Items[selMask].Count > 0 ? 0 : -1;
         RebuildMaskPanel();
@@ -471,13 +462,13 @@ public sealed partial class MainWindow
         creatingShape = 0;
         mkGrab = Grab.None;
         masking = false;
-        MasksToggle.IsChecked = false;
         MaskControls.Visibility = Visibility.Collapsed;
         EditControls.Visibility = Visibility.Visible;
         MaskCanvas.Visibility = Visibility.Collapsed;
         BrushStrip.Visibility = Visibility.Collapsed;
         MaskCanvas.Children.Clear();
         engine.SetMaskOverlay(-1);
+        UpdateTools();
     }
 
     /// <summary>The masks of the photo now in view.</summary>

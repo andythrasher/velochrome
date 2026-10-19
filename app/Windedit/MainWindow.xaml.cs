@@ -71,6 +71,7 @@ public sealed partial class MainWindow : Window
         BuildMaskPanel();
         InitMasks();
         InitCrop();
+        UpdateTools();
         InitExport();
         InitAppearance();
         BuildFolderTree();
@@ -219,6 +220,7 @@ public sealed partial class MainWindow : Window
         {
             actualSize = false;
             engine.ZoomToFit();
+            UpdatePanCursor();
         }
         engine.Show(item.Index);
         LoadEdit();
@@ -489,6 +491,7 @@ public sealed partial class MainWindow : Window
         EditToggle.IsChecked = on;
         engine.SetEditMode(on);
         EditPanel.Visibility = on && !gridMode ? Visibility.Visible : Visibility.Collapsed;
+        UpdateTools();
         if (on)
             ShowEdit();
     }
@@ -522,7 +525,15 @@ public sealed partial class MainWindow : Window
     void Thumbnail_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e)
     {
         if (gridMode)
+        {
             SetGridMode(false);
+            return;
+        }
+        // In the filmstrip a double-click means "edit this photo": its first click has already shown
+        // the photo (Thumbnail_Tapped), so all that is left is opening Edit if it isn't open.
+        if (!editMode)
+            SetEditMode(true);
+        FocusKeys();
     }
 
     // ---- Zoom ----
@@ -531,6 +542,13 @@ public sealed partial class MainWindow : Window
     {
         if (CurrentPhoto == null || last.Width == 0)
             return;
+        // Zoomed in, a press starts dragging the photo; a click that doesn't move zooms back out (MainWindow.Tools.cs).
+        if (actualSize)
+        {
+            BeginPan(e);
+            FocusKeys();
+            return;
+        }
         // Where the click landed on the fitted photo, as fractions of its size.
         var p = e.GetCurrentPoint(Panel).Position;
         double w = Panel.ActualWidth, h = Panel.ActualHeight;
@@ -545,9 +563,16 @@ public sealed partial class MainWindow : Window
             return;
         actualSize = !actualSize;
         if (actualSize)
-            engine.ZoomToActual((float)Math.Clamp(x, 0, 1), (float)Math.Clamp(y, 0, 1));
+        {
+            // Clamped so a click near an edge doesn't open on blank canvas.
+            zoomCenter = ClampCenter(Math.Clamp(x, 0, 1), Math.Clamp(y, 0, 1));
+            engine.ZoomToActual((float)zoomCenter.X, (float)zoomCenter.Y);
+        }
         else
+        {
             engine.ZoomToFit();
+        }
+        UpdatePanCursor();
         UpdatePhotoText();
     }
 
