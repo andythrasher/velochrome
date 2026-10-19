@@ -203,6 +203,9 @@ public sealed partial class MainWindow
             engine.ZoomToFit();
             UpdatePhotoText();
         }
+        // A crop already reduced to a speck (by an old bug, say) is given back as the biggest box there is at its angle.
+        if (Specks(CropOf(edit)) && last.FrameWidth > 0)
+            Change(e => WithCrop(e, Engine.ConstrainCrop(last.FrameWidth, last.FrameHeight, e.Angle, Engine.Constrain.Shrink, [0, 0, 1, 1], [0, 0, 1, 1])), commit: true);
         CommitEdit();
         cropping = true;
         cropCommits = 0;
@@ -263,6 +266,15 @@ public sealed partial class MainWindow
 
     static float[] CropOf(Engine.Edit e) => [e.CropLeft, e.CropTop, e.CropRight, e.CropBottom];
 
+    // Smaller than this (a hundredth of the frame, a few dozen pixels on screen) is a speck, never a crop anyone asked for.
+    const float MinBox = 0.01f;
+
+    static bool Specks(float[] c) => c[2] - c[0] < MinBox || c[3] - c[1] < MinBox;
+
+    /// <summary>Whether a drag step would collapse the box: the result is a speck and the box it came from was not.
+    /// Such a step is refused and the previous box stays, however the constraint maths came to it.</summary>
+    static bool Collapses(float[] result, float[] current) => Specks(result) && !Specks(current);
+
     static Engine.Edit WithCrop(Engine.Edit e, float[] c) =>
         e with { CropLeft = c[0], CropTop = c[1], CropRight = c[2], CropBottom = c[3] };
 
@@ -278,10 +290,13 @@ public sealed partial class MainWindow
     /// <summary>A new angle, with the intended box made smaller where the photo no longer reaches it.</summary>
     Engine.Edit WithAngle(Engine.Edit e, float angle)
     {
+        var previousAngle = e.Angle;
         e = e with { Angle = angle };
         if (last.FrameWidth == 0)
             return e;
-        return WithCrop(e, Engine.ConstrainCrop(last.FrameWidth, last.FrameHeight, angle, Engine.Constrain.Shrink, intended, intended));
+        var box = Engine.ConstrainCrop(last.FrameWidth, last.FrameHeight, angle, Engine.Constrain.Shrink, intended, intended);
+        // A box that would collapse leaves the angle as it was rather than ruin the crop.
+        return Collapses(box, CropOf(e)) ? e with { Angle = previousAngle } : WithCrop(e, box);
     }
 
     /// <summary>Keeps <see cref="intended"/> in step with the edit: it stays while the edit's box is what
@@ -555,6 +570,8 @@ public sealed partial class MainWindow
             var a = (float)(shiftNow ? Math.Round(total) : Math.Round(total, 1));
             // From the box as the user set it, so turning back gives it back.
             var box = Engine.ConstrainCrop(fw, fh, a, Engine.Constrain.Shrink, intended, intended);
+            if (Collapses(box, current))
+                return;
             Change(ed => WithCrop(ed with { Angle = a }, box), commit: false);
             angleText.Text = $"{a:+0.0;-0.0;0.0}°";
             angleLabel.Visibility = Visibility.Visible;
@@ -589,6 +606,9 @@ public sealed partial class MainWindow
             if ((dragKind & Bottom) != 0) want[3] += dy;
             result = Engine.ConstrainCrop(fw, fh, angle, Engine.Constrain.Edges, current, want);
         }
+        // Moving the photo under the box never changes the box's size.
+        if (Collapses(result, current) || (dragKind == Move && Math.Abs((result[2] - result[0]) - (current[2] - current[0])) > 1e-4f))
+            return;
         Change(ed => WithCrop(ed, result), commit: false);
     }
 

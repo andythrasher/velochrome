@@ -178,11 +178,14 @@ pub enum Constrain {
 /// The valid rectangle nearest to what the user asked for. `base` is a rectangle that fits (the
 /// crop before this drag step), `desired` what the drag asks for, possibly past the photo.
 pub fn constrain_crop(frame: (f64, f64), angle: f64, base: Rect, desired: Rect, how: Constrain) -> Rect {
-    let ok = |r: Rect| fits(frame, angle, r);
+    // The same few hundredths of a pixel as for the base below: a box wedged against the photo by a
+    // straighten is a hair outside the exact limit once it has been through `f32`, and judged to the
+    // exact limit every move away from there would fail and freeze it.
+    let ok = |r: Rect| fits_within(frame, angle, r, 0.05);
     // A box that was valid and has been through `f32` (as the app and the sidecar hold it) is off by
-    // about 1e-4 pixels, so the base only has to be valid to a few hundredths of a pixel; taken for
-    // invalid it would collapse to a sliver.
-    let base = if fits_within(frame, angle, base, 0.05) { base } else { [0.5 - MIN_SIZE, 0.5 - MIN_SIZE, 0.5 + MIN_SIZE, 0.5 + MIN_SIZE] };
+    // about 1e-4 pixels, so the base only has to be valid to a few hundredths of a pixel. One that
+    // is not valid at all is recovered by shrinking it as straightening would, never by collapsing it.
+    let base = if fits_within(frame, angle, base, 0.05) { base } else { shrink(frame, angle, base) };
     // The furthest value along good → bad that still passes (good must pass).
     let furthest = |good: f64, bad: f64, pass: &dyn Fn(f64) -> bool| {
         if pass(bad) {
@@ -205,11 +208,17 @@ pub fn constrain_crop(frame: (f64, f64), angle: f64, base: Rect, desired: Rect, 
             shrink(frame, angle, [cx - hw, cy - hh, cx + hw, cy + hh])
         }
         Constrain::Slide => {
-            let (sx, sy) = (desired[0] - base[0], desired[1] - base[1]);
-            let moved = |dx: f64, dy: f64| [base[0] + dx, base[1] + dy, base[2] + dx, base[3] + dy];
-            let dx = furthest(0.0, sx, &|t| ok(moved(t, 0.0)));
-            let dy = furthest(0.0, sy, &|t| ok(moved(dx, t)));
-            moved(dx, dy)
+            // The base's box, at the place nearest the desired one where it fits. Moving x and then
+            // y separately would stall against a turned edge, which only a move along it can follow.
+            let (hw, hh) = ((base[2] - base[0]) / 2.0, (base[3] - base[1]) / 2.0);
+            let want = [(desired[0] + desired[2]) / 2.0 - 0.5, (desired[1] + desired[3]) / 2.0 - 0.5];
+            match nearest_centre(frame, angle, hw, hh, 1.0, [want[0] * frame.0, want[1] * frame.1]) {
+                Some(p) => {
+                    let (cx, cy) = (0.5 + p[0] / frame.0, 0.5 + p[1] / frame.1);
+                    [cx - hw, cy - hh, cx + hw, cy + hh]
+                }
+                None => base,
+            }
         }
         Constrain::Edges => {
             let mut r = base;
@@ -247,34 +256,87 @@ pub fn constrain_crop(frame: (f64, f64), angle: f64, base: Rect, desired: Rect, 
     }
 }
 
-/// `desired` made smaller about its centre until it fits. If the centre itself is outside the
-/// photo, the centre moves toward the frame's first.
+/// `desired` made smaller until it fits, keeping its shape. It shrinks about its own centre when
+/// that leaves a box of reasonable size; when the centre is near the photo's edge, or outside the
+/// photo (a box in a corner of the frame, which straightening cuts off), the centre moves to the
+/// nearest place where the largest box that fits has room, so a box is never reduced to a speck.
 fn shrink(frame: (f64, f64), angle: f64, desired: Rect) -> Rect {
-    let ok = |r: Rect| fits(frame, angle, r);
+    let (w, h) = frame;
     let (hw, hh) = ((desired[2] - desired[0]) / 2.0, (desired[3] - desired[1]) / 2.0);
-    let (mut cx, mut cy) = ((desired[0] + desired[2]) / 2.0, (desired[1] + desired[3]) / 2.0);
+    let (cx, cy) = ((desired[0] + desired[2]) / 2.0, (desired[1] + desired[3]) / 2.0);
     let around = |cx: f64, cy: f64, s: f64| [cx - s * hw, cy - s * hh, cx + s * hw, cy + s * hh];
-    if !ok(around(cx, cy, 0.0)) {
-        let (mut good, mut bad) = (0.0, 1.0);
-        let (x0, y0) = (cx, cy);
-        for _ in 0..40 {
-            let t = (good + bad) / 2.0;
-            let (x, y) = (x0 + t * (0.5 - x0), y0 + t * (0.5 - y0));
-            if ok(around(x, y, 0.0)) { bad = t } else { good = t }
+    // The box of scale s centred at (x, y), in pixels from the frame's centre, is inside the frame and
+    // inside the turned photo when each of these holds: a·(x, y) ≤ b0 − s·k. They come in opposite
+    // pairs about the origin, so the centre has room exactly while every b0 − s·k is not negative.
+    if hw * w <= 0.0 || hh * h <= 0.0 {
+        return desired;
+    }
+    let planes = box_planes(frame, angle, hw, hh);
+    // The biggest scale there is room for anywhere, and the biggest with the desired centre.
+    let anywhere = planes.iter().map(|&(_, b0, k)| b0 / k).fold(1.0, f64::min);
+    let p0 = [(cx - 0.5) * w, (cy - 0.5) * h];
+    let here = planes.iter().map(|&(n, b0, k)| (b0 - (n[0] * p0[0] + n[1] * p0[1])) / k).fold(anywhere, f64::min).max(0.0);
+    if here >= 0.6 * anywhere {
+        return around(cx, cy, here);
+    }
+    // Too small that way: the biggest box, as near the desired centre as it goes.
+    let s = anywhere * (1.0 - 1e-9);
+    match nearest_centre(frame, angle, hw, hh, s, p0) {
+        Some(p) => around(0.5 + p[0] / w, 0.5 + p[1] / h, s),
+        None => around(0.5, 0.5, s),
+    }
+}
+
+/// The box with half-size (`hw`, `hh`) (fractions of the frame) scaled by s and centred at (x, y),
+/// in pixels from the frame's centre, is inside the frame and inside the turned photo when each
+/// of these holds: n·(x, y) ≤ b0 − s·k. They come in opposite pairs about the origin, so the
+/// centre has room exactly while every b0 − s·k is not negative.
+fn box_planes(frame: (f64, f64), angle: f64, hw: f64, hh: f64) -> [([f64; 2], f64, f64); 8] {
+    let (w, h) = frame;
+    let (sin, cos) = angle.to_radians().sin_cos();
+    let (a, b) = (hw * w, hh * h);
+    [
+        ([1.0, 0.0], w / 2.0, a),
+        ([-1.0, 0.0], w / 2.0, a),
+        ([0.0, 1.0], h / 2.0, b),
+        ([0.0, -1.0], h / 2.0, b),
+        ([cos, sin], w / 2.0, a * cos.abs() + b * sin.abs()),
+        ([-cos, -sin], w / 2.0, a * cos.abs() + b * sin.abs()),
+        ([-sin, cos], h / 2.0, a * sin.abs() + b * cos.abs()),
+        ([sin, -cos], h / 2.0, a * sin.abs() + b * cos.abs()),
+    ]
+}
+
+/// Where the box of [`box_planes`] at scale s fits, nearest to `p0` (pixels from the frame's
+/// centre); None when it fits nowhere. The places it fits are a convex polygon, so the nearest is
+/// `p0` itself, its foot on one of the polygon's lines, or a corner where two lines meet.
+fn nearest_centre(frame: (f64, f64), angle: f64, hw: f64, hh: f64, s: f64, p0: [f64; 2]) -> Option<[f64; 2]> {
+    let limits: Vec<([f64; 2], f64)> = box_planes(frame, angle, hw, hh).iter().map(|&(n, b0, k)| (n, b0 - s * k)).collect();
+    let inside = |p: [f64; 2]| limits.iter().all(|&(n, l)| n[0] * p[0] + n[1] * p[1] <= l + 1e-3);
+    let mut best: Option<([f64; 2], f64)> = None;
+    let mut consider = |p: [f64; 2]| {
+        if inside(p) {
+            let d = (p[0] - p0[0]).powi(2) + (p[1] - p0[1]).powi(2);
+            if best.is_none_or(|(_, bd)| d < bd) {
+                best = Some((p, d));
+            }
         }
-        // `bad` is the smallest move that lands inside.
-        cx = x0 + bad * (0.5 - x0);
-        cy = y0 + bad * (0.5 - y0);
+    };
+    consider(p0);
+    for &(n, l) in &limits {
+        let off = n[0] * p0[0] + n[1] * p0[1] - l;
+        consider([p0[0] - off * n[0], p0[1] - off * n[1]]);
     }
-    if ok(around(cx, cy, 1.0)) {
-        return around(cx, cy, 1.0);
+    for i in 0..limits.len() {
+        for j in i + 1..limits.len() {
+            let ((n, l), (m, k)) = (limits[i], limits[j]);
+            let det = n[0] * m[1] - n[1] * m[0];
+            if det.abs() > 1e-12 {
+                consider([(l * m[1] - k * n[1]) / det, (n[0] * k - m[0] * l) / det]);
+            }
+        }
     }
-    let (mut good, mut bad) = (0.0, 1.0);
-    for _ in 0..40 {
-        let s = (good + bad) / 2.0;
-        if ok(around(cx, cy, s)) { good = s } else { bad = s }
-    }
-    around(cx, cy, good)
+    best.map(|(p, _)| p)
 }
 
 #[cfg(test)]
@@ -344,6 +406,130 @@ mod tests {
     }
 
     #[test]
+    fn a_straightened_box_held_in_f32_can_still_be_resized_and_moved() {
+        // Straightening leaves the box touching the photo's edges. Held as `f32` it is a hair over
+        // the exact limit, which must not freeze it: shrinking an edge takes the edge, and the box slides
+        // away from the corner it is wedged in.
+        for angle in [2.0, 9.5, 16.1, -9.5, -33.0] {
+            let held = constrain_crop(FRAME, angle, FULL, FULL, Constrain::Shrink).map(|v| v as f32 as f64);
+            let mut want = held;
+            want[2] -= 0.1;
+            let r = constrain_crop(FRAME, angle, held, want, Constrain::Edges);
+            assert!((r[2] - want[2]).abs() < 1e-6, "{angle}: edges {r:?} for {want:?}");
+            // Shrink first so there is room, then slide it about.
+            let small = [0.4, 0.4, 0.6, 0.6];
+            let moved = constrain_crop(FRAME, angle, small, [0.35, 0.4, 0.55, 0.6], Constrain::Slide);
+            assert!((moved[0] - 0.35).abs() < 1e-6, "{angle}: slide {moved:?}");
+            // And the held full-size box moves toward the middle of its slack, if it has any, without freezing.
+            let _ = constrain_crop(FRAME, angle, held, [held[0] - 0.01, held[1], held[2] - 0.01, held[3]], Constrain::Slide);
+        }
+    }
+
+
+    /// A small deterministic random source, so the property test needs no crate and fails the same way every time.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> f64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+        fn range(&mut self, lo: f64, hi: f64) -> f64 {
+            lo + (hi - lo) * self.next()
+        }
+    }
+    #[test]
+    fn no_drag_or_straighten_ever_collapses_the_box() {
+        // Random frames, angles (a few of them the ones people use) and boxes held as `f32` the way the
+        // app holds them, put through every kind of change. Whatever happens the result fits, a slide
+        // keeps the size, an edge only moves the way it was asked, a scale keeps the shape and is not
+        // smaller than asked, and straightening leaves a box of at least 60% of the biggest that fits.
+        let mut rng = Lcg(2024);
+        let frames = [(6000.0, 4000.0), (4000.0, 6000.0), (5184.0, 3456.0), (4608.0, 3456.0), (3000.0, 3000.0)];
+        let fixed = [-15.0, -4.2, -4.0, 0.0, 4.0, 4.2, 15.0];
+        let mut tried = 0;
+        for n in 0..30000 {
+            let frame = frames[(rng.next() * frames.len() as f64) as usize % frames.len()];
+            let angle = if n % 3 == 0 { fixed[(rng.next() * fixed.len() as f64) as usize % fixed.len()] } else { rng.range(-45.0, 45.0) };
+            let mut random_box = |rng: &mut Lcg| {
+                let (x0, y0) = (rng.range(0.0, 0.9), rng.range(0.0, 0.9));
+                [x0, y0, rng.range(x0 + 0.03, 1.0), rng.range(y0 + 0.03, 1.0)]
+            };
+            // Any box at all, in the frame: where a crop made at another angle (or none) leaves the intended one.
+            let intended = random_box(&mut rng);
+            let (iw, ih) = (intended[2] - intended[0], intended[3] - intended[1]);
+
+            // Straightening: from the intended box.
+            let shrunk = constrain_crop(frame, angle, intended, intended, Constrain::Shrink);
+            assert!(fits(frame, angle, shrunk), "shrink doesn't fit: {angle} {frame:?} {intended:?} -> {shrunk:?}");
+            let scale = (shrunk[2] - shrunk[0]) / iw;
+            assert!(((shrunk[3] - shrunk[1]) / ih - scale).abs() < 1e-6, "shrink changed the shape: {angle} {frame:?} {intended:?} -> {shrunk:?}");
+            let centred = {
+                let (mut good, mut bad) = (0.0, 1.0);
+                let at = |s: f64| [0.5 - s * iw / 2.0, 0.5 - s * ih / 2.0, 0.5 + s * iw / 2.0, 0.5 + s * ih / 2.0];
+                if fits(frame, angle, at(1.0)) { 1.0 } else {
+                    for _ in 0..50 {
+                        let m = (good + bad) / 2.0;
+                        if fits(frame, angle, at(m)) { good = m } else { bad = m }
+                    }
+                    good
+                }
+            };
+            assert!(scale >= 0.6 * centred - 1e-6, "shrink left a speck: {angle} {frame:?} {intended:?} -> {shrunk:?} (room for {centred})");
+
+            // Dragging: from a box that fits, held as `f32`.
+            let base = shrunk.map(|v| v as f32 as f64);
+            let (bw, bh) = (base[2] - base[0], base[3] - base[1]);
+            if bw < 0.05 || bh < 0.05 {
+                continue;
+            }
+            tried += 1;
+
+            let d = [rng.range(-0.5, 0.5), rng.range(-0.5, 0.5)];
+            let slid = constrain_crop(frame, angle, base, [base[0] + d[0], base[1] + d[1], base[2] + d[0], base[3] + d[1]], Constrain::Slide);
+            assert!(fits_within(frame, angle, slid, 0.05), "slide doesn't fit: {angle} {frame:?} {base:?} {d:?} -> {slid:?}");
+            assert!(((slid[2] - slid[0]) - bw).abs() < 1e-6 && ((slid[3] - slid[1]) - bh).abs() < 1e-6, "slide changed the size: {angle} {frame:?} {base:?} {d:?} -> {slid:?}");
+
+            let i = (rng.next() * 4.0) as usize % 4;
+            let mut want = base;
+            want[i] += rng.range(-0.4, 0.4);
+            let edged = constrain_crop(frame, angle, base, want, Constrain::Edges);
+            assert!(fits_within(frame, angle, edged, 0.05), "edge doesn't fit: {angle} {frame:?} {base:?} {want:?} -> {edged:?}");
+            for j in 0..4 {
+                if j != i {
+                    assert_eq!(edged[j], base[j], "edge {i} moved edge {j}");
+                }
+            }
+            let moved = edged[i] - base[i];
+            assert!(moved * (want[i] - base[i]) >= -1e-12, "edge {i} went the wrong way: {base:?} {want:?} -> {edged:?}");
+            assert!(edged[2] - edged[0] >= MIN_SIZE - 1e-12 && edged[3] - edged[1] >= MIN_SIZE - 1e-12, "edge collapsed: {edged:?}");
+
+            let f = rng.range(0.3, 1.8);
+            let anchor = [rng.range(base[0], base[2]), rng.range(base[1], base[3])];
+            let desired = [anchor[0] + f * (base[0] - anchor[0]), anchor[1] + f * (base[1] - anchor[1]), anchor[0] + f * (base[2] - anchor[0]), anchor[1] + f * (base[3] - anchor[1])];
+            let scaled = constrain_crop(frame, angle, base, desired, Constrain::Scale(anchor));
+            assert!(fits_within(frame, angle, scaled, 0.05), "scale doesn't fit: {angle} {frame:?} {base:?} {desired:?} -> {scaled:?}");
+            let (sw, sh) = (scaled[2] - scaled[0], scaled[3] - scaled[1]);
+            assert!((sw / bw - sh / bh).abs() < 1e-6, "scale changed the shape: {scaled:?}");
+            assert!(sw >= bw.min(bw * f) - 1e-6, "scale collapsed: {angle} {frame:?} {base:?} {desired:?} -> {scaled:?}");
+        }
+        assert!(tried > 10000, "only {tried} cases got as far as the drags");
+    }
+
+    #[test]
+    fn a_box_in_the_corner_survives_straightening_either_way() {
+        // The recorded collapse: a crop in the frame's top-left corner, then the Straighten slider moved a
+        // few degrees. The corner of the frame is cut off by the turned photo, the box's centre is outside
+        // it, and the old search reduced the box to a speck on the photo's edge.
+        for angle in [-15.0, -4.2, -4.0, 4.0, 4.2, 15.0] {
+            for corner in [[0.0, 0.0, 0.3, 0.3], [0.7, 0.0, 1.0, 0.3], [0.0, 0.7, 0.3, 1.0], [0.7, 0.7, 1.0, 1.0]] {
+                let r = constrain_crop(FRAME, angle, corner, corner, Constrain::Shrink);
+                assert!(fits(FRAME, angle, r), "{angle} {corner:?}: {r:?}");
+                assert!(r[2] - r[0] > 0.2, "{angle} {corner:?} became {r:?}");
+            }
+        }
+    }
+
+    #[test]
     fn square_frame_at_45_degrees() {
         // The biggest centred square in a square turned 45° has a side of 1/√2.
         let r = constrain_crop((1000.0, 1000.0), 45.0, FULL, FULL, Constrain::Shrink);
@@ -376,10 +562,42 @@ mod tests {
         let base = constrain_crop(FRAME, 10.0, FULL, FULL, Constrain::Shrink);
         let size = (base[2] - base[0], base[3] - base[1]);
         let r = constrain_crop(FRAME, 10.0, base, [base[0] + 0.5, base[1] + 0.5, base[2] + 0.5, base[3] + 0.5], Constrain::Slide);
-        assert!(fits(FRAME, 10.0, r));
+        assert!(fits_within(FRAME, 10.0, r, 0.05));
         assert!(((r[2] - r[0]) - size.0).abs() < 1e-9 && ((r[3] - r[1]) - size.1).abs() < 1e-9);
         // The crop was already tight at the start, so the slide cannot go far.
         assert!(r[0] - base[0] < 0.2, "{r:?}");
+    }
+
+    #[test]
+    fn slide_runs_along_a_turned_edge_to_the_corner() {
+        // A smaller box on a turned photo, held as f32 between steps as the app holds it. Pushed
+        // right it stops against the turned edge; pushed on down and right from there it must keep
+        // going along that edge (not stall because neither a pure x nor a pure y move fits), all
+        // the way to where it can go no further.
+        for angle in [8.0, -8.0, 4.2, -15.0] {
+            let max = constrain_crop(FRAME, angle, FULL, FULL, Constrain::Shrink);
+            let (hw, hh) = ((max[2] - max[0]) / 4.0, (max[3] - max[1]) / 4.0);
+            let start = [0.5 - hw, 0.5 - hh, 0.5 + hw, 0.5 + hh];
+            let f32s = |r: Rect| r.map(|v| v as f32 as f64);
+            let by = |r: Rect, dx: f64, dy: f64| [r[0] + dx, r[1] + dy, r[2] + dx, r[3] + dy];
+            let right = f32s(constrain_crop(FRAME, angle, start, by(start, 1.0, 0.0), Constrain::Slide));
+            assert!(right[0] - start[0] > 0.1, "{angle}: barely moved right: {right:?}");
+            // Step by step, as a drag does, toward the bottom-right corner.
+            let mut r = right;
+            for _ in 0..200 {
+                let next = f32s(constrain_crop(FRAME, angle, r, by(r, 0.01, 0.01), Constrain::Slide));
+                assert!(fits_within(FRAME, angle, next, 0.05), "{angle}: {next:?}");
+                assert!(((next[2] - next[0]) - 2.0 * hw).abs() < 1e-5 && ((next[3] - next[1]) - 2.0 * hh).abs() < 1e-5, "{angle}: size drifted");
+                r = next;
+            }
+            // In one go it lands at the same place: the nearest that fits, as far as it goes.
+            let once = constrain_crop(FRAME, angle, right, by(right, 2.0, 2.0), Constrain::Slide);
+            assert!((r[0] - once[0]).abs() < 1e-3 && (r[1] - once[1]).abs() < 1e-3, "{angle}: steps {r:?}, once {once:?}");
+            assert!(r[1] - right[1] > 0.01, "{angle}: stalled against the edge: {right:?} -> {r:?}");
+            // And it touches the photo there: a pixel further either way doesn't fit.
+            let px = (1.0 / FRAME.0, 1.0 / FRAME.1);
+            assert!(!fits_within(FRAME, angle, by(r, px.0, 0.0), 0.05) || !fits_within(FRAME, angle, by(r, 0.0, px.1), 0.05), "{angle}: {r:?} short of the corner");
+        }
     }
 
     #[test]
@@ -394,7 +612,7 @@ mod tests {
         assert!(r[0] < r[2] && r[2] - r[0] >= MIN_SIZE - 1e-12, "{r:?}");
         // With the photo turned, the edge stops where the corner meets the photo's edge.
         let r = constrain_crop(FRAME, 10.0, [0.3, 0.1, 0.5, 0.9], [0.3, 0.1, 1.0, 0.9], Constrain::Edges);
-        assert!(fits(FRAME, 10.0, r) && r[2] < 1.0 && r[2] > 0.5, "{r:?}");
+        assert!(fits_within(FRAME, 10.0, r, 0.05) && r[2] < 1.0 && r[2] > 0.5, "{r:?}");
     }
 
     #[test]
@@ -402,7 +620,7 @@ mod tests {
         let anchor = [0.2, 0.2];
         // A corner drag far outside.
         let r = constrain_crop(FRAME, 0.0, [0.2, 0.2, 0.5, 0.4], [0.2, 0.2, 1.5, 0.8], Constrain::Scale(anchor));
-        assert!(fits(FRAME, 0.0, r));
+        assert!(fits_within(FRAME, 0.0, r, 0.05));
         assert!((r[0] - 0.2).abs() < 1e-9 && (r[1] - 0.2).abs() < 1e-9);
         assert!((r[2] - 1.0).abs() < 1e-6 || (r[3] - 1.0).abs() < 1e-6, "{r:?}");
     }
